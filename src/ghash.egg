@@ -1,0 +1,152 @@
+// ghash: GHASH, GCM's hash over GF(2^128) (NIST SP 800-38D), in constant
+// time, as BearSSL's ghash_ctmul64 does it: carry-less products come
+// from ordinary integer products of words with holes in them (every
+// fourth bit), so there are no tables indexed by the key or the data.
+//
+//     var g = Ghash.init(h)    // h: [16]u8, the encrypted zero block
+//     g.update(data)
+//     g.pad16()
+//     const y = g.final()      // [16]u8
+
+const Ghash = struct {
+    h0: u64
+    h1: u64
+    h2: u64
+    h0r: u64
+    h1r: u64
+    h2r: u64
+    y0: u64
+    y1: u64
+    buf: [16]u8
+    fill: i64
+
+    fn init(h: [16]u8) Ghash {
+        const h1 = be64(h[0..], 0)
+        const h0 = be64(h[0..], 8)
+        const h0r = rev64(h0)
+        const h1r = rev64(h1)
+        return Ghash{ .h0 = h0, .h1 = h1, .h2 = h0 ^ h1, .h0r = h0r, .h1r = h1r, .h2r = h0r ^ h1r, .y0 = 0, .y1 = 0, .buf = @splat(0), .fill = 0 }
+    }
+
+    fn update(inout self: Ghash, data: []u8) void {
+        var i = 0
+        const n = @len(data)
+        while (i < n) {
+            if (self.fill == 0 and n - i >= 16) {
+                self.absorb(data[i..i + 16])
+                i = i + 16
+            } else {
+                self.buf[self.fill] = data[i]
+                self.fill = self.fill + 1
+                i = i + 1
+                if (self.fill == 16) {
+                    const b = self.buf
+                    self.absorb(b[0..])
+                    self.fill = 0
+                }
+            }
+        }
+    }
+
+    // Zeros up to a multiple of 16 bytes, as GCM puts after the
+    // additional data and after the ciphertext.
+    fn pad16(inout self: Ghash) void {
+        if (self.fill > 0) {
+            while (self.fill < 16) {
+                self.buf[self.fill] = 0
+                self.fill = self.fill + 1
+            }
+            const b = self.buf
+            self.absorb(b[0..])
+            self.fill = 0
+        }
+    }
+
+    fn final(self: Ghash) [16]u8 {
+        var s = self
+        s.pad16()
+        var out: [16]u8 = @splat(0)
+        var i = 0
+        while (i < 8) {
+            out[i] = @as(u8, (s.y1 >> (56 - 8 * i)) & 0xFF)
+            out[8 + i] = @as(u8, (s.y0 >> (56 - 8 * i)) & 0xFF)
+            i = i + 1
+        }
+        return out
+    }
+
+    // y = (y xor block) * h.
+    fn absorb(inout self: Ghash, block: []u8) void {
+        const y1 = self.y1 ^ be64(block, 0)
+        const y0 = self.y0 ^ be64(block, 8)
+        const y0r = rev64(y0)
+        const y1r = rev64(y1)
+        const y2 = y0 ^ y1
+        const y2r = y0r ^ y1r
+        const z0 = bmul64(y0, self.h0)
+        const z1 = bmul64(y1, self.h1)
+        var z2 = bmul64(y2, self.h2)
+        var z0h = bmul64(y0r, self.h0r)
+        var z1h = bmul64(y1r, self.h1r)
+        var z2h = bmul64(y2r, self.h2r)
+        z2 = z2 ^ z0 ^ z1
+        z2h = z2h ^ z0h ^ z1h
+        z0h = rev64(z0h) >> 1
+        z1h = rev64(z1h) >> 1
+        z2h = rev64(z2h) >> 1
+        var v0 = z0
+        var v1 = z0h ^ z2
+        var v2 = z1 ^ z2h
+        var v3 = z1h
+        v3 = (v3 << 1) | (v2 >> 63)
+        v2 = (v2 << 1) | (v1 >> 63)
+        v1 = (v1 << 1) | (v0 >> 63)
+        v0 = v0 << 1
+        v2 = v2 ^ v0 ^ (v0 >> 1) ^ (v0 >> 2) ^ (v0 >> 7)
+        v1 = v1 ^ (v0 << 63) ^ (v0 << 62) ^ (v0 << 57)
+        v3 = v3 ^ v1 ^ (v1 >> 1) ^ (v1 >> 2) ^ (v1 >> 7)
+        v2 = v2 ^ (v1 << 63) ^ (v1 << 62) ^ (v1 << 57)
+        self.y0 = v2
+        self.y1 = v3
+    }
+}
+
+fn be64(b: []u8, at: i64) u64 {
+    var x: u64 = 0
+    var i = 0
+    while (i < 8) {
+        x = x << 8 | @as(u64, b[at + i])
+        i = i + 1
+    }
+    return x
+}
+
+// The low 64 bits of the carry-less product of x and y: integer products
+// of x and y with only every fourth bit kept, so carries land in the
+// holes and are masked off.
+fn bmul64(x: u64, y: u64) u64 {
+    const x0 = x & 0x1111_1111_1111_1111
+    const x1 = x & 0x2222_2222_2222_2222
+    const x2 = x & 0x4444_4444_4444_4444
+    const x3 = x & 0x8888_8888_8888_8888
+    const y0 = y & 0x1111_1111_1111_1111
+    const y1 = y & 0x2222_2222_2222_2222
+    const y2 = y & 0x4444_4444_4444_4444
+    const y3 = y & 0x8888_8888_8888_8888
+    const z0 = (x0 *% y0) ^ (x1 *% y3) ^ (x2 *% y2) ^ (x3 *% y1)
+    const z1 = (x0 *% y1) ^ (x1 *% y0) ^ (x2 *% y3) ^ (x3 *% y2)
+    const z2 = (x0 *% y2) ^ (x1 *% y1) ^ (x2 *% y0) ^ (x3 *% y3)
+    const z3 = (x0 *% y3) ^ (x1 *% y2) ^ (x2 *% y1) ^ (x3 *% y0)
+    return (z0 & 0x1111_1111_1111_1111) | (z1 & 0x2222_2222_2222_2222) | (z2 & 0x4444_4444_4444_4444) | (z3 & 0x8888_8888_8888_8888)
+}
+
+// x with its bits in the opposite order.
+fn rev64(v: u64) u64 {
+    var x = v
+    x = ((x & 0x5555_5555_5555_5555) << 1) | ((x >> 1) & 0x5555_5555_5555_5555)
+    x = ((x & 0x3333_3333_3333_3333) << 2) | ((x >> 2) & 0x3333_3333_3333_3333)
+    x = ((x & 0x0F0F_0F0F_0F0F_0F0F) << 4) | ((x >> 4) & 0x0F0F_0F0F_0F0F_0F0F)
+    x = ((x & 0x00FF_00FF_00FF_00FF) << 8) | ((x >> 8) & 0x00FF_00FF_00FF_00FF)
+    x = ((x & 0x0000_FFFF_0000_FFFF) << 16) | ((x >> 16) & 0x0000_FFFF_0000_FFFF)
+    return (x << 32) | (x >> 32)
+}

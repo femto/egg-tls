@@ -1,0 +1,165 @@
+// aes_gcm: AES-128-GCM and AES-256-GCM (NIST SP 800-38D) with 12-byte
+// nonces, in place, like tls/chacha20poly1305.
+//
+//     const g = AesGcm.init128(key)     // key: [16]u8; init256 takes [32]u8
+//     // buf: the plaintext, then 16 spare bytes
+//     g.seal(nonce, aad, &buf[0..])
+//     // buf: the ciphertext, then the tag, as a TLS record carries them
+//     try g.open(nonce, aad, &buf[0..])
+//     // buf: the plaintext again (the last 16 bytes are left as they were)
+//
+// An AesGcm holds the expanded key, so one is made per key, not per
+// message. open authenticates as it decrypts, in one pass, and a wrong
+// tag zeros all of buf and is error.AuthFailed. The block cipher and
+// GHASH are constant time (tls/aes, tls/ghash). A nonce must never be
+// used twice with one key.
+
+const aes = @import("aes.egg")
+const ghash = @import("ghash.egg")
+
+const AesGcm = struct {
+    cipher: aes.Aes
+    // H, the encrypted zero block, GHASH's key.
+    h: [16]u8
+
+    fn init128(key: [16]u8) AesGcm {
+        return with_cipher(aes.Aes.init128(key))
+    }
+
+    fn init256(key: [32]u8) AesGcm {
+        return with_cipher(aes.Aes.init256(key))
+    }
+
+    fn seal(self: AesGcm, nonce: [12]u8, aad: []u8, inout buf: []u8) void {
+        const n = @len(buf) - 16
+        var g = ghash.Ghash.init(self.h)
+        g.update(aad)
+        g.pad16()
+        var counter: u32 = 2
+        var at = 0
+        while (at < n) {
+            const end = if (n - at > 64) at + 64 else n
+            const ks = self.stream(nonce, counter, (end - at + 15) / 16)
+            var i = at
+            while (i < end) {
+                buf[i] = buf[i] ^ ks[i - at]
+                i = i + 1
+            }
+            g.update(buf[at..end])
+            at = end
+            if (at < n) {
+                counter = counter + 4
+            }
+        }
+        const tag = self.tag(g, nonce, @len(aad), n)
+        var i = 0
+        while (i < 16) {
+            buf[n + i] = tag[i]
+            i = i + 1
+        }
+    }
+
+    fn open(self: AesGcm, nonce: [12]u8, aad: []u8, inout buf: []u8) !void {
+        if (@len(buf) < 16) {
+            return error.AuthFailed
+        }
+        const n = @len(buf) - 16
+        var g = ghash.Ghash.init(self.h)
+        g.update(aad)
+        g.pad16()
+        var counter: u32 = 2
+        var at = 0
+        while (at < n) {
+            const end = if (n - at > 64) at + 64 else n
+            g.update(buf[at..end])
+            const ks = self.stream(nonce, counter, (end - at + 15) / 16)
+            var i = at
+            while (i < end) {
+                buf[i] = buf[i] ^ ks[i - at]
+                i = i + 1
+            }
+            at = end
+            if (at < n) {
+                counter = counter + 4
+            }
+        }
+        const tag = self.tag(g, nonce, @len(aad), n)
+        var diff: u8 = 0
+        var i = 0
+        while (i < 16) {
+            diff = diff | (tag[i] ^ buf[n + i])
+            i = i + 1
+        }
+        if (diff != 0) {
+            i = 0
+            while (i < @len(buf)) {
+                buf[i] = 0
+                i = i + 1
+            }
+            return error.AuthFailed
+        }
+    }
+
+    // The key stream for `used` blocks (1 to 4): the counter blocks nonce |
+    // counter .. counter + used - 1, encrypted. Only blocks a message uses
+    // get a counter, so the longest message GCM allows (2^32 - 2 blocks)
+    // ends at counter 2^32 - 1, and a longer one panics on the overflow
+    // rather than reuse counter 1, which masks the tag.
+    fn stream(self: AesGcm, nonce: [12]u8, counter: u32, used: i64) [64]u8 {
+        var blocks: [64]u8 = @splat(0)
+        var b = 0
+        while (b < used) {
+            var i = 0
+            while (i < 12) {
+                blocks[16 * b + i] = nonce[i]
+                i = i + 1
+            }
+            const c = counter + @as(u32, b)
+            blocks[16 * b + 12] = @as(u8, c >> 24)
+            blocks[16 * b + 13] = @as(u8, (c >> 16) & 0xFF)
+            blocks[16 * b + 14] = @as(u8, (c >> 8) & 0xFF)
+            blocks[16 * b + 15] = @as(u8, c & 0xFF)
+            b = b + 1
+        }
+        self.cipher.encrypt4(&blocks[0..])
+        return blocks
+    }
+
+    // GHASH over the ciphertext's padding and both lengths in bits, xor
+    // the encrypted first counter block (nonce | 1).
+    fn tag(self: AesGcm, g: ghash.Ghash, nonce: [12]u8, aad_len: i64, ct_len: i64) [16]u8 {
+        var s = g
+        s.pad16()
+        var lens: [16]u8 = @splat(0)
+        const abits = aad_len * 8
+        const cbits = ct_len * 8
+        var i = 0
+        while (i < 8) {
+            lens[i] = @as(u8, (abits >> (56 - 8 * i)) & 0xFF)
+            lens[8 + i] = @as(u8, (cbits >> (56 - 8 * i)) & 0xFF)
+            i = i + 1
+        }
+        s.update(lens[0..])
+        const y = s.final()
+        var j0: [16]u8 = @splat(0)
+        i = 0
+        while (i < 12) {
+            j0[i] = nonce[i]
+            i = i + 1
+        }
+        j0[15] = 1
+        const e = self.cipher.encrypt(j0)
+        var out: [16]u8 = @splat(0)
+        i = 0
+        while (i < 16) {
+            out[i] = y[i] ^ e[i]
+            i = i + 1
+        }
+        return out
+    }
+}
+
+fn with_cipher(c: aes.Aes) AesGcm {
+    const zero: [16]u8 = @splat(0)
+    return AesGcm{ .cipher = c, .h = c.encrypt(zero) }
+}

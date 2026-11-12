@@ -8,7 +8,7 @@ library, the way Zig's `std.crypto.tls` is written in Zig.
 checked against its RFC's test vectors:
 
 1. hashes: SHA-256, SHA-384/512, HMAC, HKDF (done)
-2. AEADs: ChaCha20-Poly1305 (done), AES-128/256-GCM
+2. AEADs: ChaCha20-Poly1305, AES-128/256-GCM (done)
 3. key exchange: X25519, P-256
 4. a TLS 1.3 client: record layer, key schedule, handshake
 5. certificates: DER, X.509, ECDSA, RSA, Ed25519, the system's CA bundle,
@@ -75,6 +75,36 @@ Its time depends on lengths only, not on the key, the data or where a
 forged tag differs. `clutch test` checks it against RFC 8439, OpenSSL,
 and Poly1305 computed from its definition, including the edges of its
 final reduction.
+
+## AES-GCM
+
+The same in-place `seal` and `open`, on a value that holds the expanded
+key (make one per key, not per message):
+
+```egg
+uses io
+
+const aes_gcm = @import("tls/aes_gcm")
+
+fn main(io: Io) !void {
+    const key: [16]u8 = @splat(1)
+    const g = aes_gcm.AesGcm.init128(key)    // init256 takes a [32]u8
+    const nonce: [12]u8 = @splat(2)        // for show: never twice with one key
+    var buf: [21]u8 = @splat(0)
+    buf[0] = 'h'
+    g.seal(nonce, "header", &buf[0..])
+    try g.open(nonce, "header", &buf[0..])
+    io.print(buf[0])
+}
+```
+
+AES is bitsliced, as in BearSSL's `aes_ct64`: four blocks at a time, the
+S-box as Boyar and Peralta's circuit of ands and xors, so no table is
+indexed by the key or the data. GHASH multiplies through integer products
+of words with holes in them (BearSSL's `ghash_ctmul64`), also without
+tables. `clutch test` checks the S-box circuit on all 256 bytes, AES
+against FIPS 197 and OpenSSL, GHASH against its definition, and AES-GCM
+against the GCM paper's test cases and OpenSSL.
 
 ## License
 
