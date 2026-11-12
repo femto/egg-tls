@@ -137,6 +137,22 @@ refuses an all-zero result, as RFC 8446 requires of a client. `clutch
 test` checks it against RFC 7748 (including the iterated test, a thousand
 rounds) and against the RFC's algorithm in Ruby's big integers.
 
+## Secrets in memory
+
+What holds a key, or bytes derived from one, for the length of an
+operation is zeroed with `@secureZero` (stores the C compiler keeps) when
+the operation ends: X25519's scalar and ladder, HMAC's padded keys,
+Poly1305's one-time key, each chunk of AEAD key stream, the tag mask
+E(K, J0), HKDF's intermediate keys, a hash's state copied to finish it.
+Two things are not:
+
+- Values you keep: an `AesGcm`, an `Hmac`, a hash, a key array. Zero them
+  when done: `defer @secureZero(&g)`.
+- Scratch inside a primitive's single block (ChaCha20's block state, SHA's
+  message schedule, AES's bitsliced state, a field multiplication's
+  products). The next block overwrites it, and zeroing it every block
+  would cost ChaCha20-Poly1305 a further 10-15%.
+
 ## License
 
 MIT

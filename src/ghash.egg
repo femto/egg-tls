@@ -64,6 +64,7 @@ const Ghash = struct {
 
     fn final(self: Ghash) [16]u8 {
         var s = self
+        defer @secureZero(&s)
         s.pad16()
         var out: [16]u8 = @splat(0)
         var i = 0

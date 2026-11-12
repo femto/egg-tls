@@ -73,7 +73,8 @@ fn xor(key: [32]u8, counter: u32, nonce: [12]u8, inout data: []u8) void {
     var c = counter
     var at = 0
     while (at < @len(data)) {
-        const ks = block(key, c, nonce)
+        var ks = block(key, c, nonce)
+        defer @secureZero(&ks)
         var i = 0
         while (i < 64 and at < @len(data)) {
             data[at] = data[at] ^ ks[i]

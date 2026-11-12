@@ -39,7 +39,8 @@ const AesGcm = struct {
         var at = 0
         while (at < n) {
             const end = if (n - at > 64) at + 64 else n
-            const ks = self.stream(nonce, counter, (end - at + 15) / 16)
+            var ks = self.stream(nonce, counter, (end - at + 15) / 16)
+            defer @secureZero(&ks)
             var i = at
             while (i < end) {
                 buf[i] = buf[i] ^ ks[i - at]
@@ -72,7 +73,8 @@ const AesGcm = struct {
         while (at < n) {
             const end = if (n - at > 64) at + 64 else n
             g.update(buf[at..end])
-            const ks = self.stream(nonce, counter, (end - at + 15) / 16)
+            var ks = self.stream(nonce, counter, (end - at + 15) / 16)
+            defer @secureZero(&ks)
             var i = at
             while (i < end) {
                 buf[i] = buf[i] ^ ks[i - at]
@@ -83,7 +85,8 @@ const AesGcm = struct {
                 counter = counter + 4
             }
         }
-        const tag = self.tag(g, nonce, @len(aad), n)
+        var tag = self.tag(g, nonce, @len(aad), n)
+        defer @secureZero(&tag)
         var diff: u8 = 0
         var i = 0
         while (i < 16) {
@@ -129,6 +132,7 @@ const AesGcm = struct {
     // the encrypted first counter block (nonce | 1).
     fn tag(self: AesGcm, g: ghash.Ghash, nonce: [12]u8, aad_len: i64, ct_len: i64) [16]u8 {
         var s = g
+        defer @secureZero(&s)
         s.pad16()
         var lens: [16]u8 = @splat(0)
         const abits = aad_len * 8
@@ -140,7 +144,8 @@ const AesGcm = struct {
             i = i + 1
         }
         s.update(lens[0..])
-        const y = s.final()
+        var y = s.final()
+        defer @secureZero(&y)
         var j0: [16]u8 = @splat(0)
         i = 0
         while (i < 12) {
@@ -148,7 +153,9 @@ const AesGcm = struct {
             i = i + 1
         }
         j0[15] = 1
-        const e = self.cipher.encrypt(j0)
+        // E(K, J0) masks the tag: as secret as the key until it is used.
+        var e = self.cipher.encrypt(j0)
+        defer @secureZero(&e)
         var out: [16]u8 = @splat(0)
         i = 0
         while (i < 16) {

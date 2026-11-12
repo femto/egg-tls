@@ -16,6 +16,7 @@ fn Hkdf(comptime H: type) type {
     return struct {
         fn extract(salt: []u8, ikm: []u8, inout prk: []u8) void {
             var m = hmac.Hmac(H).init(salt)
+            defer @secureZero(&m)
             m.update(ikm)
             m.final(&prk[0..])
         }
@@ -26,13 +27,16 @@ fn Hkdf(comptime H: type) type {
                 return error.TooLong
             }
             // T(n) = HMAC(prk, T(n - 1) | info | n), T(0) empty.
-            const keyed = hmac.Hmac(H).init(prk)
+            var keyed = hmac.Hmac(H).init(prk)
+            defer @secureZero(&keyed)
             var t: [64]u8 = @splat(0)
+            defer @secureZero(&t)
             var tlen = 0
             var n: u8 = 1
             var at = 0
             while (at < @len(out)) {
                 var m = keyed
+                defer @secureZero(&m)
                 m.update(t[0..tlen])
                 m.update(info)
                 const counter = [1]u8{ n }

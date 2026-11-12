@@ -55,6 +55,7 @@ const Sha256 = struct {
         // A 1 bit, zeros to 56 bytes past a multiple of 64, and the
         // length in bits as 8 big-endian bytes.
         var s = self
+        defer @secureZero(&s)
         const bits = self.total << 3
         var pad: [72]u8 = @splat(0)
         pad[0] = 0x80

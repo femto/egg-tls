@@ -70,6 +70,7 @@ const Poly1305 = struct {
 
     fn final(self: Poly1305) [16]u8 {
         var h = self.h
+        defer @secureZero(&h)
         if (self.fill > 0) {
             // The last, short block: its bytes, a 1, then zeros.
             var last: [16]u8 = @splat(0)
@@ -99,6 +100,7 @@ const Poly1305 = struct {
         h[0] = h[0] & MASK
         h[1] = h[1] + c
         var g: [5]u64 = @splat(0)
+        defer @secureZero(&g)
         g[0] = h[0] + 5
         c = g[0] >> 26
         g[0] = g[0] & MASK
@@ -140,6 +142,7 @@ const Poly1305 = struct {
 // The tag of data under key, at once.
 fn mac(key: [32]u8, data: []u8) [16]u8 {
     var m = Poly1305.init(key)
+    defer @secureZero(&m)
     m.update(data)
     return m.final()
 }

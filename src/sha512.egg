@@ -54,7 +54,8 @@ const Sha512 = struct {
     }
 
     fn final(self: Sha512) [64]u8 {
-        const s = self.padded()
+        var s = self.padded()
+        defer @secureZero(&s)
         var out: [64]u8 = @splat(0)
         put(&out[0..], s.h)
         return out
@@ -63,6 +64,7 @@ const Sha512 = struct {
     // A 1 bit, zeros to 112 bytes past a multiple of 128, and the length
     // in bits as 16 big-endian bytes: total counts bytes, so the top
     // bits of the length are total >> 61.
+    // The caller zeros what this returns.
     fn padded(self: Sha512) Sha512 {
         var s = self
         const bits = self.total << 3
@@ -107,7 +109,8 @@ const Sha384 = struct {
     }
 
     fn final(self: Sha384) [48]u8 {
-        const s = self.inner.padded()
+        var s = self.inner.padded()
+        defer @secureZero(&s)
         var out: [48]u8 = @splat(0)
         put(&out[0..], s.h)
         return out
