@@ -1,0 +1,70 @@
+// hmac: HMAC (RFC 2104) over any of the hashes here: Hmac(Sha256),
+// Hmac(Sha384), Hmac(Sha512).
+//
+//     var m = Hmac(Sha256).init(key)
+//     m.update(data)
+//     var tag: [32]u8 = @splat(0)
+//     m.final(&tag[0..])
+//
+// final writes the H.digest_len() bytes of the tag into out, which must
+// hold that many. Like the hashes, an Hmac is a plain value: a copy keeps
+// the key, so one keyed Hmac can be copied for each message.
+
+fn Hmac(comptime H: type) type {
+    return struct {
+        inner: H
+        outer: H
+
+        fn init(key: []u8) @This() {
+            // The key, hashed first if it is longer than a block, then
+            // padded with zeros to one block (128 bytes holds every block).
+            const bl = H.block_len()
+            var k: [128]u8 = @splat(0)
+            if (@len(key) > bl) {
+                var kh = H.init()
+                kh.update(key)
+                const d = kh.final()
+                var i = 0
+                while (i < @len(d)) {
+                    k[i] = d[i]
+                    i = i + 1
+                }
+            } else {
+                var i = 0
+                while (i < @len(key)) {
+                    k[i] = key[i]
+                    i = i + 1
+                }
+            }
+            var ipad: [128]u8 = @splat(0)
+            var opad: [128]u8 = @splat(0)
+            var i = 0
+            while (i < bl) {
+                ipad[i] = k[i] ^ 0x36
+                opad[i] = k[i] ^ 0x5C
+                i = i + 1
+            }
+            var inner = H.init()
+            inner.update(ipad[0..bl])
+            var outer = H.init()
+            outer.update(opad[0..bl])
+            return @This(){ .inner = inner, .outer = outer }
+        }
+
+        fn update(inout self: @This(), data: []u8) void {
+            self.inner.update(data)
+        }
+
+        fn final(self: @This(), inout out: []u8) void {
+            const d = self.inner.final()
+            var o = self.outer
+            o.update(d[0..])
+            const tag = o.final()
+            var i = 0
+            while (i < @len(tag)) {
+                out[i] = tag[i]
+                i = i + 1
+            }
+        }
+    }
+}
