@@ -1,0 +1,16 @@
+// tls: TLS 1.3 (RFC 8446) for Egg, written in Egg, with no C library.
+//
+// Work in progress. The plan, bottom up, each part checked against its
+// RFC's test vectors:
+//
+//   1. hashes: SHA-256, SHA-384/512, HMAC, HKDF
+//   2. AEADs: ChaCha20-Poly1305, AES-128/256-GCM
+//   3. key exchange: X25519, P-256
+//   4. the record layer, key schedule and handshake of a TLS 1.3 client
+//   5. certificates: DER, X.509, ECDSA, RSA, Ed25519, the system's CA
+//      bundle, host names
+//
+// Then a client over a TcpConn:
+//
+//     var c = try tls.client(a, rng, conn, "example.com")
+//     try c.write("GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
