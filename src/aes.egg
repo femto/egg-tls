@@ -1,0 +1,405 @@
+// aes: the AES block cipher (FIPS 197), AES-128 and AES-256, in constant
+// time: bitsliced, as BearSSL's aes_ct64 is. Four blocks are encrypted at
+// once, their bits spread over eight u64 words, and the S-box is the
+// Boyar-Peralta circuit of ands and xors, so no table is indexed by the
+// key or the data.
+//
+//     const k = Aes.init128(key)       // key: [16]u8; init256 takes [32]u8
+//     var blocks: [64]u8 = ...
+//     k.encrypt4(&blocks[0..])         // four 16-byte blocks, in place
+//
+// Only encryption: GCM, the one mode TLS 1.3 uses, never decrypts a block.
+
+const Aes = struct {
+    rounds: i64
+    // The round keys, eight words each, bitsliced like the state.
+    keys: [120]u64
+
+    fn init128(key: [16]u8) Aes {
+        return schedule(key[0..], 4, 10)
+    }
+
+    fn init256(key: [32]u8) Aes {
+        return schedule(key[0..], 8, 14)
+    }
+
+    // Encrypts the four 16-byte blocks of data (64 bytes) in place.
+    fn encrypt4(self: Aes, inout data: []u8) void {
+        var q: [8]u64 = @splat(0)
+        var i = 0
+        while (i < 4) {
+            const p = interleave_in(le32(data, 16 * i), le32(data, 16 * i + 4), le32(data, 16 * i + 8), le32(data, 16 * i + 12))
+            q[i] = p[0]
+            q[i + 4] = p[1]
+            i = i + 1
+        }
+        ortho(&q)
+        add_round_key(&q, self.keys, 0)
+        var r = 1
+        while (r < self.rounds) {
+            sbox(&q)
+            shift_rows(&q)
+            mix_columns(&q)
+            add_round_key(&q, self.keys, r)
+            r = r + 1
+        }
+        sbox(&q)
+        shift_rows(&q)
+        add_round_key(&q, self.keys, self.rounds)
+        ortho(&q)
+        i = 0
+        while (i < 4) {
+            const w = interleave_out(q[i], q[i + 4])
+            var j = 0
+            while (j < 4) {
+                put32(&data[16 * i + 4 * j..16 * i + 4 * j + 4], w[j])
+                j = j + 1
+            }
+            i = i + 1
+        }
+    }
+
+    // One block.
+    fn encrypt(self: Aes, block: [16]u8) [16]u8 {
+        var four: [64]u8 = @splat(0)
+        var i = 0
+        while (i < 16) {
+            four[i] = block[i]
+            i = i + 1
+        }
+        self.encrypt4(&four[0..])
+        var out: [16]u8 = @splat(0)
+        i = 0
+        while (i < 16) {
+            out[i] = four[i]
+            i = i + 1
+        }
+        return out
+    }
+}
+
+// The key schedule (nk words of key, so many rounds), then each round
+// key bitsliced as four copies of itself.
+fn schedule(key: []u8, nk: i64, rounds: i64) Aes {
+    const rcon = [10]u32{ 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1B, 0x36 }
+    var w: [60]u32 = @splat(0)
+    var i = 0
+    while (i < nk) {
+        w[i] = @as(u32, le32(key, 4 * i))
+        i = i + 1
+    }
+    const total = (rounds + 1) * 4
+    var tmp = w[nk - 1]
+    var j = 0
+    var k = 0
+    while (i < total) {
+        if (j == 0) {
+            tmp = (tmp << 24) | (tmp >> 8)
+            tmp = sub_word(tmp) ^ rcon[k]
+        } else if (nk > 6 and j == 4) {
+            tmp = sub_word(tmp)
+        }
+        tmp = tmp ^ w[i - nk]
+        w[i] = tmp
+        j = j + 1
+        if (j == nk) {
+            j = 0
+            k = k + 1
+        }
+        i = i + 1
+    }
+    var keys: [120]u64 = @splat(0)
+    var r = 0
+    while (r <= rounds) {
+        const p = interleave_in(@as(u64, w[4 * r]), @as(u64, w[4 * r + 1]), @as(u64, w[4 * r + 2]), @as(u64, w[4 * r + 3]))
+        var q: [8]u64 = @splat(0)
+        q[0] = p[0]
+        q[1] = p[0]
+        q[2] = p[0]
+        q[3] = p[0]
+        q[4] = p[1]
+        q[5] = p[1]
+        q[6] = p[1]
+        q[7] = p[1]
+        ortho(&q)
+        var b = 0
+        while (b < 8) {
+            keys[8 * r + b] = q[b]
+            b = b + 1
+        }
+        r = r + 1
+    }
+    return Aes{ .rounds = rounds, .keys = keys }
+}
+
+// The S-box on each byte of x, through the bitsliced circuit.
+fn sub_word(x: u32) u32 {
+    var q: [8]u64 = @splat(0)
+    q[0] = @as(u64, x)
+    ortho(&q)
+    sbox(&q)
+    ortho(&q)
+    return @as(u32, q[0] & 0xFFFF_FFFF)
+}
+
+fn le32(b: []u8, at: i64) u64 {
+    return @as(u64, b[at]) | @as(u64, b[at + 1]) << 8 | @as(u64, b[at + 2]) << 16 | @as(u64, b[at + 3]) << 24
+}
+
+fn put32(inout out: []u8, x: u64) void {
+    out[0] = @as(u8, x & 0xFF)
+    out[1] = @as(u8, (x >> 8) & 0xFF)
+    out[2] = @as(u8, (x >> 16) & 0xFF)
+    out[3] = @as(u8, (x >> 24) & 0xFF)
+}
+
+fn add_round_key(inout q: [8]u64, keys: [120]u64, round: i64) void {
+    var i = 0
+    while (i < 8) {
+        q[i] = q[i] ^ keys[8 * round + i]
+        i = i + 1
+    }
+}
+
+// Exchanges the bits of x under cl with the bits of y under ch, s apart.
+fn swap(inout q: [8]u64, a: i64, b: i64, cl: u64, ch: u64, s: i64) void {
+    const x = q[a]
+    const y = q[b]
+    q[a] = (x & cl) | ((y & cl) << s)
+    q[b] = ((x & ch) >> s) | (y & ch)
+}
+
+// Into and out of the bitsliced form (its own inverse).
+fn ortho(inout q: [8]u64) void {
+    swap(&q, 0, 1, 0x5555_5555_5555_5555, 0xAAAA_AAAA_AAAA_AAAA, 1)
+    swap(&q, 2, 3, 0x5555_5555_5555_5555, 0xAAAA_AAAA_AAAA_AAAA, 1)
+    swap(&q, 4, 5, 0x5555_5555_5555_5555, 0xAAAA_AAAA_AAAA_AAAA, 1)
+    swap(&q, 6, 7, 0x5555_5555_5555_5555, 0xAAAA_AAAA_AAAA_AAAA, 1)
+    swap(&q, 0, 2, 0x3333_3333_3333_3333, 0xCCCC_CCCC_CCCC_CCCC, 2)
+    swap(&q, 1, 3, 0x3333_3333_3333_3333, 0xCCCC_CCCC_CCCC_CCCC, 2)
+    swap(&q, 4, 6, 0x3333_3333_3333_3333, 0xCCCC_CCCC_CCCC_CCCC, 2)
+    swap(&q, 5, 7, 0x3333_3333_3333_3333, 0xCCCC_CCCC_CCCC_CCCC, 2)
+    swap(&q, 0, 4, 0x0F0F_0F0F_0F0F_0F0F, 0xF0F0_F0F0_F0F0_F0F0, 4)
+    swap(&q, 1, 5, 0x0F0F_0F0F_0F0F_0F0F, 0xF0F0_F0F0_F0F0_F0F0, 4)
+    swap(&q, 2, 6, 0x0F0F_0F0F_0F0F_0F0F, 0xF0F0_F0F0_F0F0_F0F0, 4)
+    swap(&q, 3, 7, 0x0F0F_0F0F_0F0F_0F0F, 0xF0F0_F0F0_F0F0_F0F0, 4)
+}
+
+// The four little-endian words of a block, spread over two words.
+fn interleave_in(w0: u64, w1: u64, w2: u64, w3: u64) [2]u64 {
+    var x0 = w0 | (w0 << 16)
+    var x1 = w1 | (w1 << 16)
+    var x2 = w2 | (w2 << 16)
+    var x3 = w3 | (w3 << 16)
+    x0 = x0 & 0x0000_FFFF_0000_FFFF
+    x1 = x1 & 0x0000_FFFF_0000_FFFF
+    x2 = x2 & 0x0000_FFFF_0000_FFFF
+    x3 = x3 & 0x0000_FFFF_0000_FFFF
+    x0 = x0 | (x0 << 8)
+    x1 = x1 | (x1 << 8)
+    x2 = x2 | (x2 << 8)
+    x3 = x3 | (x3 << 8)
+    x0 = x0 & 0x00FF_00FF_00FF_00FF
+    x1 = x1 & 0x00FF_00FF_00FF_00FF
+    x2 = x2 & 0x00FF_00FF_00FF_00FF
+    x3 = x3 & 0x00FF_00FF_00FF_00FF
+    return [2]u64{ x0 | (x2 << 8), x1 | (x3 << 8) }
+}
+
+fn interleave_out(q0: u64, q1: u64) [4]u64 {
+    var x0 = q0 & 0x00FF_00FF_00FF_00FF
+    var x1 = q1 & 0x00FF_00FF_00FF_00FF
+    var x2 = (q0 >> 8) & 0x00FF_00FF_00FF_00FF
+    var x3 = (q1 >> 8) & 0x00FF_00FF_00FF_00FF
+    x0 = x0 | (x0 >> 8)
+    x1 = x1 | (x1 >> 8)
+    x2 = x2 | (x2 >> 8)
+    x3 = x3 | (x3 >> 8)
+    x0 = x0 & 0x0000_FFFF_0000_FFFF
+    x1 = x1 & 0x0000_FFFF_0000_FFFF
+    x2 = x2 & 0x0000_FFFF_0000_FFFF
+    x3 = x3 & 0x0000_FFFF_0000_FFFF
+    return [4]u64{ (x0 | (x0 >> 16)) & 0xFFFF_FFFF, (x1 | (x1 >> 16)) & 0xFFFF_FFFF, (x2 | (x2 >> 16)) & 0xFFFF_FFFF, (x3 | (x3 >> 16)) & 0xFFFF_FFFF }
+}
+
+fn shift_rows(inout q: [8]u64) void {
+    var i = 0
+    while (i < 8) {
+        const x = q[i]
+        q[i] = (x & 0x0000_0000_0000_FFFF) | ((x & 0x0000_0000_FFF0_0000) >> 4) | ((x & 0x0000_0000_000F_0000) << 12) | ((x & 0x0000_FF00_0000_0000) >> 8) | ((x & 0x0000_00FF_0000_0000) << 8) | ((x & 0xF000_0000_0000_0000) >> 12) | ((x & 0x0FFF_0000_0000_0000) << 4)
+        i = i + 1
+    }
+}
+
+fn rotr32(x: u64) u64 {
+    return (x << 32) | (x >> 32)
+}
+
+fn mix_columns(inout q: [8]u64) void {
+    const q0 = q[0]
+    const q1 = q[1]
+    const q2 = q[2]
+    const q3 = q[3]
+    const q4 = q[4]
+    const q5 = q[5]
+    const q6 = q[6]
+    const q7 = q[7]
+    const r0 = (q0 >> 16) | (q0 << 48)
+    const r1 = (q1 >> 16) | (q1 << 48)
+    const r2 = (q2 >> 16) | (q2 << 48)
+    const r3 = (q3 >> 16) | (q3 << 48)
+    const r4 = (q4 >> 16) | (q4 << 48)
+    const r5 = (q5 >> 16) | (q5 << 48)
+    const r6 = (q6 >> 16) | (q6 << 48)
+    const r7 = (q7 >> 16) | (q7 << 48)
+    q[0] = q7 ^ r7 ^ r0 ^ rotr32(q0 ^ r0)
+    q[1] = q0 ^ r0 ^ q7 ^ r7 ^ r1 ^ rotr32(q1 ^ r1)
+    q[2] = q1 ^ r1 ^ r2 ^ rotr32(q2 ^ r2)
+    q[3] = q2 ^ r2 ^ q7 ^ r7 ^ r3 ^ rotr32(q3 ^ r3)
+    q[4] = q3 ^ r3 ^ q7 ^ r7 ^ r4 ^ rotr32(q4 ^ r4)
+    q[5] = q4 ^ r4 ^ r5 ^ rotr32(q5 ^ r5)
+    q[6] = q5 ^ r5 ^ r6 ^ rotr32(q6 ^ r6)
+    q[7] = q6 ^ r6 ^ r7 ^ rotr32(q7 ^ r7)
+}
+
+// The S-box on every byte at once: Boyar and Peralta's circuit (a linear
+// layer, the inversion in GF(2^8) as ands and xors, a linear layer).
+fn sbox(inout q: [8]u64) void {
+    const x0 = q[7]
+    const x1 = q[6]
+    const x2 = q[5]
+    const x3 = q[4]
+    const x4 = q[3]
+    const x5 = q[2]
+    const x6 = q[1]
+    const x7 = q[0]
+
+    const y14 = x3 ^ x5
+    const y13 = x0 ^ x6
+    const y9 = x0 ^ x3
+    const y8 = x0 ^ x5
+    const t0 = x1 ^ x2
+    const y1 = t0 ^ x7
+    const y4 = y1 ^ x3
+    const y12 = y13 ^ y14
+    const y2 = y1 ^ x0
+    const y5 = y1 ^ x6
+    const y3 = y5 ^ y8
+    const t1 = x4 ^ y12
+    const y15 = t1 ^ x5
+    const y20 = t1 ^ x1
+    const y6 = y15 ^ x7
+    const y10 = y15 ^ t0
+    const y11 = y20 ^ y9
+    const y7 = x7 ^ y11
+    const y17 = y10 ^ y11
+    const y19 = y10 ^ y8
+    const y16 = t0 ^ y11
+    const y21 = y13 ^ y16
+    const y18 = x0 ^ y16
+
+    const t2 = y12 & y15
+    const t3 = y3 & y6
+    const t4 = t3 ^ t2
+    const t5 = y4 & x7
+    const t6 = t5 ^ t2
+    const t7 = y13 & y16
+    const t8 = y5 & y1
+    const t9 = t8 ^ t7
+    const t10 = y2 & y7
+    const t11 = t10 ^ t7
+    const t12 = y9 & y11
+    const t13 = y14 & y17
+    const t14 = t13 ^ t12
+    const t15 = y8 & y10
+    const t16 = t15 ^ t12
+    const t17 = t4 ^ t14
+    const t18 = t6 ^ t16
+    const t19 = t9 ^ t14
+    const t20 = t11 ^ t16
+    const t21 = t17 ^ y20
+    const t22 = t18 ^ y19
+    const t23 = t19 ^ y21
+    const t24 = t20 ^ y18
+
+    const t25 = t21 ^ t22
+    const t26 = t21 & t23
+    const t27 = t24 ^ t26
+    const t28 = t25 & t27
+    const t29 = t28 ^ t22
+    const t30 = t23 ^ t24
+    const t31 = t22 ^ t26
+    const t32 = t31 & t30
+    const t33 = t32 ^ t24
+    const t34 = t23 ^ t33
+    const t35 = t27 ^ t33
+    const t36 = t24 & t35
+    const t37 = t36 ^ t34
+    const t38 = t27 ^ t36
+    const t39 = t29 & t38
+    const t40 = t25 ^ t39
+
+    const t41 = t40 ^ t37
+    const t42 = t29 ^ t33
+    const t43 = t29 ^ t40
+    const t44 = t33 ^ t37
+    const t45 = t42 ^ t41
+    const z0 = t44 & y15
+    const z1 = t37 & y6
+    const z2 = t33 & x7
+    const z3 = t43 & y16
+    const z4 = t40 & y1
+    const z5 = t29 & y7
+    const z6 = t42 & y11
+    const z7 = t45 & y17
+    const z8 = t41 & y10
+    const z9 = t44 & y12
+    const z10 = t37 & y3
+    const z11 = t33 & y4
+    const z12 = t43 & y13
+    const z13 = t40 & y5
+    const z14 = t29 & y2
+    const z15 = t42 & y9
+    const z16 = t45 & y14
+    const z17 = t41 & y8
+
+    const t46 = z15 ^ z16
+    const t47 = z10 ^ z11
+    const t48 = z5 ^ z13
+    const t49 = z9 ^ z10
+    const t50 = z2 ^ z12
+    const t51 = z2 ^ z5
+    const t52 = z7 ^ z8
+    const t53 = z0 ^ z3
+    const t54 = z6 ^ z7
+    const t55 = z16 ^ z17
+    const t56 = z12 ^ t48
+    const t57 = t50 ^ t53
+    const t58 = z4 ^ t46
+    const t59 = z3 ^ t54
+    const t60 = t46 ^ t57
+    const t61 = z14 ^ t57
+    const t62 = t52 ^ t58
+    const t63 = t49 ^ t58
+    const t64 = z4 ^ t59
+    const t65 = t61 ^ t62
+    const t66 = z1 ^ t63
+    const s0 = t59 ^ t63
+    const s6 = t56 ^ ~t62
+    const s7 = t48 ^ ~t60
+    const t67 = t64 ^ t65
+    const s3 = t53 ^ t66
+    const s4 = t51 ^ t66
+    const s5 = t47 ^ t65
+    const s1 = t64 ^ ~s3
+    const s2 = t55 ^ ~t67
+
+    q[7] = s0
+    q[6] = s1
+    q[5] = s2
+    q[4] = s3
+    q[3] = s4
+    q[2] = s5
+    q[1] = s6
+    q[0] = s7
+}

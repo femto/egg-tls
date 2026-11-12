@@ -1,0 +1,199 @@
+// AES, GHASH and AES-GCM against FIPS 197, the GCM paper's test cases and
+// OpenSSL; the S-box circuit against the S-box computed from its
+// definition, for all 256 bytes; GHASH against its definition in Ruby's
+// big integers.
+uses io, alloc
+
+const aes = @import("tls/aes")
+const ghash = @import("tls/ghash")
+const gcm = @import("tls/aes_gcm")
+const support = @import("support/check.egg")
+
+fn main(io: Io, a: Allocator) !void {
+    var t = support.tally()
+    try sboxes(io, a, &t, "637c777bf26b6fc53001672bfed7ab76ca82c97dfa5947f0add4a2af9ca472c0b7fd9326363ff7cc34a5e5f171d8311504c723c31896059a071280e2eb27b27509832c1a1b6e5aa0523bd6b329e32f8453d100ed20fcb15b6acbbe394a4c58cfd0efaafb434d338545f9027f503c9fa851a3408f929d38f5bcb6da2110fff3d2cd0c13ec5f974417c4a77e3d645d197360814fdc222a908846eeb814de5e0bdbe0323a0a4906245cc2d3ac629195e479e7c8376d8dd54ea96c56f4ea657aae08ba78252e1ca6b4c6e8dd741f4bbd8b8a703eb5664803f60e613557b986c11d9ee1f8981169d98e949b1e87e9ce5528df8ca1890dbfe6426841992d0fb054bb16")
+    try block128(io, a, &t, "000102030405060708090a0b0c0d0e0f", "00112233445566778899aabbccddeeff", "69c4e0d86a7b0430d8cdb78070b4c55a", "FIPS 197 C.1")
+    try block256(io, a, &t, "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f", "00112233445566778899aabbccddeeff", "8ea2b7ca516745bfeafc49904b496089", "FIPS 197 C.3")
+    try block128(io, a, &t, "0f0e60a05843990e0c9fddffe05d20a2", "ae065b038830ea28e700f0c9a4af8408", "3a58aeb93dc0ab304d0b0d2e45a8af50", "AES-128, random 1")
+    try block256(io, a, &t, "bc66a03cffcbc0b85f17826dea93bee700b830bcfd54501b0c6bf5a3f886a055", "8159e22f0e1258e0c717badfe0923949", "e8f7de378230a14c41df1ee41e367534", "AES-256, random 1")
+    try block128(io, a, &t, "4f146274ae2cb5e86191099aa455f719", "11953d8cad330b2ad2be4d4ffc4f4003", "b40cb3330e8c9b1a024fdef666b278b0", "AES-128, random 2")
+    try block256(io, a, &t, "be63ba07bc22b234c53487dd2de5b5c306d9811d3e8fa8a2235813294ed040d1", "38ee2ee0a79182ba33f380c172fb457f", "23dcef74b876ceb8832fc48fa0f1dc63", "AES-256, random 2")
+    try block128(io, a, &t, "998a1bc1af98499504aaf244f66f5b5b", "0c1f6440fd27052618193f97ff37bad7", "ea5cbfeb93f844071e0c4fc124bbf83f", "AES-128, random 3")
+    try block256(io, a, &t, "b8f31ac9692feec943e8f0238dd5deeb2f36111ea0fb6b05a63a89cffcedaef1", "8ac054c3445746df8566261d39a46a58", "c58fd916a5680d4b358f88ab8f020332", "AES-256, random 3")
+    try block128(io, a, &t, "c96346e80c1e89c47f01158c97a0fb63", "877c0615a45da57ce53dc3aa6cddecf9", "7b31aa7a45a88d8e062b6bcb7cad2637", "AES-128, random 4")
+    try block256(io, a, &t, "75ce6f0c776e281ec031870b0797faccd850f3accf00a8e59fc2910ffacf5cb7", "0361c1833ee5c4f5c580a3b5b457f4b5", "4569c86f301f786982d8c7e6f56b4851", "AES-256, random 4")
+    try hash(io, a, &t, "1ee07674c28d1d81ed820534b7a1ce4d", "", "00000000000000000000000000000000", "GHASH, 0 bytes")
+    try hash(io, a, &t, "747f09c0eaf5181b60b3b7fdc4a08d3d", "eae6392e5739dc0d7ac118f15a90aca8", "29940c2b1c4bc1514f664b5f68edfe7f", "GHASH, 16 bytes")
+    try hash(io, a, &t, "4f7306e9f5fbe780f3628233337dd2c8", "35a062f2f7e7c48e13bc45d96534323948", "2969fa53d497961603321712c3bd2ab9", "GHASH, 17 bytes")
+    try hash(io, a, &t, "6d7a2769a4c867c29b0847f2b6f0ff5a", "7d0dcbcc89687fb23d575c2a4aaaa7eb2cbc97cfb35b01e949200ef826499e5d56fc121ed967371941cabea4b4f21a00dd3c7323e9bf0a9aadf9181ad6aedb24", "83a6c2378c4c59f307efb463a9dfe53f", "GHASH, 64 bytes")
+    try hash(io, a, &t, "eeeb7e358b8463262e64dfbbd6ce2211", "09a47d94c04321b3b897494ba792139baeed4dda15f3d6c8df5dfd7d1ed3258e91af4ec71f2b13b489d8c70b84f10cafb1981dc8cc3869ad48dd3eb3db9308ed3eb4492334b6d594138ea17044cf571af077e29f38bc00ef6479ebd7f5d541e33f559277", "58c4a891f95959dbd4c882dd7dc7d065", "GHASH, 100 bytes")
+    try hash(io, a, &t, "80000000000000000000000000000000", "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff", "00000000000000000000000000000000", "GHASH, h = 1")
+    try hash(io, a, &t, "ffffffffffffffffffffffffffffffff", "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff", "2583f991111111111111111111111111", "GHASH, all ones")
+    try aead(io, a, &t, "00000000000000000000000000000000", "000000000000000000000000", "", "", "58e2fccefa7e3061367f1d57a4e7455a", "GCM test case 1")
+    try aead(io, a, &t, "00000000000000000000000000000000", "000000000000000000000000", "", "00000000000000000000000000000000", "0388dace60b6a392f328c2b971b2fe78ab6e47d42cec13bdf53a67b21257bddf", "GCM test case 2")
+    try aead(io, a, &t, "feffe9928665731c6d6a8f9467308308", "cafebabefacedbaddecaf888", "", "d9313225f88406e5a55909c5aff5269a86a7a9531534f7da2e4c303d8a318a721c3c0c95956809532fcf0e2449a6b525b16aedf5aa0de657ba637b391aafd255", "42831ec2217774244b7221b784d0d49ce3aa212f2c02a4e035c17e2329aca12e21d514b25466931c7d8f6a5aac84aa051ba30b396a0aac973d58e091473f59854d5c2af327cd64a62cf35abd2ba6fab4", "GCM test case 3")
+    try aead(io, a, &t, "feffe9928665731c6d6a8f9467308308", "cafebabefacedbaddecaf888", "feedfacedeadbeeffeedfacedeadbeefabaddad2", "d9313225f88406e5a55909c5aff5269a86a7a9531534f7da2e4c303d8a318a721c3c0c95956809532fcf0e2449a6b525b16aedf5aa0de657ba637b39", "42831ec2217774244b7221b784d0d49ce3aa212f2c02a4e035c17e2329aca12e21d514b25466931c7d8f6a5aac84aa051ba30b396a0aac973d58e0915bc94fbc3221a5db94fae95ae7121a47", "GCM test case 4")
+    try aead(io, a, &t, "0000000000000000000000000000000000000000000000000000000000000000", "000000000000000000000000", "", "", "530f8afbc74536b9a963b4f1c4cb738b", "GCM test case 13")
+    try aead(io, a, &t, "0000000000000000000000000000000000000000000000000000000000000000", "000000000000000000000000", "", "00000000000000000000000000000000", "cea7403d4d606b6e074ec5d3baf39d18d0d1c8a799996bf0265b98b5d48ab919", "GCM test case 14")
+    try aead(io, a, &t, "feffe9928665731c6d6a8f9467308308feffe9928665731c6d6a8f9467308308", "cafebabefacedbaddecaf888", "", "d9313225f88406e5a55909c5aff5269a86a7a9531534f7da2e4c303d8a318a721c3c0c95956809532fcf0e2449a6b525b16aedf5aa0de657ba637b391aafd255", "522dc1f099567d07f47f37a32a84427d643a8cdcbfe5c0c97598a2bd2555d1aa8cb08e48590dbb3da7b08b1056828838c5f61e6393ba7a0abcc9f662898015adb094dac5d93471bdec1a502270e3cc6c", "GCM test case 15")
+    try aead(io, a, &t, "feffe9928665731c6d6a8f9467308308feffe9928665731c6d6a8f9467308308", "cafebabefacedbaddecaf888", "feedfacedeadbeeffeedfacedeadbeefabaddad2", "d9313225f88406e5a55909c5aff5269a86a7a9531534f7da2e4c303d8a318a721c3c0c95956809532fcf0e2449a6b525b16aedf5aa0de657ba637b39", "522dc1f099567d07f47f37a32a84427d643a8cdcbfe5c0c97598a2bd2555d1aa8cb08e48590dbb3da7b08b1056828838c5f61e6393ba7a0abcc9f66276fc6ece0f4e1768cddf8853bb2d551b", "GCM test case 16")
+    try aead(io, a, &t, "4393bdfd38563c8cd7bd50ca4006b457", "26916af7946d6b4ca781b446", "", "", "a729100b45874cedde8eed409b91abf6", "AES-128-GCM, 0 bytes, 0 of aad")
+    try aead(io, a, &t, "b507bb9eb3d82ca1ce6c3dfefa805ec263d2f327146e13227776156820207b16", "acf8744cd936880e87077c21", "", "", "bd1c1ad9354d7a0b1a9903276acf655f", "AES-256-GCM, 0 bytes, 0 of aad")
+    try aead(io, a, &t, "6e5ea00e8e9a0de3a29b7b8d5f724b72", "66e92b71f690186b8ad78ffa", "", "6a", "0de165bb8b5514f58560e4c33bf25ef69c", "AES-128-GCM, 1 bytes, 0 of aad")
+    try aead(io, a, &t, "526a0e84f7b3c7bc1c3f4960026edfc53bb751d364d3103374e4736523d8bcb1", "ef37da52edd27e0e84dfa9fb", "", "34", "d9a17805f961593d33b5bec4cc6ac2259d", "AES-256-GCM, 1 bytes, 0 of aad")
+    try aead(io, a, &t, "9f63f889f1d2c937bc2d41c82a45f789", "7c8372b68a329954e6b16fc7", "aa2f433131574f5e0761f4f0189288c5", "417178f575e0868efca119ac8b4ac7", "c4222816283b35940df98f958b7db82216a89571e32e55881e828c977de415", "AES-128-GCM, 15 bytes, 16 of aad")
+    try aead(io, a, &t, "c4cfa1868fdee12aa6621871f891de76a118105f2757ba3a88319d499b1c4385", "221a6a82d85d6515cdd5ceec", "382edc69f13425536e7c0f5a479b5da3", "fa15a9c13798384c400cd182365de2", "6334171dd8cbfcd07bd1109f43c36f4ead084009dfeb74cb22316f6fca97e9", "AES-256-GCM, 15 bytes, 16 of aad")
+    try aead(io, a, &t, "8d2a0c44a1b3266fe28a47db9d71b94f", "00729ffbaf6cf3cc61f419fa", "4927dbfefd815620be747526c4", "0cca3315a8b56f76e5437a4a07c69780", "31c68ff93bc1b44301d7f08b67d93d1e8c447de7b5f295c9e9d871f4e4175398", "AES-128-GCM, 16 bytes, 13 of aad")
+    try aead(io, a, &t, "4580679d59e6971fde6d01e8b355467bdc1b683674a0a19cd0241cf72ad9cc4f", "7257f8c2dec2e06eb4c0a254", "a567c20718aba5343abeeef27c", "147e8267892965070809e802a4fbc47a", "90b5bd2bea4e59f6f78c5ae81fd90b79f324352c6524dfb7e9f58cb07136a31a", "AES-256-GCM, 16 bytes, 13 of aad")
+    try aead(io, a, &t, "84e45b193063c3fdb856f42059f330ca", "a00d2a894713bff8f2c218c0", "05", "e7e7c633eb62549ae15bd1b67e9278f967", "78c83ad04014950d7d715a8526384417e259aa79850b18ce92aa60f857fb73ac06", "AES-128-GCM, 17 bytes, 1 of aad")
+    try aead(io, a, &t, "0bf6376a3826ddecdffe66efd658d4a73f30210a92d3c62c019e22f2f173815a", "3f5989a4f4967fa0283a1cd5", "ad", "bb4ce3b75ca99ac1b317c964e6fd2e1987", "19d793e3b34b00cb68eac9dcbc35445ab7505a4b6e3475241b4b8db89a03f3998a", "AES-256-GCM, 17 bytes, 1 of aad")
+    try aead(io, a, &t, "009deb436d3e6e97b8663c2b0e5759ef", "5d7ce8dd1af4236fa4ccd446", "", "b110d84bfc8694b07da98d9a402efa483d1a0c7bee7e729e0042cb82dabea3eda31d4a6ff4cf368aa7355b0b0481f53c9f3d066198ed1caf41d17c2edc42dc", "9983bf97a61bf93432122aa36c25e4299a27e4a8a5a4b5af2c0c148503ef6b6d8548db29416f7a9ae4491e795737cca5210fabae2513b53d750c0e50c67651dbcbfa0497f7193ed1c75e775716eb62", "AES-128-GCM, 63 bytes, 0 of aad")
+    try aead(io, a, &t, "a20a818ee7786385da7bb4cab26eef9b7d9d8d9c7b0909becd508872ff119f91", "f835c94d408ddb3434e3b205", "", "196bb73f9d14961b2df30dbc0ca188b3e71ffad92b6769ccea631c57e60d32a7ba96428d14b011c5f1fa027427bb75e245f148dfbd2d9b850ddc0596a7bc65", "d4bf2b98e4b1a015edc4df92d582921d8c3c44d613c5da1515d7a6933b52d59f8bce758722b6783f4d92d8bf6ed6ac6bbd1622916a0d683edb734711f65dc674b57e42bc06ece9045455764ed05875", "AES-256-GCM, 63 bytes, 0 of aad")
+    try aead(io, a, &t, "f0fb29117cc713288327ce9d7bb50273", "056b6c9196292998f455de2c", "4799c027c5e32f409badc2561f8d69dd91ca616909fd2730f30cd0a33ca76c8299528264c2a3055120029f7d0166b177dd00b336a3de3f2ff2ba3a594e4053c7", "1264ea0293b9c878dcd988459d10711679b93de13aac1be6c34a88180b5a7b70ed0f4d4e3036db6e4ee253d70a716901dd2d10951f25f1e394f2aa72f1b89826", "374ec1fc7a37e2c902502eab8ab34b6f5d11730e29e132c435a0e8b26a57e163ca51459e81abbcef4273ba47a7e88e1a78bbd1cd9c06a8ecd46221f016796bd81baafeb7d5caa232b336711529a92629", "AES-128-GCM, 64 bytes, 64 of aad")
+    try aead(io, a, &t, "bdbd8c4e1007ebe1814c00a1cf28ee20fee15d7192a00fc3065d8f309c87396e", "b52487f3f22623b4b3e189d2", "04ae64dbebd96639c785533b3661c839abdfb15cb7e5cb44f4bd195084bbbc1b62a260b90ca586251bcee8574ce98e2902e750e5b63b8f7f0fcc368f27769238", "6649a49ee6951be4d38061b8a316b5fba4d088a40a9ac49f4168796f32763a5bd5cfb68fcdb0728aac7c5b074d1fa6a0ce694a73c3ce6db175d373936b6cebc0", "da22403687cab46c4a84a89999010550e5642bec64e7db474690946a256a030ccf312cfe87e32431584464b8254466595917cfa7192ba6f31e21a32e97d60ec34ff13da5d593f87bd54a3863b2e5addd", "AES-256-GCM, 64 bytes, 64 of aad")
+    try aead(io, a, &t, "431891b47c7a40ac58faae83be437d4c", "9ed80da16f8eaf15b9464f68", "061e87", "82382c6581446c574452ce49036a4ab4bf0d4f72b88c7c092636c074e92a9061a912e342ef2aa7b4b191c9a2ffee7503f0202c1dfa093039702c71b35ce6d439ed", "8f000448d613396e992eb62fc39dc2470aa46ddeac78956d26d85b28c22a1fa74d6ce79367138492632d3a99d3bebbceec4e174ec5400e4ba457d413228df44dfafb2164de59db20fed55f40f33aa31c82", "AES-128-GCM, 65 bytes, 3 of aad")
+    try aead(io, a, &t, "228dbbf6449bcfb20a9da23a67d72b249abb3fa51909294152749ec9ee5970d2", "d7ce61b8970b0b6ef06b9574", "2ddeaf", "6d2376f80fe76f59eea21fb18e423f31534a7c21c697a8d7def182a625d101566fd0fd7b43ae71fe873c0807d46d0134e7fa01b15fe365813db85bf04a1bf8e1dc", "ea4becb46f7121a6c8b4804e849eced1831115cf6d788365aa7d8f24e1e2f0ccf15acc9285f4a74e5e991777f7cc2803224fd1d4f8bc5f3839804293a56add73e23720a99278ab80d3054f07871644c7b8", "AES-256-GCM, 65 bytes, 3 of aad")
+    try aead(io, a, &t, "fd39840192fbbbbd9a70c5c523bf476f", "95da696e42ac1c411754d73b", "712f6e95b0bc3dafd2e5a2dbf8382c3a1c", "09dc9afed0111b5a8adb0da25ab7afdb363ad5e8002e80b2bae495c0155ff2f1c337ed6c16e3e04829855c2fd574ea9f1ab66cd8655ee89daf6a4fcb1f0e0ae006e5052e77f446b4717cc7799686e025c22d79ccb15b01923373c4ef0d2501becd1eae2f9e7adda4d4872d2b98253da682696d62afe07c56f143065956f6e158", "1556243dbce329889eef49e437f1043b7fb1d5e3727aa441701dab4690d6e5b62f8b86ef4d1b002564d40851e9b2cc99322f931567edb22c64ce8c807d23aaeff76a51d6bc89712ccdb113cad37cea04aa051de3b3a436580464027a8bfcd6be974da0b06ad97ab33f887bd960fc68322fb35bc672b6bbb75891963fc4665cb0e7a42a6a22761684df7878e1ed4011c3", "AES-128-GCM, 128 bytes, 17 of aad")
+    try aead(io, a, &t, "c2a35da706d84a9ba830a8ba49081ba55e7e311c731abe880539969a84edb413", "15a27ec24e81c6ce847b7a79", "ac9cc2f07416e8fb32c31e829ed955e343", "4b2d436d28babb18c046fdb6d29c089e30258d7789943408fccc1bafae7fb7e647f4d1617a64dc06162b043b1e9c431727965e4b332d1ad58075f2bc5082d2676b341bbece4875ad2c440f62aa91b3d026e6cdd920a3d37acf7f202d107f74b086f6d0e0d77f840522241b587392cbb4a62b1fea8b27e271c91bb96f01208ef8", "e0696e2564463c6eaf540f88b755744073e406ba28d72912d973145e2877155e96cf82e857a384004c54be9c0bc9ce554edae7062eb893cf68639d765353eb345b513925b661f6ff097ac11983d1075f3b47024177c9a280b24f9be0f16e362f36b060c582e7748f34a44f68538c2d4e9f37c9840668c2f25b1dcc16e3084d392677d2acedabc51a8a06c048275d2f92", "AES-256-GCM, 128 bytes, 17 of aad")
+    try aead(io, a, &t, "1389b9c09c62614a099527780de8199a", "b95908aa0a4164c7b79e0709", "03345196af4c6d1941950a979511b015e86fc893331a7e15e267962b2cd0860e99", "5f9c9d138e984c8ebf4df145abd4cecbc0b1a2ba15ba16014b9ae00c62cd0fc664a44f6df2029d71e9fd94c8a771369569f1ac819ea629f6408697daa3b6dd028bda251ccbbeddd63a9a6eaa4c31d3498fe686a2cfa2a0de35ff5bde0a94ad1b984c0d65d9d93fa2f7354b82d5646cffcaf59c94ed466f4a4fd5412d0bf413eb71a81e34d7d387e422f078739dd032149292ff316776bd3c823c422141d4b0b942b7388d0b187a3ddc900c114bea851d579d38db39fe6de60040871b579f80eb708b8e5f60b4af499a77c56646ec1e4d24c5136cfcd6961211d0a066897d40124e449a97b2e3ef9d5871216ecf6e261b4b158ccce5b290ab8be137fe89590a2826dfd923a195dd8f2d4190e2cb37ddcf1c89abb3d7820e4617c814b641770e3bb57468e0e02cc9c2392729e7", "e8d766b1e9308d2a2eb798135020a1fd7fbb9162f04e1c157e9d3ce5cfdb4dc4bba551c55abf5508c8b29b4e4437eb98ce7f55de46b672909b6d6c5b91d6d4f575ba75f0be5a626011fe2d7af0535a509466e0364e17b49b88c550f915ec95325a68d0b59f1233c3f995549b614d15fd70df0c516346bc0bc44f0cc8e28d2d5882316568141a1eb696f86fa6a6c57341bc6776b28419d9c56ef002247b23c444dbe59bdaa9bcdb792a8d356cac20e796327399964ffab214f5e9cfff9a8b670f5095ce59aababb0366c6bc4248abeaafe125b3f5ae6357afbf07b479449a2d67fa7b846157a87ba21230155254912c69aaed29551dde3865f005deb93046beb5dfd94db4ef9b882ca1c0ab53bf097d8072214b9f7a8f891f6e38edad8b119976c53dce74cef6ae7dba107b992932364c78225646c936e27a4e743029", "AES-128-GCM, 300 bytes, 33 of aad")
+    try aead(io, a, &t, "f54be2a0759d9ce7b27590842c0936946f82a4ef0608221387ead8a2ae33c26e", "62af1c2eeb76de6d5916fb81", "e5ec0f7fddb1cb1b0fb24615f6aa5fe956596d67056e10478dd39b283f52119223", "96e441b7df7b7aa5917520601ce563a30b4fc44b1388147aab7f0af30d6fb30e6e767d2a96858701a0de71771a4dacf8bfc0c0bf407ee118b224f57b40f06eaa872abd119fa5b490fc7dc5e6cb8ac088b7d428183c3433c37242cba16b849af44f118f06f970adb2f62c089f778087260c3a2fc08fde0681a7f2ce5ace5f18f6b3bbf90eebd81fed64f04485422b1558dea12ae2f902ff42d602215c3ac3cf8f89b41213f447ef33f0c79a02d2c3c7cebb7e5755df486c7cb84d9c5b8364e10be70583cfb7eceab2ba6a44db8e477ef9b71fd289d39d6ffc2e36b29bbc223bf957f56aac6910d7b6359b38ff35cd53353e1ce359446912ce3fa18cb206049b8087f53b10256955997b6ef93ed8ec8f6f8f05a891ba5cfe203e51f0e071a94ae5062d6f52404a7a890d2d8341", "3a70895d6b51cee1a0cdf27438a39e50f528dbcac7c2d099e79f29cb7c0881b33ea6a7ba89357ffa538dc2882bdb5ad6766e11ccacaba38d681ae81344493377c0118fde49d21f5f09b9d7a3d137f59fc22b637771f276f68d62352d7c8438b63ad45e31b13478d47f869ae8285a069b89056f9b7655f62f4c391cf70a23487d532c5cd9e0bdf9f2be53834ae9d15bed0359c4b5541938fbf0e30d037de7199c1905789ff39be10f54c09401de36b5004542b79cc74074ce11ab41348eae7072a1255b12490480195415256b6eee269f63ef82740026d94a34b3517b10c1b573b5f45a4209933db3ca44fe38a89977df7ccebd711e0eb861a3b30ec466906de5516b1a9d6ee090337e52baedce5db305285a706c8def063dcb408aed9baf3e01369dfc99a30081c570cec1d723bce8bf9e41c9cf147ea47bb6d74450", "AES-256-GCM, 300 bytes, 33 of aad")
+    try forged(io, a, &t)
+    try t.done(io)
+}
+
+fn sboxes(io: Io, a: Allocator, inout t: support.Tally, want: str) !void {
+    var got = a.alloc(0, @as(u8, 0))
+    defer a.free(got)
+    var x: u32 = 0
+    while (x < 256) {
+        const w = aes.sub_word(x | (x + 1) << 8 | (x + 2) << 16 | (x + 3) << 24)
+        a.push(&got, @as(u8, w & 0xFF))
+        a.push(&got, @as(u8, (w >> 8) & 0xFF))
+        a.push(&got, @as(u8, (w >> 16) & 0xFF))
+        a.push(&got, @as(u8, w >> 24))
+        x = x + 4
+    }
+    t.check(io, support.same(a, got[0..], want), "the S-box circuit, all 256 bytes")
+}
+
+fn bytes16(a: Allocator, s: str) ![16]u8 {
+    const b = try support.unhex(a, s)
+    defer a.free(b)
+    var out: [16]u8 = @splat(0)
+    var i = 0
+    while (i < 16) {
+        out[i] = b[i]
+        i = i + 1
+    }
+    return out
+}
+
+fn block128(io: Io, a: Allocator, inout t: support.Tally, key_hex: str, pt_hex: str, want: str, name: str) !void {
+    const c = aes.Aes.init128(try bytes16(a, key_hex)).encrypt(try bytes16(a, pt_hex))
+    t.check(io, support.same(a, c[0..], want), name)
+}
+
+fn block256(io: Io, a: Allocator, inout t: support.Tally, key_hex: str, pt_hex: str, want: str, name: str) !void {
+    const c = aes.Aes.init256(try support.bytes32(key_hex)).encrypt(try bytes16(a, pt_hex))
+    t.check(io, support.same(a, c[0..], want), name)
+}
+
+fn hash(io: Io, a: Allocator, inout t: support.Tally, h_hex: str, data_hex: str, want: str, name: str) !void {
+    const data = try support.unhex(a, data_hex)
+    defer a.free(data)
+    const h = try bytes16(a, h_hex)
+    var g = ghash.Ghash.init(h)
+    g.update(data[0..])
+    const y = g.final()
+    t.check(io, support.same(a, y[0..], want), name)
+    var p = ghash.Ghash.init(h)
+    var at = 0
+    while (at < @len(data)) {
+        const end = if (@len(data) - at > 7) at + 7 else @len(data)
+        p.update(data[at..end])
+        at = end
+    }
+    const again = p.final()
+    t.check_of(io, support.same(a, again[0..], want), "in pieces:", name)
+}
+
+fn aead(io: Io, a: Allocator, inout t: support.Tally, key_hex: str, nonce_hex: str, aad_hex: str, pt_hex: str, want: str, name: str) !void {
+    const g = if (@len(key_hex) == 32) gcm.AesGcm.init128(try bytes16(a, key_hex)) else gcm.AesGcm.init256(try support.bytes32(key_hex))
+    const nonce = try support.bytes12(nonce_hex)
+    const aad = try support.unhex(a, aad_hex)
+    defer a.free(aad)
+    var buf = try support.unhex(a, pt_hex)
+    defer a.free(buf)
+    const n = @len(buf)
+    var i = 0
+    while (i < 16) {
+        a.push(&buf, 0)
+        i = i + 1
+    }
+    g.seal(nonce, aad[0..], &buf[0..])
+    t.check_of(io, support.same(a, buf[0..], want), "seal:", name)
+    var opened = true
+    g.open(nonce, aad[0..], &buf[0..]) catch {
+        opened = false
+    }
+    t.check_of(io, opened and support.same(a, buf[0..n], pt_hex), "open:", name)
+}
+
+// A changed bit anywhere, other additional data or another nonce fails,
+// and leaves only zeros.
+fn forged(io: Io, a: Allocator, inout t: support.Tally) !void {
+    const key: [32]u8 = @splat(0x42)
+    const g = gcm.AesGcm.init256(key)
+    const nonce: [12]u8 = @splat(7)
+    const aad = "header"
+    var sealed = a.alloc(0, @as(u8, 0))
+    defer a.free(sealed)
+    a.append_str(&sealed, "attack at dawn, bring snacks")
+    var i = 0
+    while (i < 16) {
+        a.push(&sealed, 0)
+        i = i + 1
+    }
+    g.seal(nonce, aad, &sealed[0..])
+    var at = 0
+    var all_fail = true
+    var all_zero = true
+    while (at < @len(sealed)) {
+        var bad = a.concat(sealed[0..], "")
+        defer a.free(bad)
+        bad[at] = bad[at] ^ 0x80
+        var failed = false
+        g.open(nonce, aad, &bad[0..]) catch {
+            failed = true
+        }
+        all_fail = all_fail and failed
+        for (bad) |b| {
+            all_zero = all_zero and b == 0
+        }
+        at = at + 1
+    }
+    t.check(io, all_fail, "a changed bit of the ciphertext or tag fails")
+    t.check(io, all_zero, "a failed open leaves only zeros")
+    var copy = a.concat(sealed[0..], "")
+    defer a.free(copy)
+    var failed = false
+    g.open(nonce, "headex", &copy[0..]) catch {
+        failed = true
+    }
+    t.check(io, failed, "other additional data fails")
+    var copy2 = a.concat(sealed[0..], "")
+    defer a.free(copy2)
+    var other: [12]u8 = @splat(7)
+    other[0] = 8
+    failed = false
+    g.open(other, aad, &copy2[0..]) catch {
+        failed = true
+    }
+    t.check(io, failed, "another nonce fails")
+    var short: [15]u8 = @splat(0)
+    failed = false
+    g.open(nonce, aad, &short[0..]) catch {
+        failed = true
+    }
+    t.check(io, failed, "fewer than 16 bytes fails")
+}
