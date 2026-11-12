@@ -110,15 +110,30 @@ against the GCM paper's test cases and OpenSSL.
 ## X25519
 
 ```egg
-uses io
+uses io, alloc, rand
 
 const x25519 = @import("tls/x25519")
 
-fn main(io: Io) !void {
-    const mine: [32]u8 = @splat(7)               // for show: 32 random bytes
-    const theirs = x25519.public_key(@splat(8))  // what the peer sends
-    const shared = try x25519.shared(mine, theirs)   // error.WeakKey if all zeros
-    io.print(shared[0])
+fn main(io: Io, a: Allocator, rng: Random) !void {
+    const mine = secret(a, rng)                    // 32 random bytes, kept
+    const ours = x25519.public_key(mine)           // sent to the peer
+    // The peer's public key, received from it; made up here.
+    const theirs = x25519.public_key(secret(a, rng))
+    const shared = try x25519.shared(mine, theirs) // error.WeakKey if all zeros
+    io.print(ours[0], " ", shared[0])
+}
+
+fn secret(a: Allocator, rng: Random) [32]u8 {
+    var b = a.alloc(32, @as(u8, 0))
+    defer a.free(b)
+    rng.fill(&b)
+    var k: [32]u8 = @splat(0)
+    var i = 0
+    while (i < 32) {
+        k[i] = b[i]
+        i = i + 1
+    }
+    return k
 }
 ```
 
