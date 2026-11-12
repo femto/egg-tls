@@ -38,8 +38,8 @@ const AesGcm = struct {
         var counter: u32 = 2
         var at = 0
         while (at < n) {
-            const ks = self.stream(nonce, counter)
             const end = if (n - at > 64) at + 64 else n
+            const ks = self.stream(nonce, counter, (end - at + 15) / 16)
             var i = at
             while (i < end) {
                 buf[i] = buf[i] ^ ks[i - at]
@@ -72,7 +72,7 @@ const AesGcm = struct {
         while (at < n) {
             const end = if (n - at > 64) at + 64 else n
             g.update(buf[at..end])
-            const ks = self.stream(nonce, counter)
+            const ks = self.stream(nonce, counter, (end - at + 15) / 16)
             var i = at
             while (i < end) {
                 buf[i] = buf[i] ^ ks[i - at]
@@ -100,20 +100,21 @@ const AesGcm = struct {
         }
     }
 
-    // 64 bytes of key stream: the counter blocks nonce | counter .. + 3,
-    // encrypted. The counters wrap as GCM's inc32 does, so blocks past the
-    // end of a message of the greatest length are only unused; seal and
-    // open panic on a longer one (counter + 4).
-    fn stream(self: AesGcm, nonce: [12]u8, counter: u32) [64]u8 {
+    // The key stream for `used` blocks (1 to 4): the counter blocks nonce |
+    // counter .. counter + used - 1, encrypted. Only blocks a message uses
+    // get a counter, so the longest message GCM allows (2^32 - 2 blocks)
+    // ends at counter 2^32 - 1, and a longer one panics on the overflow
+    // rather than reuse counter 1, which masks the tag.
+    fn stream(self: AesGcm, nonce: [12]u8, counter: u32, used: i64) [64]u8 {
         var blocks: [64]u8 = @splat(0)
         var b = 0
-        while (b < 4) {
+        while (b < used) {
             var i = 0
             while (i < 12) {
                 blocks[16 * b + i] = nonce[i]
                 i = i + 1
             }
-            const c = counter +% @as(u32, b)
+            const c = counter + @as(u32, b)
             blocks[16 * b + 12] = @as(u8, c >> 24)
             blocks[16 * b + 13] = @as(u8, (c >> 16) & 0xFF)
             blocks[16 * b + 14] = @as(u8, (c >> 8) & 0xFF)
