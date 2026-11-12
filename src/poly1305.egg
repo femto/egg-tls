@@ -1,0 +1,194 @@
+// poly1305: the Poly1305 one-time authenticator (RFC 8439, section 2.5).
+// A key authenticates one message only; ChaCha20-Poly1305 makes a fresh
+// one for each.
+//
+//     var m = Poly1305.init(key)    // key: [32]u8
+//     m.update(data)
+//     const tag = m.final()         // [16]u8
+//
+// The 130-bit accumulator is kept in five 26-bit limbs (as in
+// poly1305-donna), so every product fits a u64, and nothing branches on
+// or indexes by the key or the data: its time depends only on the length.
+
+const MASK: u64 = 0x3FF_FFFF
+
+const Poly1305 = struct {
+    r: [5]u64
+    pad: [4]u64
+    h: [5]u64
+    buf: [16]u8
+    fill: i64
+
+    fn init(key: [32]u8) Poly1305 {
+        // r, clamped as RFC 8439 says, and s, added at the end.
+        var r: [5]u64 = @splat(0)
+        r[0] = le32(key[0..], 0) & 0x3FF_FFFF
+        r[1] = (le32(key[0..], 3) >> 2) & 0x3FF_FF03
+        r[2] = (le32(key[0..], 6) >> 4) & 0x3FF_C0FF
+        r[3] = (le32(key[0..], 9) >> 6) & 0x3F0_3FFF
+        r[4] = (le32(key[0..], 12) >> 8) & 0x00F_FFFF
+        var pad: [4]u64 = @splat(0)
+        var i = 0
+        while (i < 4) {
+            pad[i] = le32(key[0..], 16 + 4 * i)
+            i = i + 1
+        }
+        return Poly1305{ .r = r, .pad = pad, .h = @splat(0), .buf = @splat(0), .fill = 0 }
+    }
+
+    fn update(inout self: Poly1305, data: []u8) void {
+        var i = 0
+        const n = @len(data)
+        while (i < n) {
+            if (self.fill == 0 and n - i >= 16) {
+                absorb(&self.h, self.r, data[i..i + 16], 1)
+                i = i + 16
+            } else {
+                self.buf[self.fill] = data[i]
+                self.fill = self.fill + 1
+                i = i + 1
+                if (self.fill == 16) {
+                    absorb(&self.h, self.r, self.buf[0..], 1)
+                    self.fill = 0
+                }
+            }
+        }
+    }
+
+    // Zeros up to a multiple of 16 bytes, as ChaCha20-Poly1305 puts
+    // after the additional data and after the ciphertext.
+    fn pad16(inout self: Poly1305) void {
+        if (self.fill > 0) {
+            while (self.fill < 16) {
+                self.buf[self.fill] = 0
+                self.fill = self.fill + 1
+            }
+            absorb(&self.h, self.r, self.buf[0..], 1)
+            self.fill = 0
+        }
+    }
+
+    fn final(self: Poly1305) [16]u8 {
+        var h = self.h
+        if (self.fill > 0) {
+            // The last, short block: its bytes, a 1, then zeros.
+            var last: [16]u8 = @splat(0)
+            var i = 0
+            while (i < self.fill) {
+                last[i] = self.buf[i]
+                i = i + 1
+            }
+            last[self.fill] = 1
+            absorb(&h, self.r, last[0..], 0)
+        }
+        // Carry fully, then h - p if that is not negative (chosen by a
+        // mask, not a branch).
+        var c = h[1] >> 26
+        h[1] = h[1] & MASK
+        h[2] = h[2] + c
+        c = h[2] >> 26
+        h[2] = h[2] & MASK
+        h[3] = h[3] + c
+        c = h[3] >> 26
+        h[3] = h[3] & MASK
+        h[4] = h[4] + c
+        c = h[4] >> 26
+        h[4] = h[4] & MASK
+        h[0] = h[0] + c * 5
+        c = h[0] >> 26
+        h[0] = h[0] & MASK
+        h[1] = h[1] + c
+        var g: [5]u64 = @splat(0)
+        g[0] = h[0] + 5
+        c = g[0] >> 26
+        g[0] = g[0] & MASK
+        g[1] = h[1] + c
+        c = g[1] >> 26
+        g[1] = g[1] & MASK
+        g[2] = h[2] + c
+        c = g[2] >> 26
+        g[2] = g[2] & MASK
+        g[3] = h[3] + c
+        c = g[3] >> 26
+        g[3] = g[3] & MASK
+        g[4] = h[4] +% c -% (1 << 26)
+        // All ones when g is not negative (h >= p), else 0.
+        const keep_g = (g[4] >> 63) -% 1
+        var i = 0
+        while (i < 5) {
+            h[i] = (h[i] & ~keep_g) | (g[i] & keep_g & MASK)
+            i = i + 1
+        }
+        // h mod 2^128, plus s.
+        const w0 = (h[0] | (h[1] << 26)) & 0xFFFF_FFFF
+        const w1 = ((h[1] >> 6) | (h[2] << 20)) & 0xFFFF_FFFF
+        const w2 = ((h[2] >> 12) | (h[3] << 14)) & 0xFFFF_FFFF
+        const w3 = ((h[3] >> 18) | (h[4] << 8)) & 0xFFFF_FFFF
+        var out: [16]u8 = @splat(0)
+        var f = w0 + self.pad[0]
+        put32(&out[0..4], f)
+        f = w1 + self.pad[1] + (f >> 32)
+        put32(&out[4..8], f)
+        f = w2 + self.pad[2] + (f >> 32)
+        put32(&out[8..12], f)
+        f = w3 + self.pad[3] + (f >> 32)
+        put32(&out[12..16], f)
+        return out
+    }
+}
+
+// The tag of data under key, at once.
+fn mac(key: [32]u8, data: []u8) [16]u8 {
+    var m = Poly1305.init(key)
+    m.update(data)
+    return m.final()
+}
+
+fn le32(b: []u8, at: i64) u64 {
+    return @as(u64, b[at]) | @as(u64, b[at + 1]) << 8 | @as(u64, b[at + 2]) << 16 | @as(u64, b[at + 3]) << 24
+}
+
+// The low 32 bits of x, little-endian.
+fn put32(inout out: []u8, x: u64) void {
+    out[0] = @as(u8, x & 0xFF)
+    out[1] = @as(u8, (x >> 8) & 0xFF)
+    out[2] = @as(u8, (x >> 16) & 0xFF)
+    out[3] = @as(u8, (x >> 24) & 0xFF)
+}
+
+// h = (h + block) * r mod 2^130 - 5, partly reduced. hibit is 1 for a full
+// 16-byte block (its 2^128 bit), 0 for the padded last one.
+fn absorb(inout h: [5]u64, r: [5]u64, m: []u8, hibit: u64) void {
+    const s1 = r[1] * 5
+    const s2 = r[2] * 5
+    const s3 = r[3] * 5
+    const s4 = r[4] * 5
+    const h0 = h[0] + (le32(m, 0) & MASK)
+    const h1 = h[1] + ((le32(m, 3) >> 2) & MASK)
+    const h2 = h[2] + ((le32(m, 6) >> 4) & MASK)
+    const h3 = h[3] + ((le32(m, 9) >> 6) & MASK)
+    const h4 = h[4] + ((le32(m, 12) >> 8) | (hibit << 24))
+    const d0 = h0 * r[0] + h1 * s4 + h2 * s3 + h3 * s2 + h4 * s1
+    var d1 = h0 * r[1] + h1 * r[0] + h2 * s4 + h3 * s3 + h4 * s2
+    var d2 = h0 * r[2] + h1 * r[1] + h2 * r[0] + h3 * s4 + h4 * s3
+    var d3 = h0 * r[3] + h1 * r[2] + h2 * r[1] + h3 * r[0] + h4 * s4
+    var d4 = h0 * r[4] + h1 * r[3] + h2 * r[2] + h3 * r[1] + h4 * r[0]
+    var c = d0 >> 26
+    h[0] = d0 & MASK
+    d1 = d1 + c
+    c = d1 >> 26
+    h[1] = d1 & MASK
+    d2 = d2 + c
+    c = d2 >> 26
+    h[2] = d2 & MASK
+    d3 = d3 + c
+    c = d3 >> 26
+    h[3] = d3 & MASK
+    d4 = d4 + c
+    c = d4 >> 26
+    h[4] = d4 & MASK
+    h[0] = h[0] + c * 5
+    c = h[0] >> 26
+    h[0] = h[0] & MASK
+    h[1] = h[1] + c
+}

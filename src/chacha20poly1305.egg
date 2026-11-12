@@ -1,0 +1,116 @@
+// chacha20poly1305: the ChaCha20-Poly1305 AEAD (RFC 8439, section 2.8),
+// in place.
+//
+//     // buf: the plaintext, then 16 bytes for the tag
+//     chacha20poly1305.seal(key, nonce, aad, &buf[0..])
+//     // buf: the ciphertext, then the tag, as a TLS record carries them
+//     try chacha20poly1305.open(key, nonce, aad, &buf[0..])
+//     // buf: the plaintext again (the last 16 bytes are left as they were)
+//
+// open authenticates as it decrypts, in one pass, and when the tag does
+// not match it zeros all of buf and returns error.AuthFailed, so no
+// unauthenticated plaintext is ever left. Its time does not depend on the
+// key, the data or where the tag differs. A nonce must never be used twice
+// with one key.
+
+const chacha20 = @import("chacha20.egg")
+const poly1305 = @import("poly1305.egg")
+
+fn seal(key: [32]u8, nonce: [12]u8, aad: []u8, inout buf: []u8) void {
+    const n = @len(buf) - 16
+    var m = start(key, nonce, aad)
+    var counter: u32 = 1
+    var at = 0
+    while (at < n) {
+        const end = if (n - at > 64) at + 64 else n
+        const ks = chacha20.block(key, counter, nonce)
+        var i = at
+        while (i < end) {
+            buf[i] = buf[i] ^ ks[i - at]
+            i = i + 1
+        }
+        m.update(buf[at..end])
+        at = end
+        if (at < n) {
+            counter = counter + 1
+        }
+    }
+    const tag = finish(m, @len(aad), n)
+    var i = 0
+    while (i < 16) {
+        buf[n + i] = tag[i]
+        i = i + 1
+    }
+}
+
+fn open(key: [32]u8, nonce: [12]u8, aad: []u8, inout buf: []u8) !void {
+    if (@len(buf) < 16) {
+        return error.AuthFailed
+    }
+    const n = @len(buf) - 16
+    var m = start(key, nonce, aad)
+    var counter: u32 = 1
+    var at = 0
+    while (at < n) {
+        const end = if (n - at > 64) at + 64 else n
+        m.update(buf[at..end])
+        const ks = chacha20.block(key, counter, nonce)
+        var i = at
+        while (i < end) {
+            buf[i] = buf[i] ^ ks[i - at]
+            i = i + 1
+        }
+        at = end
+        if (at < n) {
+            counter = counter + 1
+        }
+    }
+    const tag = finish(m, @len(aad), n)
+    // Every byte compared, the differences gathered: no early exit.
+    var diff: u8 = 0
+    var i = 0
+    while (i < 16) {
+        diff = diff | (tag[i] ^ buf[n + i])
+        i = i + 1
+    }
+    if (diff != 0) {
+        i = 0
+        while (i < @len(buf)) {
+            buf[i] = 0
+            i = i + 1
+        }
+        return error.AuthFailed
+    }
+}
+
+// Poly1305 keyed by the first 32 bytes of block 0, over the additional
+// data and its padding.
+fn start(key: [32]u8, nonce: [12]u8, aad: []u8) poly1305.Poly1305 {
+    const b0 = chacha20.block(key, 0, nonce)
+    var otk: [32]u8 = @splat(0)
+    var i = 0
+    while (i < 32) {
+        otk[i] = b0[i]
+        i = i + 1
+    }
+    var m = poly1305.Poly1305.init(otk)
+    m.update(aad)
+    m.pad16()
+    return m
+}
+
+// The tag: the ciphertext's padding, then both lengths as 8-byte
+// little-endian numbers.
+fn finish(m: poly1305.Poly1305, aad_len: i64, ct_len: i64) [16]u8 {
+    var p = m
+    p.pad16()
+    var lens: [16]u8 = @splat(0)
+    var i = 0
+    while (i < 8) {
+        lens[i] = @as(u8, (aad_len >> (8 * i)) & 0xFF)
+        lens[8 + i] = @as(u8, (ct_len >> (8 * i)) & 0xFF)
+        i = i + 1
+    }
+    p.update(lens[0..])
+    return p.final()
+}

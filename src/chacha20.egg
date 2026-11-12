@@ -1,0 +1,87 @@
+// chacha20: the ChaCha20 stream cipher (RFC 8439, section 2.4), with a
+// 32-byte key, a 12-byte nonce and a 32-bit block counter.
+//
+//     chacha20.xor(key, 1, nonce, &data[0..])    // encrypts or decrypts
+//
+// Only additions, xors and rotations of 32-bit words, so its time does
+// not depend on the key or the data.
+
+fn rotl(x: u32, n: i64) u32 {
+    return (x << n) | (x >> (32 - n))
+}
+
+fn le32(b: []u8, at: i64) u32 {
+    return @as(u32, b[at]) | @as(u32, b[at + 1]) << 8 | @as(u32, b[at + 2]) << 16 | @as(u32, b[at + 3]) << 24
+}
+
+fn quarter(inout s: [16]u32, a: i64, b: i64, c: i64, d: i64) void {
+    s[a] = s[a] +% s[b]
+    s[d] = rotl(s[d] ^ s[a], 16)
+    s[c] = s[c] +% s[d]
+    s[b] = rotl(s[b] ^ s[c], 12)
+    s[a] = s[a] +% s[b]
+    s[d] = rotl(s[d] ^ s[a], 8)
+    s[c] = s[c] +% s[d]
+    s[b] = rotl(s[b] ^ s[c], 7)
+}
+
+// The 64 bytes of key stream for one counter value.
+fn block(key: [32]u8, counter: u32, nonce: [12]u8) [64]u8 {
+    var init: [16]u32 = @splat(0)
+    init[0] = 0x6170_7865
+    init[1] = 0x3320_646E
+    init[2] = 0x7962_2D32
+    init[3] = 0x6B20_6574
+    var i = 0
+    while (i < 8) {
+        init[4 + i] = le32(key[0..], 4 * i)
+        i = i + 1
+    }
+    init[12] = counter
+    init[13] = le32(nonce[0..], 0)
+    init[14] = le32(nonce[0..], 4)
+    init[15] = le32(nonce[0..], 8)
+    var s = init
+    i = 0
+    while (i < 10) {
+        quarter(&s, 0, 4, 8, 12)
+        quarter(&s, 1, 5, 9, 13)
+        quarter(&s, 2, 6, 10, 14)
+        quarter(&s, 3, 7, 11, 15)
+        quarter(&s, 0, 5, 10, 15)
+        quarter(&s, 1, 6, 11, 12)
+        quarter(&s, 2, 7, 8, 13)
+        quarter(&s, 3, 4, 9, 14)
+        i = i + 1
+    }
+    var out: [64]u8 = @splat(0)
+    i = 0
+    while (i < 16) {
+        const w = s[i] +% init[i]
+        out[4 * i] = @as(u8, w & 0xFF)
+        out[4 * i + 1] = @as(u8, (w >> 8) & 0xFF)
+        out[4 * i + 2] = @as(u8, (w >> 16) & 0xFF)
+        out[4 * i + 3] = @as(u8, w >> 24)
+        i = i + 1
+    }
+    return out
+}
+
+// data xor the key stream from counter on, in place. The counter must not
+// pass 2^32 - 1 (256 GiB under one nonce): that panics.
+fn xor(key: [32]u8, counter: u32, nonce: [12]u8, inout data: []u8) void {
+    var c = counter
+    var at = 0
+    while (at < @len(data)) {
+        const ks = block(key, c, nonce)
+        var i = 0
+        while (i < 64 and at < @len(data)) {
+            data[at] = data[at] ^ ks[i]
+            at = at + 1
+            i = i + 1
+        }
+        if (at < @len(data)) {
+            c = c + 1
+        }
+    }
+}

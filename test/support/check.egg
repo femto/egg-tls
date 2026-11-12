@@ -1,0 +1,106 @@
+// What the tests share: a tally of checks, and hex.
+uses io, alloc
+
+const Tally = struct {
+    passed: i64
+    failed: i64
+
+    fn check(inout self: Tally, io: Io, ok: bool, name: str) void {
+        if (ok) {
+            self.passed = self.passed + 1
+        } else {
+            self.failed = self.failed + 1
+            io.print("FAIL ", name)
+        }
+    }
+
+    // check, saying which of several things failed.
+    fn check_of(inout self: Tally, io: Io, ok: bool, which: str, name: str) void {
+        if (ok) {
+            self.passed = self.passed + 1
+        } else {
+            self.failed = self.failed + 1
+            io.print("FAIL ", which, " ", name)
+        }
+    }
+
+    // Prints the counts; an error if any check failed.
+    fn done(self: Tally, io: Io) !void {
+        io.print(self.passed, " passed, ", self.failed, " failed")
+        if (self.failed > 0) {
+            return error.Failed
+        }
+    }
+}
+
+fn tally() Tally {
+    return Tally{ .passed = 0, .failed = 0 }
+}
+
+// Do the bytes, in lower-case hex, read want?
+fn same(a: Allocator, got: []u8, want: str) bool {
+    const h = hex(a, got)
+    defer a.free(h)
+    return h == want
+}
+
+fn hex(a: Allocator, b: []u8) Buf(u8) {
+    const digits = "0123456789abcdef"
+    var out = a.alloc(0, @as(u8, 0))
+    for (b) |x| {
+        a.push(&out, digits[@as(i64, x >> 4)])
+        a.push(&out, digits[@as(i64, x & 15)])
+    }
+    return out
+}
+
+fn unhex(a: Allocator, s: str) !Buf(u8) {
+    if (@len(s) % 2 != 0) {
+        return error.BadHex
+    }
+    var out = a.alloc(0, @as(u8, 0))
+    errdefer a.free(out)
+    var i = 0
+    while (i + 1 < @len(s)) {
+        a.push(&out, try nibble(s[i]) << 4 | try nibble(s[i + 1]))
+        i = i + 2
+    }
+    return out
+}
+
+fn nibble(c: u8) !u8 {
+    if (c >= '0' and c <= '9') {
+        return c - '0'
+    }
+    if (c >= 'a' and c <= 'f') {
+        return c - 'a' + 10
+    }
+    return error.BadHex
+}
+
+// Hex text of exactly 32 or 12 bytes as an array (for keys and nonces).
+fn bytes32(s: str) ![32]u8 {
+    if (@len(s) != 64) {
+        return error.BadHex
+    }
+    var out: [32]u8 = @splat(0)
+    var i = 0
+    while (i < 32) {
+        out[i] = try nibble(s[2 * i]) << 4 | try nibble(s[2 * i + 1])
+        i = i + 1
+    }
+    return out
+}
+
+fn bytes12(s: str) ![12]u8 {
+    if (@len(s) != 24) {
+        return error.BadHex
+    }
+    var out: [12]u8 = @splat(0)
+    var i = 0
+    while (i < 12) {
+        out[i] = try nibble(s[2 * i]) << 4 | try nibble(s[2 * i + 1])
+        i = i + 1
+    }
+    return out
+}
