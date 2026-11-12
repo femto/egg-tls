@@ -50,8 +50,10 @@ RFC 5869.
 
 ## ChaCha20-Poly1305
 
-In place, in one pass, as a TLS record holds it: the plaintext, then 16
-bytes for the tag.
+In place, in one pass, on one buffer. Before `seal` it holds the plaintext
+and then 16 spare bytes; after it, the ciphertext and then the tag, which
+is how a TLS record carries them. `open` turns that back into the
+plaintext (the last 16 bytes are left as they were).
 
 ```egg
 uses io

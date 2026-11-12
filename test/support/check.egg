@@ -55,6 +55,9 @@ fn hex(a: Allocator, b: []u8) Buf(u8) {
 }
 
 fn unhex(a: Allocator, s: str) !Buf(u8) {
+    if (@len(s) % 2 != 0) {
+        return error.BadHex
+    }
     var out = a.alloc(0, @as(u8, 0))
     errdefer a.free(out)
     var i = 0
@@ -75,8 +78,11 @@ fn nibble(c: u8) !u8 {
     return error.BadHex
 }
 
-// The first N bytes of hex text as an array (for keys and nonces).
+// Hex text of exactly 32 or 12 bytes as an array (for keys and nonces).
 fn bytes32(s: str) ![32]u8 {
+    if (@len(s) != 64) {
+        return error.BadHex
+    }
     var out: [32]u8 = @splat(0)
     var i = 0
     while (i < 32) {
@@ -87,6 +93,9 @@ fn bytes32(s: str) ![32]u8 {
 }
 
 fn bytes12(s: str) ![12]u8 {
+    if (@len(s) != 24) {
+        return error.BadHex
+    }
     var out: [12]u8 = @splat(0)
     var i = 0
     while (i < 12) {
