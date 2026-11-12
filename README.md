@@ -89,7 +89,7 @@ const aes_gcm = @import("tls/aes_gcm")
 fn main(io: Io) !void {
     const key: [16]u8 = @splat(1)
     const g = aes_gcm.AesGcm.init128(key)    // init256 takes a [32]u8
-    const nonce: [12]u8 = @splat(2)
+    const nonce: [12]u8 = @splat(2)        // for show: never twice with one key
     var buf: [21]u8 = @splat(0)
     buf[0] = 'h'
     g.seal(nonce, "header", &buf[0..])

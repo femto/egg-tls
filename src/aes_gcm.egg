@@ -101,8 +101,9 @@ const AesGcm = struct {
     }
 
     // 64 bytes of key stream: the counter blocks nonce | counter .. + 3,
-    // encrypted. The counter must not pass 2^32 - 1 (64 GiB under one
-    // nonce): that panics.
+    // encrypted. The counters wrap as GCM's inc32 does, so blocks past the
+    // end of a message of the greatest length are only unused; seal and
+    // open panic on a longer one (counter + 4).
     fn stream(self: AesGcm, nonce: [12]u8, counter: u32) [64]u8 {
         var blocks: [64]u8 = @splat(0)
         var b = 0
@@ -112,7 +113,7 @@ const AesGcm = struct {
                 blocks[16 * b + i] = nonce[i]
                 i = i + 1
             }
-            const c = counter + @as(u32, b)
+            const c = counter +% @as(u32, b)
             blocks[16 * b + 12] = @as(u8, c >> 24)
             blocks[16 * b + 13] = @as(u8, (c >> 16) & 0xFF)
             blocks[16 * b + 14] = @as(u8, (c >> 8) & 0xFF)

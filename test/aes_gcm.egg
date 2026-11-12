@@ -77,6 +77,9 @@ fn sboxes(io: Io, a: Allocator, inout t: support.Tally, want: str) !void {
 }
 
 fn bytes16(a: Allocator, s: str) ![16]u8 {
+    if (@len(s) != 32) {
+        return error.BadHex
+    }
     const b = try support.unhex(a, s)
     defer a.free(b)
     var out: [16]u8 = @splat(0)

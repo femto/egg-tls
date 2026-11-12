@@ -34,18 +34,18 @@ const Aes = struct {
             i = i + 1
         }
         ortho(&q)
-        add_round_key(&q, self.keys, 0)
+        add_round_key(&q, self.keys[0..8])
         var r = 1
         while (r < self.rounds) {
             sbox(&q)
             shift_rows(&q)
             mix_columns(&q)
-            add_round_key(&q, self.keys, r)
+            add_round_key(&q, self.keys[8 * r..8 * r + 8])
             r = r + 1
         }
         sbox(&q)
         shift_rows(&q)
-        add_round_key(&q, self.keys, self.rounds)
+        add_round_key(&q, self.keys[8 * self.rounds..8 * self.rounds + 8])
         ortho(&q)
         i = 0
         while (i < 4) {
@@ -153,10 +153,11 @@ fn put32(inout out: []u8, x: u64) void {
     out[3] = @as(u8, (x >> 24) & 0xFF)
 }
 
-fn add_round_key(inout q: [8]u64, keys: [120]u64, round: i64) void {
+// key: the eight words of one round key.
+fn add_round_key(inout q: [8]u64, key: []u64) void {
     var i = 0
     while (i < 8) {
-        q[i] = q[i] ^ keys[8 * round + i]
+        q[i] = q[i] ^ key[i]
         i = i + 1
     }
 }
