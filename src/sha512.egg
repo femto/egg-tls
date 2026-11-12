@@ -61,7 +61,8 @@ const Sha512 = struct {
     }
 
     // A 1 bit, zeros to 112 bytes past a multiple of 128, and the length
-    // in bits as 16 big-endian bytes (the top 8 are 0: total is a u64).
+    // in bits as 16 big-endian bytes: total counts bytes, so the top
+    // bits of the length are total >> 61.
     fn padded(self: Sha512) Sha512 {
         var s = self
         const bits = self.total << 3
@@ -71,6 +72,7 @@ const Sha512 = struct {
         if (n <= 0) {
             n = n + 128
         }
+        pad[n + 7] = @as(u8, self.total >> 61)
         var i = 0
         while (i < 8) {
             pad[n + 8 + i] = @as(u8, (bits >> (56 - 8 * i)) & 0xFF)
