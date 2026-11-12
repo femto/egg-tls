@@ -1,0 +1,163 @@
+// ChaCha20, Poly1305 and ChaCha20-Poly1305 against RFC 8439, and against
+// OpenSSL (ChaCha20, the AEAD) and the definition of Poly1305 in Ruby's
+// big integers, at lengths around the block sizes and at the edges of
+// Poly1305's final reduction.
+uses io, alloc
+
+const chacha20 = @import("tls/chacha20")
+const poly1305 = @import("tls/poly1305")
+const cp = @import("tls/chacha20poly1305")
+const support = @import("support/check.egg")
+
+fn main(io: Io, a: Allocator) !void {
+    var t = support.tally()
+    try block(io, a, &t, "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f", 1, "000000090000004a00000000", "10f1e7e4d13b5915500fdd1fa32071c4c7d1f4c733c068030422aa9ac3d46c4ed2826446079faa0914c2d705d98b02a2b5129cd1de164eb9cbd083e8a2503c4e", "RFC 8439 2.3.2")
+    try stream(io, a, &t, "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f", 1, "000000000000004a00000000", "4c616469657320616e642047656e746c656d656e206f662074686520636c617373206f66202739393a204966204920636f756c64206f6666657220796f75206f6e6c79206f6e652074697020666f7220746865206675747572652c2073756e73637265656e20776f756c642062652069742e", "6e2e359a2568f98041ba0728dd0d6981e97e7aec1d4360c20a27afccfd9fae0bf91b65c5524733ab8f593dabcd62b3571639d624e65152ab8f530c359f0861d807ca0dbf500d6a6156a38e088a22b65e52bc514d16ccf806818ce91ab77937365af90bbf74a35be6b40b8eedf2785e42874d", "RFC 8439 2.4.2")
+    try stream(io, a, &t, "41f728b0b45849079ba02d52506aaadcceabc7021114a26b1cd8d1a81cb2068c", 406682963, "ff7ece38fbdf38c8fc01fe14", "", "", "ChaCha20, 0 bytes")
+    try stream(io, a, &t, "500236aed03eb6534d8b0f8a40fcc6c3c8200b6d4a71e87cb0069ed353ed79b2", 1901771667, "1c2b875fe3a31d173c883b7e", "21", "ee", "ChaCha20, 1 bytes")
+    try stream(io, a, &t, "f5aa483175ad9837cc343348e3b3442f97fc3c7040131b7e34947b0cda408b63", 1806980697, "0b2d0a858e475c12acd56b6a", "dab9fc0d3933bd152e6e1bcc2baa93c7ccfbb12967b5c49908e0518ecb1b40e2472b34b7d1e733563b591bd23fb31493f2acf4bac062431d7d88ab473a6810", "ddcf6687e91cc72a19f54466e4d025867a44e364050c2f103b2c35a71c55261180a4a58701f2809e7d8c8d11f54019e2ec1a328766f498f22718a937fa82e8", "ChaCha20, 63 bytes")
+    try stream(io, a, &t, "588b1bd5d9f28f3fff45231f3489f89a1a1e1b3d367901db7d6b91157a8c85e8", 1755862076, "0496d5a9ca0d4129515b3b6f", "4224d40f8776b0186f6569fc894984c68c3e0e1b31408f6963bcd570bcd2692472e1ddfe852f45f42087947bb053f52c8643f6c5e4ca460a5cbb1a2f93779947", "638f4258687e8ea203a069727569b8591e3db50929a5b5ff94b1cd205033de750b5c0407d81ff5fa04a50668f89595bec20a4ceca937301e7011dff61d72c8f3", "ChaCha20, 64 bytes")
+    try stream(io, a, &t, "73d1ddb120bea7e029533afda67bb89ad4b9b89df86cdafacabce0dbf697cc29", 218468662, "b35761123c5d9d5fce07d2df", "dc107103e98898d3e49a42b7cf6ad5faa9f2f8e39e5b4c144b22a59540cea541597fdc15ddffc7197811524dcf37f86883320e0f5993a653a67c37890b4f2e8aca", "ab3460f66a5832de8b2b1bca9b65282c170596d2b28b32886dcbb68d1536ced09aca20e31b6fe2e308031a724c1c8225082a1cf4a7f23207b3c041b2eb16386e7b", "ChaCha20, 65 bytes")
+    try stream(io, a, &t, "961399b5d3564ca01fc5d16f2a2043da043ac4bdcdcf46866ec83a6f8264e412", 710642710, "c9e4c0231cedca6b6c73b476", "de00aba063d33066f3d199998c29906ffc33bf34bca390728041bb8a97b27d267522e9d99a5c83786e78d1c4b4041d378fabbb7a0d45cb29e72ac2958156a3f0be403610e3f60fc80eb8b59d379e002ace84e926d33f4e223159410de8b36b7590eeb244620d69f38622557c7d5ae910be1707c5514b0aa3b2bfae2d5e611471c5d707babc80c6c6f957511a5674fb40d34c680bc15ff43f594f4b8d418478cfee8625e5e34482dc1a308a0f4f9db7b3d1baeaba005218831098a73f37a5df1795fa4a167adb3f54", "a38c60c0238fabb2c86f7279195d31ead58e97f944fc376471f82c1e9bce268db1555c8fded2070546fc538eae8f836c38b3c20a0c90bf9f4b198d5044574d5b3eca95b19e0c4a3c9d329ae8ea59984acab193bf3e115c77e8e9a6888997d16432fc90cb3ccc9eb09ffe805b8dc0078d7fb69e66264a42ecfc9acac3152601672e9e414ea93e8c1c39def26c27b8a88c83042f1fd9123afe361c28adc413412cd81cc9559f60c4e631e375680e2e2f1d2f99bf2fd638a0f1e247d1555ecf5fb844eced87cd5f876d", "ChaCha20, 200 bytes")
+    try mac(io, a, &t, "85d6be7857556d337f4452fe42d506a80103808afb0db2fd4abff6af4149f51b", "43727970746f6772617068696320466f72756d2052657365617263682047726f7570", "a8061dc1305136c6c22b8baf0c0127a9", "RFC 8439 2.5.2")
+    try mac(io, a, &t, "ec1abf327e4dc1b6ea0fdf949fe673bfd338697420cb67ddc22346eced69fde7", "", "d338697420cb67ddc22346eced69fde7", "Poly1305, 0 bytes")
+    try mac(io, a, &t, "440947dcaea875bc972bfd76ed245f8c7ee8014049fdb1431158c328e83cd4ae", "10", "cdc07b4b1634b5805ea5c195af77ebd3", "Poly1305, 1 bytes")
+    try mac(io, a, &t, "c5f1adf5f8774eb5fc3a732d0cbea401bdba10932f59127faccc13fbf9446728", "d8763614ea462aed7ee5e41d65f33b", "d3f6a7c2debecaf6d045268e49f351e5", "Poly1305, 15 bytes")
+    try mac(io, a, &t, "9bd138ef189eba665ad93484f11b6c57279de5aaed6a3191a853e96867111f38", "9cccf025dca93074ad64529ef17360ad", "304e4e91f29e4645283498b4c77ca41c", "Poly1305, 16 bytes")
+    try mac(io, a, &t, "ee79cd6174c928b33126fe0aac5ddd94e9d6fc69f1fa5d6f0db26a077e69ac58", "6bffe67b39ff7a3eab14265488fa806b8b", "62370033498efdd952bac1909c02eda9", "Poly1305, 17 bytes")
+    try mac(io, a, &t, "f86aa94cd09564165dd9e0778a603dff3dd4237022632728c0d96af959b2a59d", "4b5c118a06de2c42988f1efb080a7926367d30f396fedff2f8385c912bee30", "0c97b68b58600f20071865b95b329591", "Poly1305, 31 bytes")
+    try mac(io, a, &t, "25bdecccf86eea1a13f4cae10b10cdcc17835962bbbc32aa473b7ae7b8ebf870", "b4d76f7c99ccb54cd852630b33aafa95ad3ddebe48ed3c7707868f9d26f4beff", "5de66f8c17f2e1846501e809e2bafcd5", "Poly1305, 32 bytes")
+    try mac(io, a, &t, "7685cc55bb2a158f39eb41cffddf3f969c17e548c2591a057bfdd13de8041787", "9a28b30ac25373c39da214c919fdb62646d579d28d66e7ddc668e80d3aeb1e5b6a", "8bf1303280e881e123b834b4a2238638", "Poly1305, 33 bytes")
+    try mac(io, a, &t, "c67f5ec014f60596917813bc49d471239ff050926004d31dd9632c716d9a5eab", "0fac3c8ecbe40ed78bcc53cde0451dc4985eb367cc22286eddfaf56359d7bd7e2232d3e4996e19ff2e2aea24bf97f5b7bdf34b59e2c91965255b8e7f4e19d547e21a0c040dea9a6b8f514c6f4cef2d5dabb9484604011e80f211b4429c0f512a77c69648", "29ccda87ce741780031f1233e9bb1a5c", "Poly1305, 100 bytes")
+    try mac(io, a, &t, "0100000000000000000000000000000000000000000000000000000000000000", "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff", "03000000000000000000000000000000", "Poly1305, h = p + 3")
+    try mac(io, a, &t, "0100000000000000000000000000000000000000000000000000000000000000", "fffffffffffffffffffffffffffffffffcffffffffffffffffffffffffffffff", "00000000000000000000000000000000", "Poly1305, h = p")
+    try mac(io, a, &t, "0100000000000000000000000000000000000000000000000000000000000000", "fffffffffffffffffffffffffffffffffbffffffffffffffffffffffffffffff", "faffffffffffffffffffffffffffffff", "Poly1305, h = p - 1")
+    try mac(io, a, &t, "0100000000000000000000000000000000000000000000000000000000000000", "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff", "02000000000000000000000000000000", "Poly1305, h just under 2^130")
+    try mac(io, a, &t, "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff", "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff", "900fe32bc15fa8d7bca8efe4c7e37eb1", "Poly1305, all ones key")
+    try aead(io, a, &t, "808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f", "070000004041424344454647", "50515253c0c1c2c3c4c5c6c7", "4c616469657320616e642047656e746c656d656e206f662074686520636c617373206f66202739393a204966204920636f756c64206f6666657220796f75206f6e6c79206f6e652074697020666f7220746865206675747572652c2073756e73637265656e20776f756c642062652069742e", "d31a8d34648e60db7b86afbc53ef7ec2a4aded51296e08fea9e2b5a736ee62d63dbea45e8ca9671282fafb69da92728b1a71de0a9e060b2905d6a5b67ecd3b3692ddbd7f2d778b8c9803aee328091b58fab324e4fad675945585808b4831d7bc3ff4def08e4b7a9de576d26586cec64b61161ae10b594f09e26a7e902ecbd0600691", "RFC 8439 2.8.2")
+    try aead(io, a, &t, "590dcbebcbcd0663546b603b4b6828921be9a849adf3c5c0bb6bb4ebeb0c09ab", "528af9297fe442e3d490699a", "", "", "06f3d535a6f7d724f141c80e9e899a2d", "AEAD, 0 bytes, 0 of aad")
+    try aead(io, a, &t, "26c09feb07e7695470d15c7e2f0511ac78e08898fefdfab282fd3b14f792d411", "b0ae7367b9652fc066238757", "b07b70ae50", "", "4323f5d22c3f6ea2e4069705ef4a8542", "AEAD, 0 bytes, 5 of aad")
+    try aead(io, a, &t, "5dc71e81481faffc77b02cd83ca16f1ceed8627c8ec12b3b2a833a32b1bed5be", "399ce795f8ff8c49ce929541", "", "19", "89cb98468dfe72eff8a61019c2fea80bda", "AEAD, 1 bytes, 0 of aad")
+    try aead(io, a, &t, "ce72a90d05f18eb507b26b2609b8b7ff5d3db1ca87aee2cd2a9ebbb709e0323a", "c37845ffb91e36493e215b80", "de26e52b904507c7f5b05f6987253c9b", "9be8d725e1b89b2ab613bea2400b18", "86d659c43e505157864daa9a40db7ce5bc52d89f20e20a092bc93b7d8addda", "AEAD, 15 bytes, 16 of aad")
+    try aead(io, a, &t, "c41d4b37dcc53e9cb1c0e6dc3481172a029935bb8d8019a5d2a505ae3cfb94d3", "9d0c0078615d0388b1aa12ab", "8ca3394190d0702369fffd5deb", "8adb53134eb131e0f1c0eaa13f642f78", "792bdf20c2876256edae35f06dd68d0a0bc27a3bcc29f03e233f28c0b962753b", "AEAD, 16 bytes, 13 of aad")
+    try aead(io, a, &t, "af0fceef304ae8e2ed8e773c19273db0721abb91ebf02d2f40d2159a2c5138c9", "9c1c515ad5512ee0e063a96e", "de", "6fb4e39525b8fc219e56c3753041dd9911", "e34e1c007e0e0548a5616c7e2f2fb79edea7c5279337025f083e806665df7b9cae", "AEAD, 17 bytes, 1 of aad")
+    try aead(io, a, &t, "9fcfa83be60f46948fca5dd14ae960b948d260fdd31e526074264896c66989e3", "c6a071809e573db9f52f22ac", "", "3da7974c2635eac7cacd9b19b84721ff2396e3f400676e1ed00469f6eedbbb764dce7c5b8bb5f60a95727371484ad1c22ef54fd0a97a30e6c66d46a1824dfc", "7c5949edaed9df375bec085ac48433d1465f6e3c9e97986fbdc95308d9137defcad1ea17a97ac8aa7ce1b8c70d761505980ff68c920dabf7c737f7cb645439ad4f188f2ee864d5db756c98408eba15", "AEAD, 63 bytes, 0 of aad")
+    try aead(io, a, &t, "420ea178175ce68366a4997aab8c7639f9eef487399997d9a9f40435edd0b304", "18f66418a39501ae334be8a6", "c6330c25f209898a2c219146519132c95fb90ab2f8a22610c271329a8e2e6ba087f5585a54c8cb537ca8da9a5539c57e294f152ca21c9ad844eae1fde1532d4a", "e9753b6b73ba874caa47f2af807cf576611b835c6456627ca377fba5ee15897272c3f3690d28a1c3a173b4a4d719511a71b2a13d55f018eeb2907bdec17261fa", "159e6c233d6ffb906e7e89bbf71cb095f823142308843f42f31da4a09713908c43fe2b4a27b0fbd7ccb1e254f7143f29c00e4dd7d0cb74798ddb1c08f7c61343b16b833f1075e570ee49629685ecaea4", "AEAD, 64 bytes, 64 of aad")
+    try aead(io, a, &t, "8bc89e9518cd027e9784019d957f9c841aae4c9fe4f4325efe6ebee1625dfc38", "68483f49870596fedb325e00", "391f43", "bd1f50118eb68597cb37dc745e2f154e999b360012dc53d95b20f5871b65e02762a191748783fcdcf59d0e5ce28d274c6c0fa446f3479094bc3f4aee1f7534841d", "38c23757eaacd2c1db2f0456673dc65c672732eec451edf9d1700ca5fed351ad98c1d1cfbbd52439f8e8ab9f405a565cdc10ad1dc12fb8043340aecee039bcec8105c539fd9514eb16fd212d5eff0d9803", "AEAD, 65 bytes, 3 of aad")
+    try aead(io, a, &t, "819a3e69258c707546482c0ea3e8af4d01a41f18ab8848eeb7929dcc251cf989", "60ff717d0096b137d4bc1e81", "58c810731e2fe9a836c65fe7170d3da272", "7c5d7dfc0387041f38dd00b2a18d4370f0047d4ce556feb6bd40fa7fbd278c8df402aa096b05e48b405a4af13891bbf76918bd16efe967fa0d1d13afc3d3a4ed4c3c7c07edfa8a36d788cdaf5cf7ee3a17be93eff5ba29808ca9485285d033f4d11843cd0a0b5654148e0670a65e0c2b1e8757c24aa71f6bc0fa819af4ea0071", "33703db3ae39b966efd0f9e7c207dd5bca6af8f9108df2aad7636d732f14eee30da1335e9a3281a0c0909ac6766540029746dc50bf01ea0a5d36e820c04400e3019cef8fa2fbd9ecb58a21c60d688220dd8ffeebf10df25fb00b70eaa6908dfc06fa2de5b1b27698e2e69677f1219214be6a83dc87dbec4bc703dad396629a3ce72c95ba1f4d176174d0f592fb1ee6f1", "AEAD, 128 bytes, 17 of aad")
+    try aead(io, a, &t, "be0f7b346e4f035414b1c90febfeea18b24272242e2cf6ad1a4b2a7c277ddbbf", "404ed3588cf50736a659d8bf", "52cdd4381ce2fea7e869c8c5d17944595676615e45759dba1f648e3bd493f722c6", "f796caa6774b0a93ca72eefa13d1fd2ea2f17ab3614c422c9d360f533c9df6a80a3e7f162ac2f79ab54ed2f9b6ab1fe5b16ba33935af0194192a8e8573ae59e619daaebeea606941366b02da606a635777621c0b97d4f95a97ae170e336a23b7cc48d954efff34682cd1b9714f2e33448c5ccc46cec898b27270bf74cdbe92832c067356a39f67ddfa052a8fb0bff563c8752c480339946d4e663093026467cbef758521bcb52128b891f801b2bf7df243dcb7ecb6c92b79aca484d8d7bf5401afd31a9ebf4de218cd5c72db1653dad6897d4663db596ef4323c4fe13accd5a07aabf955e643b5553cae22f197e06222ec42b49352704d9e0010b582e6f4a75ec70c416584059428e2e7dc6bee908918449ee7cdf3d416e7b82f6e4ced3f4bba617397761212ec93d8434342", "c7c17d672119436eb37dec917bd529e9bf939b4d77aaec7d6ba65906862a14cc7aaf5071249ab7101599bfce576e8ed35de9c1d74a1b8653117895127451fe673a460c37386427e8d4cec08574b3bc14aaa4be8db6d607b7d4fd65e17e16976e0f83d0cde3758d7bcb1478021a30334f35ca45e2053c2977b415230e106f193666e0daa9ac84d451c0c63da1f30e17688b9b5b8ca8f35747f405392327253d5cdf0edb483718a789b831a5434d576536f946573344ceb4ab4d45b18a0229d720ee75fd0adcd0b11686266da192ccdead70a6e65c3483654cead97841fb033c707d4d97334545a56bf110d69cb551e9cbca17bb26fe8a23b1f7b9a9abeffccc1e6a24a3d0b3031bb711b982a0384cc8bd32db4e520253606616329dc4d7e18b39848e339dbee5cb10a1dbc13b2346eed4983a584dc2d6e662c4816a83", "AEAD, 300 bytes, 33 of aad")
+    try forged(io, a, &t)
+    try t.done(io)
+}
+
+fn block(io: Io, a: Allocator, inout t: support.Tally, key_hex: str, counter: u32, nonce_hex: str, want: str, name: str) !void {
+    const b = chacha20.block(try support.bytes32(key_hex), counter, try support.bytes12(nonce_hex))
+    t.check(io, support.same(a, b[0..], want), name)
+}
+
+fn stream(io: Io, a: Allocator, inout t: support.Tally, key_hex: str, counter: u32, nonce_hex: str, data_hex: str, want: str, name: str) !void {
+    var data = try support.unhex(a, data_hex)
+    defer a.free(data)
+    chacha20.xor(try support.bytes32(key_hex), counter, try support.bytes12(nonce_hex), &data[0..])
+    t.check(io, support.same(a, data[0..], want), name)
+}
+
+fn mac(io: Io, a: Allocator, inout t: support.Tally, key_hex: str, data_hex: str, want: str, name: str) !void {
+    const data = try support.unhex(a, data_hex)
+    defer a.free(data)
+    const key = try support.bytes32(key_hex)
+    const tag = poly1305.mac(key, data[0..])
+    t.check(io, support.same(a, tag[0..], want), name)
+    // The same in pieces of 7: buffering across blocks changes nothing.
+    var m = poly1305.Poly1305.init(key)
+    var at = 0
+    while (at < @len(data)) {
+        const end = if (@len(data) - at > 7) at + 7 else @len(data)
+        m.update(data[at..end])
+        at = end
+    }
+    const again = m.final()
+    t.check_of(io, support.same(a, again[0..], want), "in pieces:", name)
+}
+
+// seal gives the ciphertext and tag OpenSSL does; open gives the
+// plaintext back.
+fn aead(io: Io, a: Allocator, inout t: support.Tally, key_hex: str, nonce_hex: str, aad_hex: str, pt_hex: str, want: str, name: str) !void {
+    const key = try support.bytes32(key_hex)
+    const nonce = try support.bytes12(nonce_hex)
+    const aad = try support.unhex(a, aad_hex)
+    defer a.free(aad)
+    var buf = try support.unhex(a, pt_hex)
+    defer a.free(buf)
+    const n = @len(buf)
+    var i = 0
+    while (i < 16) {
+        a.push(&buf, 0)
+        i = i + 1
+    }
+    cp.seal(key, nonce, aad[0..], &buf[0..])
+    t.check_of(io, support.same(a, buf[0..], want), "seal:", name)
+    var opened = true
+    cp.open(key, nonce, aad[0..], &buf[0..]) catch {
+        opened = false
+    }
+    t.check_of(io, opened and support.same(a, buf[0..n], pt_hex), "open:", name)
+}
+
+// A changed bit anywhere, in the ciphertext, the tag, the additional data
+// or the nonce, fails, and leaves only zeros.
+fn forged(io: Io, a: Allocator, inout t: support.Tally) !void {
+    const key: [32]u8 = @splat(0x42)
+    const nonce: [12]u8 = @splat(7)
+    const aad = "header"
+    var sealed = a.alloc(0, @as(u8, 0))
+    defer a.free(sealed)
+    a.append_str(&sealed, "attack at dawn, bring snacks")
+    var i = 0
+    while (i < 16) {
+        a.push(&sealed, 0)
+        i = i + 1
+    }
+    cp.seal(key, nonce, aad, &sealed[0..])
+    var at = 0
+    var all_fail = true
+    var all_zero = true
+    while (at < @len(sealed)) {
+        var bad = a.concat(sealed[0..], "")
+        defer a.free(bad)
+        bad[at] = bad[at] ^ 0x01
+        var failed = false
+        cp.open(key, nonce, aad, &bad[0..]) catch {
+            failed = true
+        }
+        all_fail = all_fail and failed
+        for (bad) |b| {
+            all_zero = all_zero and b == 0
+        }
+        at = at + 1
+    }
+    t.check(io, all_fail, "a changed bit of the ciphertext or tag fails")
+    t.check(io, all_zero, "a failed open leaves only zeros")
+    var copy = a.concat(sealed[0..], "")
+    defer a.free(copy)
+    var failed = false
+    cp.open(key, nonce, "headex", &copy[0..]) catch {
+        failed = true
+    }
+    t.check(io, failed, "other additional data fails")
+    var copy2 = a.concat(sealed[0..], "")
+    defer a.free(copy2)
+    var other: [12]u8 = @splat(7)
+    other[11] = 8
+    failed = false
+    cp.open(key, other, aad, &copy2[0..]) catch {
+        failed = true
+    }
+    t.check(io, failed, "another nonce fails")
+    var short: [15]u8 = @splat(0)
+    failed = false
+    cp.open(key, nonce, aad, &short[0..]) catch {
+        failed = true
+    }
+    t.check(io, failed, "fewer than 16 bytes fails")
+}

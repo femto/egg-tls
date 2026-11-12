@@ -8,7 +8,7 @@ library, the way Zig's `std.crypto.tls` is written in Zig.
 checked against its RFC's test vectors:
 
 1. hashes: SHA-256, SHA-384/512, HMAC, HKDF (done)
-2. AEADs: ChaCha20-Poly1305, AES-128/256-GCM
+2. AEADs: ChaCha20-Poly1305 (done), AES-128/256-GCM
 3. key exchange: X25519, P-256
 4. a TLS 1.3 client: record layer, key schedule, handshake
 5. certificates: DER, X.509, ECDSA, RSA, Ed25519, the system's CA bundle,
@@ -47,6 +47,32 @@ fn main(io: Io) !void {
 
 `clutch test` checks them against FIPS 180-4 (RFC 6234), RFC 4231 and
 RFC 5869.
+
+## ChaCha20-Poly1305
+
+In place, in one pass, as a TLS record holds it: the plaintext, then 16
+bytes for the tag.
+
+```egg
+uses io
+
+const cp = @import("tls/chacha20poly1305")
+
+fn main(io: Io) !void {
+    const key: [32]u8 = @splat(1)
+    const nonce: [12]u8 = @splat(2)        // never twice with one key
+    var buf: [21]u8 = @splat(0)
+    buf[0] = 'h'                            // 5 bytes of plaintext, 16 for the tag
+    cp.seal(key, nonce, "header", &buf[0..])
+    try cp.open(key, nonce, "header", &buf[0..])   // error.AuthFailed, and
+    io.print(buf[0])                               // all zeros, if changed
+}
+```
+
+Its time depends on lengths only, not on the key, the data or where a
+forged tag differs. `clutch test` checks it against RFC 8439, OpenSSL,
+and Poly1305 computed from its definition, including the edges of its
+final reduction.
 
 ## License
 
