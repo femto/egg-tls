@@ -1,0 +1,81 @@
+// X25519 against RFC 7748 (sections 5.2 and 6.1, and the iterated test,
+// once and a thousand times), and against the RFC's own algorithm in
+// Ruby's big integers for random keys and for u-coordinates that are not
+// reduced; a peer point of small order gives error.WeakKey.
+uses io, alloc
+
+const x25519 = @import("tls/x25519")
+const support = @import("support/check.egg")
+
+fn main(io: Io, a: Allocator) !void {
+    var t = support.tally()
+    try mult(io, a, &t, "a546e36bf0527c9d3b16154b82465edd62144c0ac1fc5a18506a2244ba449ac4", "e6db6867583030db3594c1a424b15f7c726624ec26b3353b10a903a6d0ab1c4c", "c3da55379de9c6908e94ea4df28d084f32eccf03491c71f754b4075577a28552", "RFC 7748 5.2, first")
+    try mult(io, a, &t, "4b66e9d4d1b4673c5ad22691957d6af5c11b6421e0ea01d42ca4169e7918ba0d", "e5210f12786811d3f4b7959d0538ae2c31dbe7106fc03c3efc4cd549c715a493", "95cbde9476e8907d7aade45cb4b873f88b595a68799fa152e6f8f7647aac7957", "RFC 7748 5.2, second (u's top bit set)")
+    try dh(io, a, &t, "77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a", "5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb", "8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a", "de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f", "4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742", "RFC 7748 6.1")
+    try dh(io, a, &t, "6f0b47a2d1a814b2d4088f3776362fa65c243c1355aa833c8b0c39e3a348a28f", "eb176fe5466252062d01bceff9211f7dd291f980b29a68a8cd3ea0d8d6574324", "bebbcb244447e7649bbdd6522d7253ee693aab08eaff15b7e31dd0e5ea37ce4b", "a3e14cf633111e52d341885371b8fa65178a736139db443e50a6f0eed7ee0651", "6a76eda5b0296986549698aca1fa352073ed7eff35f7111b90b22956ba75d648", "random pair 1")
+    try dh(io, a, &t, "9e9027ea12c1e94da8de42c2602723e08c81768b99fe6237e2d84c6ac57024e9", "975a2cf8445569437f395e7397ec02b20253dde4fa7d791c719b59a8e35ee0cd", "95221c4c05508cb9049e34d2271f64f6ab07da7e0f05bfca78cdada8fabd2a2c", "c4020cd8a4329f799dccc7006f8c0cb1cbf0591ee33e91217c59e04da5b9df14", "e7b5e8cde701a088203804bc99f7ceb0787bc992c9d6bccd3a3d9c81eda34068", "random pair 2")
+    try dh(io, a, &t, "b953b1887468915927785096f8233480333ce46eb80f0eb79c497e16119dab3d", "26d0cc05cd7910b3646e0f8bb378446313757dc9e57951ea2a562eaabfdcecbb", "044a22f5ad25783130a54a6c3e3e057992ce83896753325f3aece81ece8ab47f", "cfeca5681086ac5ae443482e1f2931a14ac629baad1e17ad263653f0730ef64b", "6becdb34dfbe4afa1b4c79b148ce982de79f7642ae9538f9d442b4375f03a257", "random pair 3")
+    try dh(io, a, &t, "c1ac2822dd150e6e4bb27314b1269dbae388d5e1160082e430f637391a8f6b4a", "ff9b809c637e7c8a019d1d17ef6a235629ae056f41d5bbf767c36a5cd59051ad", "ab3a118a60e48e77117e2189adee3f8c3e327cd732e4855c52930642da543621", "a5b4cf4802134bb46455996c053414f42742626473402b47fd1755b2460a060c", "0895807ba6a2d4c84e14841c74128f7df4a25b8fdf6be68e01e7eb37b8ffa54f", "random pair 4")
+    try dh(io, a, &t, "e275ba7a860d0c2aeffd8221b26aa90c3246677b1f3e0bba6e8b0dfdfcc356dd", "21dc7d095fa714501384a2e3dfd06a5a3a686800359ef718848446c1b0f9c91f", "631179a4164f1366cb674811c33b6b74e4c662fe67a1d3794ec869a22b6eb40f", "c2f0d132fb3b1518d310e69a72cf9f62447c5324fd629e76883aa8c3bf47333a", "a5378e1c944dcb24383980be07b456ac09420ebe34a786ee5daadb2861e54026", "random pair 5")
+    try mult(io, a, &t, "ceb385e0b29eab0441b2ca7b14ed71aca0b342579f0cf531eb5021bb228a9ea0", "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f", "0000000000000000000000000000000000000000000000000000000000000000", "u = p")
+    try mult(io, a, &t, "f860d715eec4152f991fcadcbf19a5d64eadba9502375369bf5afeb28abbfb6a", "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f", "0000000000000000000000000000000000000000000000000000000000000000", "u = p + 1")
+    try mult(io, a, &t, "e50d35625e3859d2b9457550a7b06d807fa19f3872968169f9e25045cda8c057", "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f", "8ae373497a05e1dfe65060bf0f8220007a4feab8ab018f9af33c77527329d326", "u = 2^255 - 1")
+    try mult(io, a, &t, "6fb7778c1692254e228031753991106a1fd2d48fdb3d5b3fd6c3d27f739117fe", "7d402299a354cafb88ee725f5499353964b57e8f6a2f5e622216218460a880ee", "5ee067d763bc924e5a95c3c3207a63b8b592e5adc031778ce37eb3e00c62374f", "u's top bit set")
+    try iterate(io, a, &t, "422c8e7a6227d7bca1350b3e2bb7279f7897b87bb6854b783c60e80311ae3079")
+    try weak(io, &t)
+    try t.done(io)
+}
+
+fn mult(io: Io, a: Allocator, inout t: support.Tally, k_hex: str, u_hex: str, want: str, name: str) !void {
+    const r = x25519.scalarmult(try support.bytes32(k_hex), try support.bytes32(u_hex))
+    t.check(io, support.same(a, r[0..], want), name)
+}
+
+fn dh(io: Io, a: Allocator, inout t: support.Tally, a_hex: str, b_hex: str, want_a: str, want_b: str, want_shared: str, name: str) !void {
+    const sa = try support.bytes32(a_hex)
+    const sb = try support.bytes32(b_hex)
+    const pa = x25519.public_key(sa)
+    const pb = x25519.public_key(sb)
+    t.check_of(io, support.same(a, pa[0..], want_a), "first public key:", name)
+    t.check_of(io, support.same(a, pb[0..], want_b), "second public key:", name)
+    const s1 = try x25519.shared(sa, pb)
+    const s2 = try x25519.shared(sb, pa)
+    t.check_of(io, support.same(a, s1[0..], want_shared) and support.same(a, s2[0..], want_shared), "shared:", name)
+}
+
+// k = u = 9, then k, u = x25519(k, u), k: after one round and a thousand.
+fn iterate(io: Io, a: Allocator, inout t: support.Tally, want_one: str) !void {
+    var k: [32]u8 = @splat(0)
+    k[0] = 9
+    var u = k
+    var i = 0
+    while (i < 1000) {
+        const next = x25519.scalarmult(k, u)
+        u = k
+        k = next
+        if (i == 0) {
+            t.check(io, support.same(a, k[0..], want_one), "RFC 7748 5.2, one iteration")
+        }
+        i = i + 1
+    }
+    t.check(io, support.same(a, k[0..], "684cf59ba83309552800ef566f2f4d3c1c3887c49360e3875f2eb94d99532c51"), "RFC 7748 5.2, a thousand iterations")
+}
+
+// Points of small order (u = 0, u = 1) make the result all zeros, which
+// shared refuses.
+fn weak(io: Io, inout t: support.Tally) !void {
+    const secret = try support.bytes32("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a")
+    var u: [32]u8 = @splat(0)
+    t.check(io, refused(secret, u), "u = 0 is refused")
+    u[0] = 1
+    t.check(io, refused(secret, u), "u = 1 is refused")
+    u[0] = 9
+    t.check(io, !refused(secret, u), "u = 9 is not")
+}
+
+fn refused(secret: [32]u8, u: [32]u8) bool {
+    _ = x25519.shared(secret, u) catch {
+        return true
+    }
+    return false
+}

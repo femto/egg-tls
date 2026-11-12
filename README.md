@@ -9,13 +9,15 @@ checked against its RFC's test vectors:
 
 1. hashes: SHA-256, SHA-384/512, HMAC, HKDF (done)
 2. AEADs: ChaCha20-Poly1305, AES-128/256-GCM (done)
-3. key exchange: X25519, P-256
+3. key exchange: X25519 (done); P-256 comes with step 5, which needs the
+   curve for ECDSA anyway
 4. a TLS 1.3 client: record layer, key schedule, handshake
 5. certificates: DER, X.509, ECDSA, RSA, Ed25519, the system's CA bundle,
    host names
 
-It needs an eggc from after [egg #109](https://github.com/femto/egg/pull/109)
-(wrapping arithmetic, `+%`), which the next release will include.
+It needs an eggc from after [egg #112](https://github.com/femto/egg/pull/112)
+(wrapping arithmetic `+%`, `rng.fill` into an array, `@secureZero`), which
+the next release will include.
 
 ## The hashes
 
@@ -105,6 +107,35 @@ of words with holes in them (BearSSL's `ghash_ctmul64`), also without
 tables. `clutch test` checks the S-box circuit on all 256 bytes, AES
 against FIPS 197 and OpenSSL, GHASH against its definition, and AES-GCM
 against the GCM paper's test cases and OpenSSL.
+
+## X25519
+
+```egg
+uses io, rand
+
+const x25519 = @import("tls/x25519")
+
+fn main(io: Io, rng: Random) !void {
+    var mine: [32]u8 = @splat(0)
+    defer @secureZero(&mine)                       // gone when main returns
+    rng.fill(&mine[0..])                           // 32 random bytes, in place
+    const ours = x25519.public_key(mine)           // sent to the peer
+    // The peer's public key, received from it; made up here.
+    var other: [32]u8 = @splat(0)
+    defer @secureZero(&other)
+    rng.fill(&other[0..])
+    const theirs = x25519.public_key(other)
+    var shared = try x25519.shared(mine, theirs)   // error.WeakKey if all zeros
+    defer @secureZero(&shared)
+    io.print(ours[0], " ", shared[0])
+}
+```
+
+Field elements are sixteen 16-bit limbs, as in TweetNaCl, and the ladder
+swaps by masks, so its time does not depend on the secret. `shared`
+refuses an all-zero result, as RFC 8446 requires of a client. `clutch
+test` checks it against RFC 7748 (including the iterated test, a thousand
+rounds) and against the RFC's algorithm in Ruby's big integers.
 
 ## License
 
