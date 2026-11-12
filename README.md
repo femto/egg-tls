@@ -15,8 +15,9 @@ checked against its RFC's test vectors:
 5. certificates: DER, X.509, ECDSA, RSA, Ed25519, the system's CA bundle,
    host names
 
-It needs an eggc from after [egg #109](https://github.com/femto/egg/pull/109)
-(wrapping arithmetic, `+%`), which the next release will include.
+It needs an eggc from after [egg #112](https://github.com/femto/egg/pull/112)
+(wrapping arithmetic `+%`, `rng.fill` into an array, `@secureZero`), which
+the next release will include.
 
 ## The hashes
 
@@ -110,30 +111,23 @@ against the GCM paper's test cases and OpenSSL.
 ## X25519
 
 ```egg
-uses io, alloc, rand
+uses io, rand
 
 const x25519 = @import("tls/x25519")
 
-fn main(io: Io, a: Allocator, rng: Random) !void {
-    const mine = secret(a, rng)                    // 32 random bytes, kept
+fn main(io: Io, rng: Random) !void {
+    var mine: [32]u8 = @splat(0)
+    defer @secureZero(&mine)                       // gone when main returns
+    rng.fill(&mine[0..])                           // 32 random bytes, in place
     const ours = x25519.public_key(mine)           // sent to the peer
     // The peer's public key, received from it; made up here.
-    const theirs = x25519.public_key(secret(a, rng))
-    const shared = try x25519.shared(mine, theirs) // error.WeakKey if all zeros
+    var other: [32]u8 = @splat(0)
+    defer @secureZero(&other)
+    rng.fill(&other[0..])
+    const theirs = x25519.public_key(other)
+    var shared = try x25519.shared(mine, theirs)   // error.WeakKey if all zeros
+    defer @secureZero(&shared)
     io.print(ours[0], " ", shared[0])
-}
-
-fn secret(a: Allocator, rng: Random) [32]u8 {
-    var b = a.alloc(32, @as(u8, 0))
-    defer a.free(b)
-    rng.fill(&b)
-    var k: [32]u8 = @splat(0)
-    var i = 0
-    while (i < 32) {
-        k[i] = b[i]
-        i = i + 1
-    }
-    return k
 }
 ```
 
