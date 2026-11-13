@@ -1,0 +1,147 @@
+// roots: the certificates a client trusts, from PEM text or from the
+// system's bundle.
+//
+//     var roots = try roots.system(a, files)       // or:
+//     var mine = x509.CertList.empty()
+//     const skipped = try roots.add_pem(a, &mine, pem_text)
+//
+// PEM is base64 between "-----BEGIN CERTIFICATE-----" and
+// "-----END CERTIFICATE-----" lines; anything outside them is ignored. A
+// certificate that does not parse is skipped and counted, so one odd
+// entry in a bundle does not lose the rest; base64 that does not decode,
+// or a BEGIN with no END, is error.BadPem.
+//
+// system reads the first bundle it finds: /etc/ssl/cert.pem (macOS, the
+// BSDs, Alpine), /etc/ssl/certs/ca-certificates.crt (Debian, Ubuntu),
+// /etc/pki/tls/certs/ca-bundle.crt (Fedora, RHEL),
+// /etc/ssl/ca-bundle.pem (openSUSE),
+// /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem. None is
+// error.NoRoots. Windows's certificate store is not read yet: give it
+// PEM.
+uses alloc, fs
+
+const x509 = @import("x509.egg")
+
+fn system(a: Allocator, files: Fs) !x509.CertList {
+    const paths = [5]str{
+        "/etc/ssl/cert.pem",
+        "/etc/ssl/certs/ca-certificates.crt",
+        "/etc/pki/tls/certs/ca-bundle.crt",
+        "/etc/ssl/ca-bundle.pem",
+        "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",
+    }
+    for (paths) |path| {
+        const text = files.read(a, path) catch {
+            continue
+        }
+        defer a.free(text)
+        var list = x509.CertList.empty()
+        errdefer a.free(list)
+        _ = try add_pem(a, &list, text)
+        if (list.len() > 0) {
+            return list
+        }
+        a.free(list)
+    }
+    return error.NoRoots
+}
+
+// Adds every certificate in the PEM text to list: how many were skipped
+// because they did not parse.
+fn add_pem(a: Allocator, inout list: x509.CertList, text: []u8) !i64 {
+    const begin = "-----BEGIN CERTIFICATE-----"
+    const end = "-----END CERTIFICATE-----"
+    var skipped = 0
+    var bytes: Buf(u8) = .empty
+    defer a.free(bytes)
+    var at = 0
+    while (true) {
+        const b = find(text, begin, at)
+        if (b < 0) {
+            break
+        }
+        const body = b + @len(begin)
+        const e = find(text, end, body)
+        if (e < 0) {
+            return error.BadPem
+        }
+        a.resize(&bytes, 0, 0)
+        try base64(a, text[body..e], &bytes)
+        list.add(a, bytes[0..]) catch {
+            skipped = skipped + 1
+        }
+        at = e + @len(end)
+    }
+    return skipped
+}
+
+// Where needle first is in s at or after from, or -1.
+fn find(s: []u8, needle: str, from: i64) i64 {
+    const n = @len(needle)
+    var i = from
+    while (i + n <= @len(s)) {
+        if (s[i..i + n] == needle) {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// Base64 (RFC 4648) to bytes, at the end of out; spaces and line ends
+// are skipped, and = may only pad the end.
+fn base64(a: Allocator, s: []u8, inout out: Buf(u8)) !void {
+    var acc = 0
+    var bits = 0
+    var pad = 0
+    for (s) |ch| {
+        if (ch == ' ' or ch == '\n' or ch == '\r' or ch == '\t') {
+            continue
+        }
+        if (ch == '=') {
+            pad = pad + 1
+            continue
+        }
+        if (pad > 0) {
+            return error.BadPem
+        }
+        const v = sextet(ch)
+        if (v < 0) {
+            return error.BadPem
+        }
+        acc = (acc << 6 | v) & 0xFFFFFF
+        bits = bits + 6
+        if (bits >= 8) {
+            bits = bits - 8
+            a.push(&out, @as(u8, (acc >> bits) & 0xFF))
+        }
+    }
+    // Leftover bits, which must be zero: 4 after two characters of a
+    // group ("=="), 2 after three ("="); padding may also be left out.
+    const ok = (bits == 0 and pad == 0) or (bits == 4 and (pad == 2 or pad == 0)) or (bits == 2 and (pad == 1 or pad == 0))
+    if (!ok) {
+        return error.BadPem
+    }
+    if (acc & ((1 << bits) - 1) != 0) {
+        return error.BadPem
+    }
+}
+
+fn sextet(ch: u8) i64 {
+    if (ch >= 'A' and ch <= 'Z') {
+        return @as(i64, ch - 'A')
+    }
+    if (ch >= 'a' and ch <= 'z') {
+        return @as(i64, ch - 'a') + 26
+    }
+    if (ch >= '0' and ch <= '9') {
+        return @as(i64, ch - '0') + 52
+    }
+    if (ch == '+') {
+        return 62
+    }
+    if (ch == '/') {
+        return 63
+    }
+    return -1
+}

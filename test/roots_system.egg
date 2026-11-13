@@ -1,0 +1,14 @@
+// The system's root bundle, if there is one: it parses, and nearly all
+// of its certificates do too.
+uses io, alloc, fs
+
+const roots = @import("tls/roots")
+
+fn main(io: Io, a: Allocator, files: Fs) !void {
+    const list = roots.system(a, files) catch |e| {
+        io.print("no system roots: ", @errorName(e))
+        return
+    }
+    defer a.free(list)
+    io.print(list.len(), " roots")
+}

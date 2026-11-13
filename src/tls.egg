@@ -13,7 +13,8 @@
 //      (done: tls/key_schedule, tls/record, tls/client, and TlsConn
 //      here), without checking the server's certificate
 //   5. certificates: ECDSA on P-256 and P-384 (done: tls/ecdsa), RSA
-//      (done: tls/rsa), DER, X.509, the system's CA bundle, host names;
+//      (done: tls/rsa), DER, X.509, the system's CA bundle, host names
+//      (done: tls/der, tls/x509, tls/roots), checked in the handshake;
 //      Ed25519 later
 //
 // A client over a TcpConn, once step 5 is done:
