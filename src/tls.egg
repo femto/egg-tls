@@ -8,13 +8,12 @@
 //   2. AEADs: ChaCha20-Poly1305 (done: tls/chacha20, tls/poly1305,
 //      tls/chacha20poly1305), AES-128/256-GCM (done: tls/aes,
 //      tls/ghash, tls/aes_gcm)
-//   3. key exchange: X25519 (done: tls/x25519); P-256 comes with step 5,
-//      which needs the curve for ECDSA anyway
+//   3. key exchange: X25519 (done: tls/x25519), P-256 (done: tls/ec)
 //   4. the record layer, key schedule and handshake of a TLS 1.3 client
 //      (done: tls/key_schedule, tls/record, tls/client, and TlsConn
 //      here), without checking the server's certificate
-//   5. certificates: DER, X.509, ECDSA, RSA, Ed25519, the system's CA
-//      bundle, host names
+//   5. certificates: ECDSA on P-256 and P-384 (done: tls/ecdsa), RSA,
+//      DER, X.509, the system's CA bundle, host names; Ed25519 later
 //
 // A client over a TcpConn, once step 5 is done:
 //
@@ -31,6 +30,7 @@ uses alloc, net, rand
 
 const tls_client = @import("client.egg")
 const record = @import("record.egg")
+const ec = @import("ec.egg")
 
 const TlsConn = owned struct {
     conn: TcpConn
@@ -112,9 +112,17 @@ fn client_unverified(a: Allocator, rng: Random, sink conn: TcpConn, host: []u8) 
     var secret: [32]u8 = @splat(0)
     defer @secureZero(&secret)
     rng.fill(&secret[0..])
+    // A P-256 secret is below the group's order, as all but about one in
+    // 2^32 random values are.
+    var p256_secret: [32]u8 = @splat(0)
+    defer @secureZero(&p256_secret)
+    rng.fill(&p256_secret[0..])
+    while (!p256_ok(p256_secret)) {
+        rng.fill(&p256_secret[0..])
+    }
     var random: [32]u8 = @splat(0)
     rng.fill(&random[0..])
-    const c = tls_client.Client.start(a, secret, random, host) catch |e| {
+    const c = tls_client.Client.start(a, secret, p256_secret, random, host) catch |e| {
         conn.close()
         return e
     }
@@ -136,4 +144,11 @@ fn client_unverified(a: Allocator, rng: Random, sink conn: TcpConn, host: []u8) 
         }
     }
     return t
+}
+
+fn p256_ok(k: [32]u8) bool {
+    ec.check_scalar(ec.p256(), k[0..]) catch {
+        return false
+    }
+    return true
 }
