@@ -1,0 +1,72 @@
+// The client against real servers on the Internet, with the system's
+// roots: run with EGG_TLS_REAL set to a comma-separated list of hosts
+// (port 443). Without it, it does nothing, so clutch test needs no
+// network. Each host must verify and answer an HTTP request.
+uses io, alloc, args, net, rand, fs, time
+
+const tls = @import("tls")
+const roots = @import("tls/roots")
+const record = @import("tls/record")
+const x509 = @import("tls/x509")
+
+fn main(io: Io, a: Allocator, args: Args, net: Net, rng: Random, files: Fs, clock: Clock) !void {
+    const hosts = args.env("EGG_TLS_REAL") orelse return
+    const trusted = try roots.system(a, files)
+    defer a.free(trusted)
+    var failed = 0
+    var at = 0
+    while (at < @len(hosts)) {
+        var end = at
+        while (end < @len(hosts) and hosts[end] != ',') {
+            end = end + 1
+        }
+        const host = hosts[at..end]
+        get(io, a, rng, clock, net, trusted, host) catch |e| {
+            io.print("FAIL ", host, ": ", @errorName(e))
+            failed = failed + 1
+        }
+        at = end + 1
+    }
+    if (failed > 0) {
+        return error.Failed
+    }
+}
+
+fn get(io: Io, a: Allocator, rng: Random, clock: Clock, net: Net, trusted: x509.CertList, host: []u8) !void {
+    const t0 = clock.monotonic()
+    const conn = try net.tcp_connect(host, 443)
+    var c = tls.client(a, rng, clock, trusted, conn, host) catch |e| {
+        io.print("  in the handshake: ", @errorName(e))
+        return e
+    }
+    defer c.close(a)
+    const ms = (clock.monotonic() - t0) / 1000000
+    const request = a.concat("GET / HTTP/1.1\r\nHost: ", host, "\r\nConnection: close\r\n\r\n")
+    defer a.free(request)
+    try c.write(a, request)
+    var buf: Buf(u8) = .empty
+    defer a.free(buf)
+    _ = c.read(a, &buf, 64) catch |e| {
+        io.print("  reading the response: ", @errorName(e))
+        return e
+    }
+    var line = 0
+    while (line < @len(buf) and buf[line] != '\r') {
+        line = line + 1
+    }
+    io.print(host, ": ", suite_name(c.suite()), ", handshake ", ms, " ms, ", buf[0..line])
+}
+
+fn suite_name(s: record.Suite) str {
+    switch (s) {
+        .chacha20_poly1305_sha256 => {
+            return "CHACHA20_POLY1305"
+        }
+        .aes_128_gcm_sha256 => {
+            return "AES_128_GCM"
+        }
+        .aes_256_gcm_sha384 => {
+            return "AES_256_GCM"
+        }
+    }
+}

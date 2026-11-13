@@ -4,20 +4,46 @@
 // plain `clutch test` passes without openssl. With EGG_TLS_SHA256 too,
 // the server is `s_server -HTTP`, which sends the file big.bin as it is,
 // and what arrives must have that SHA-256.
-uses io, alloc, args, net, rand
+//
+// With EGG_TLS_CA, the PEM of the test CA, the client checks the server
+// (tls.client) for EGG_TLS_HOST (localhost by default); with
+// EGG_TLS_EXPECT too, connecting must fail with that error.
+uses io, alloc, args, net, rand, fs, time
 
 const tls = @import("tls")
 const record = @import("tls/record")
 const sha256 = @import("tls/sha256")
+const x509 = @import("tls/x509")
+const roots = @import("tls/roots")
 
-fn main(io: Io, a: Allocator, args: Args, net: Net, rng: Random) !void {
+fn main(io: Io, a: Allocator, args: Args, net: Net, rng: Random, files: Fs, clock: Clock) !void {
     const port_text = args.env("EGG_TLS_PORT") orelse return
     const want = args.env("EGG_TLS_SUITE") orelse return
     const port = number(port_text)
     const want_sha = args.env("EGG_TLS_SHA256") orelse ""
+    const ca_path = args.env("EGG_TLS_CA") orelse ""
+    var trusted = x509.CertList.empty()
+    defer a.free(trusted)
+    if (@len(ca_path) > 0) {
+        const pem = try files.read(a, ca_path)
+        defer a.free(pem)
+        _ = try roots.add_pem(a, &trusted, pem)
+    }
     const conn = try net.tcp_connect("127.0.0.1", port)
-    var c = try tls.client_unverified(a, rng, conn, "localhost")
+    const host = args.env("EGG_TLS_HOST") orelse "localhost"
+    const expect = args.env("EGG_TLS_EXPECT") orelse ""
+    var c = connect(a, rng, clock, trusted, conn, host, @len(ca_path) > 0) catch |e| {
+        if (@len(expect) > 0 and @errorName(e) == expect) {
+            io.print("refused: ", expect)
+            return
+        }
+        return e
+    }
     defer c.close(a)
+    if (@len(expect) > 0) {
+        io.print("FAIL connected; wanted ", expect)
+        return error.Failed
+    }
     const got = suite_name(c.suite())
     if (@len(want_sha) > 0) {
         try c.write(a, "GET /big.bin HTTP/1.0\r\n\r\n")
@@ -58,6 +84,13 @@ fn main(io: Io, a: Allocator, args: Args, net: Net, rng: Random) !void {
         io.print(response)
         return error.Failed
     }
+}
+
+fn connect(a: Allocator, rng: Random, clock: Clock, trusted: x509.CertList, sink conn: TcpConn, host: []u8, verify: bool) !tls.TlsConn {
+    if (verify) {
+        return tls.client(a, rng, clock, trusted, conn, host)
+    }
+    return tls.client_unverified(a, rng, conn, host)
 }
 
 fn number(text: str) i64 {

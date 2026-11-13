@@ -80,6 +80,16 @@ const CertList = struct {
         return @len(self.certs)
     }
 
+    // A copy, with bytes and certificates of its own.
+    fn clone(self: CertList, a: Allocator) CertList {
+        var c = CertList.empty()
+        a.append_str(&c.bytes, self.bytes)
+        for (self.certs) |cert| {
+            a.push(&c.certs, cert)
+        }
+        return c
+    }
+
     // Adds one certificate, as DER, or fails (error.BadDer) and adds
     // nothing.
     fn add(inout self: CertList, a: Allocator, cert: []u8) !void {
