@@ -13,7 +13,7 @@ checked against its RFC's test vectors:
 4. a TLS 1.3 client: record layer, key schedule, handshake (done, but
    without checking the server's certificate)
 5. certificates: ECDSA on P-256 and P-384 (done: 5a), RSA (done: 5b); DER,
-   X.509, the system's CA bundle, host names (5c); checked in the
+   X.509, the system's CA bundle, host names (done: 5c); checked in the
    handshake (5d). Ed25519 later
 
 It needs an eggc from after [egg #116](https://github.com/femto/egg/pull/116)
@@ -265,6 +265,60 @@ verification takes well under a millisecond. `clutch test` checks it
 against OpenSSL's keys (2048 to 8192 bits, e = 3 too) and signatures,
 and against encodings built by hand and signed with the raw private
 operation, every expected answer agreed by OpenSSL.
+
+## Certificates
+
+`tls/x509` checks a server's chain; `tls/roots` reads the roots to check
+it against, from the system's bundle or from PEM you give:
+
+```egg
+uses io, alloc, fs, time
+
+const x509 = @import("tls/x509")
+const roots = @import("tls/roots")
+
+fn main(io: Io, a: Allocator, files: Fs, clock: Clock) !void {
+    const trusted = try roots.system(a, files)       // or roots.add_pem
+    defer a.free(trusted)
+    var chain = x509.CertList.empty()                 // the server's, leaf first,
+    defer a.free(chain)                               // then each intermediate
+    const sent = [2]str{ "leaf.der", "intermediate.der" }   // in TLS, the handshake's
+    for (sent) |path| {
+        const der = try files.read(a, path)
+        defer a.free(der)
+        try chain.add(a, der)
+    }
+    x509.verify(chain, trusted, "example.com", clock.now() / 1000000000) catch |e| {
+        io.print(@errorName(e))                       // UnknownIssuer, Expired, ...
+    }
+}
+```
+
+The chain is taken in the order the server sends it: each certificate
+must be issued by the next, until one is a root or is issued by one (no
+search for another path). Each signature is checked (ECDSA on P-256 and
+P-384, RSA PKCS #1 v1.5; SHA-256, -384, -512), and each certificate's
+validity, notAfter's second included (RFC 5280). Intermediates must be
+CAs with keyCertSign if they have keyUsage, within pathLenConstraint;
+wherever extKeyUsage is, it must allow serverAuth; the leaf needs
+digitalSignature if it has keyUsage. The host must be in the leaf's
+subjectAltName, as a DNS name (any case, a final dot allowed; `*` only
+as the whole leftmost label, with two labels after it) or an IPv4 or
+IPv6 address; the common name is never used. A critical extension it
+does not know fails the certificate, nameConstraints included (not
+supported yet). Revocation is not checked. Not yet: RSA-PSS and Ed25519
+signatures in certificates, and Windows's certificate store (give PEM
+there).
+
+DER is read strictly: definite, shortest lengths, explicit defaults
+refused. `roots.system` reads the first bundle of `/etc/ssl/cert.pem`,
+`/etc/ssl/certs/ca-certificates.crt`, `/etc/pki/tls/certs/ca-bundle.crt`,
+`/etc/ssl/ca-bundle.pem` and
+`/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem`; a certificate in it
+that does not parse is skipped, not fatal (all of macOS's 128 parse).
+`clutch test` verifies 43 chains of a test PKI made by OpenSSL, whose
+verifier agreed with every answer except where tls/x509 differs by
+design (which each such case says).
 
 ## Secrets in memory
 

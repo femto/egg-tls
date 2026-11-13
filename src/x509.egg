@@ -1,0 +1,790 @@
+// x509: certificates (RFC 5280) and checking a server's chain.
+//
+//     var chain = x509.CertList.empty()
+//     defer a.free(chain)
+//     try chain.add(a, leaf_der)            // the server's, leaf first
+//     try chain.add(a, intermediate_der)
+//     try x509.verify(chain, roots, "example.com", clock.now() / 1000000000)
+//
+// roots is a CertList too (tls/roots reads the system's). verify walks
+// the chain in the order the server sent it: each certificate must be
+// issued by the next, until one is a root or is issued by one. It checks
+// each signature (ECDSA on P-256 and P-384, RSA PKCS #1 v1.5, with
+// SHA-256, -384 or -512), validity at now, that issuers are CAs
+// (basicConstraints, and keyCertSign if keyUsage is there) within their
+// pathLenConstraint, serverAuth wherever extKeyUsage is, and that the
+// leaf names host in its subjectAltName: a DNS name, with * only as the
+// whole leftmost label, or an IP address. The subject's common name is
+// never used. A critical extension it does not know (nameConstraints
+// among them) fails the certificate. Revocation is not checked.
+//
+// Failures: error.UnknownIssuer, error.BadSignature, error.Expired,
+// error.NotYetValid, error.NotCA, error.PathLenExceeded,
+// error.BadKeyUsage, error.BadExtKeyUsage, error.UnknownCriticalExtension,
+// error.HostMismatch, error.ChainTooLong, error.UnsupportedAlgorithm
+// (RSA-PSS or Ed25519 in a certificate, for now), error.BadDer.
+uses alloc
+
+const der = @import("der.egg")
+const ec = @import("ec.egg")
+const ecdsa = @import("ecdsa.egg")
+const rsa = @import("rsa.egg")
+const sha256 = @import("sha256.egg")
+const sha512 = @import("sha512.egg")
+
+const KeyKind = enum { p256, p384, rsa, other }
+
+const SigAlg = enum { ecdsa_sha256, ecdsa_sha384, ecdsa_sha512, rsa_sha256, rsa_sha384, rsa_sha512, other }
+
+// A parsed certificate: positions in the bytes it was parsed from.
+const Cert = struct {
+    whole: der.Tlv
+    tbs: der.Tlv
+    sig_alg: SigAlg
+    sig_at: i64
+    sig_end: i64
+    issuer: der.Tlv
+    subject: der.Tlv
+    not_before: i64
+    not_after: i64
+    key_kind: KeyKind
+    // An EC point, or an RSA modulus and exponent.
+    key_at: i64
+    key_end: i64
+    exp_at: i64
+    exp_end: i64
+    has_bc: bool
+    is_ca: bool
+    // -1: no limit.
+    path_len: i64
+    // KeyUsage's first byte (digitalSignature is 0x80, keyCertSign 0x04),
+    // or -1 when there is none.
+    key_usage: i64
+    has_eku: bool
+    eku_server: bool
+    has_san: bool
+    san: der.Tlv
+    unknown_critical: bool
+}
+
+// Certificates one after another, with their bytes.
+const CertList = struct {
+    bytes: Buf(u8)
+    certs: Buf(Cert)
+
+    fn empty() CertList {
+        return CertList{ .bytes = .empty, .certs = .empty }
+    }
+
+    fn len(self: CertList) i64 {
+        return @len(self.certs)
+    }
+
+    // Adds one certificate, as DER, or fails (error.BadDer) and adds
+    // nothing.
+    fn add(inout self: CertList, a: Allocator, cert: []u8) !void {
+        const at = @len(self.bytes)
+        a.append_str(&self.bytes, cert)
+        const c = parse(self.bytes[0..], at, @len(self.bytes)) catch |e| {
+            a.resize(&self.bytes, at, 0)
+            return e
+        }
+        a.push(&self.certs, c)
+    }
+}
+
+// The certificate in b[at..end], which it must fill.
+fn parse(b: []u8, at: i64, end: i64) !Cert {
+    const whole = try der.expect(b, at, end, der.SEQUENCE)
+    if (whole.end != end) {
+        return error.BadDer
+    }
+    const tbs = try der.expect(b, whole.start, whole.end, der.SEQUENCE)
+    const outer_alg = try der.expect(b, tbs.end, whole.end, der.SEQUENCE)
+    const sig = try der.expect(b, outer_alg.end, whole.end, der.BIT_STRING)
+    if (sig.end != whole.end) {
+        return error.BadDer
+    }
+    var c = Cert{
+        .whole = whole, .tbs = tbs, .sig_alg = try sig_alg_of(b, outer_alg),
+        .sig_at = try der.whole_bits(b, sig), .sig_end = sig.end,
+        .issuer = tbs, .subject = tbs, .not_before = 0, .not_after = 0,
+        .key_kind = .other, .key_at = 0, .key_end = 0, .exp_at = 0, .exp_end = 0,
+        .has_bc = false, .is_ca = false, .path_len = -1, .key_usage = -1,
+        .has_eku = false, .eku_server = false, .has_san = false, .san = tbs,
+        .unknown_critical = false,
+    }
+    // TBSCertificate: [0] version, serial, signature, issuer, validity,
+    // subject, subjectPublicKeyInfo, [1] [2] unique ids, [3] extensions.
+    var p = tbs.start
+    var version = 0
+    var t = try der.read(b, p, tbs.end)
+    if (t.tag == 0xA0) {
+        // [0] EXPLICIT INTEGER: v2 (1) or v3 (2); v1 (0) is the default,
+        // which DER leaves out.
+        const v = try der.expect(b, t.start, t.end, der.INTEGER)
+        version = try der.small_int(b, v)
+        if (v.end != t.end or version < 1 or version > 2) {
+            return error.BadDer
+        }
+        p = t.end
+    }
+    const serial = try der.expect(b, p, tbs.end, der.INTEGER)
+    try der.non_negative(b, serial)
+    const inner_alg = try der.expect(b, serial.end, tbs.end, der.SEQUENCE)
+    if (!der.same(b, inner_alg, outer_alg)) {
+        return error.BadDer
+    }
+    c.issuer = try der.expect(b, inner_alg.end, tbs.end, der.SEQUENCE)
+    const validity = try der.expect(b, c.issuer.end, tbs.end, der.SEQUENCE)
+    const nb = try der.read(b, validity.start, validity.end)
+    const na = try der.read(b, nb.end, validity.end)
+    if (na.end != validity.end) {
+        return error.BadDer
+    }
+    c.not_before = try der.time(b, nb)
+    c.not_after = try der.time(b, na)
+    c.subject = try der.expect(b, validity.end, tbs.end, der.SEQUENCE)
+    const spki = try der.expect(b, c.subject.end, tbs.end, der.SEQUENCE)
+    try public_key_info(b, spki, &c)
+    p = spki.end
+    while (p < tbs.end) {
+        t = try der.read(b, p, tbs.end)
+        if (t.tag == 0x81 or t.tag == 0x82) {
+            p = t.end
+        } else if (t.tag == 0xA3) {
+            if (version != 2) {
+                return error.BadDer
+            }
+            const list = try der.expect(b, t.start, t.end, der.SEQUENCE)
+            try extensions(b, list, &c)
+            if (list.end != t.end or t.end != tbs.end) {
+                return error.BadDer
+            }
+            p = t.end
+        } else {
+            return error.BadDer
+        }
+    }
+    return c
+}
+
+fn sig_alg_of(b: []u8, alg: der.Tlv) !SigAlg {
+    const oid = try der.oid(b, alg.start, alg.end)
+    if (der.oid_is(b, oid, "\x2a\x86\x48\xce\x3d\x04\x03\x02")) {
+        return .ecdsa_sha256
+    }
+    if (der.oid_is(b, oid, "\x2a\x86\x48\xce\x3d\x04\x03\x03")) {
+        return .ecdsa_sha384
+    }
+    if (der.oid_is(b, oid, "\x2a\x86\x48\xce\x3d\x04\x03\x04")) {
+        return .ecdsa_sha512
+    }
+    if (der.oid_is(b, oid, "\x2a\x86\x48\x86\xf7\x0d\x01\x01\x0b")) {
+        return .rsa_sha256
+    }
+    if (der.oid_is(b, oid, "\x2a\x86\x48\x86\xf7\x0d\x01\x01\x0c")) {
+        return .rsa_sha384
+    }
+    if (der.oid_is(b, oid, "\x2a\x86\x48\x86\xf7\x0d\x01\x01\x0d")) {
+        return .rsa_sha512
+    }
+    return .other
+}
+
+// SubjectPublicKeyInfo: an EC key on P-256 or P-384, an RSA key, or a
+// kind left as .other (parsed, but no signature of its can be checked).
+fn public_key_info(b: []u8, spki: der.Tlv, inout c: Cert) !void {
+    const alg = try der.expect(b, spki.start, spki.end, der.SEQUENCE)
+    const key = try der.expect(b, alg.end, spki.end, der.BIT_STRING)
+    if (key.end != spki.end) {
+        return error.BadDer
+    }
+    const oid = try der.oid(b, alg.start, alg.end)
+    if (der.oid_is(b, oid, "\x2a\x86\x48\xce\x3d\x02\x01")) {
+        // id-ecPublicKey; the parameters name the curve.
+        const curve = try der.read(b, oid.end, alg.end)
+        if (curve.tag == der.OID) {
+            _ = try der.oid(b, oid.end, alg.end)
+        }
+        if (der.oid_is(b, curve, "\x2a\x86\x48\xce\x3d\x03\x01\x07")) {
+            c.key_kind = .p256
+        } else if (der.oid_is(b, curve, "\x2b\x81\x04\x00\x22")) {
+            c.key_kind = .p384
+        }
+        c.key_at = try der.whole_bits(b, key)
+        c.key_end = key.end
+    } else if (der.oid_is(b, oid, "\x2a\x86\x48\x86\xf7\x0d\x01\x01\x01")) {
+        // rsaEncryption: RSAPublicKey { modulus, publicExponent }.
+        const at = try der.whole_bits(b, key)
+        const seq = try der.expect(b, at, key.end, der.SEQUENCE)
+        const n = try der.expect(b, seq.start, seq.end, der.INTEGER)
+        const e = try der.expect(b, n.end, seq.end, der.INTEGER)
+        if (seq.end != key.end or e.end != seq.end) {
+            return error.BadDer
+        }
+        c.key_kind = .rsa
+        c.key_at = n.start
+        c.key_end = n.end
+        c.exp_at = e.start
+        c.exp_end = e.end
+    }
+}
+
+// Extensions: SEQUENCE OF { OID, critical BOOLEAN DEFAULT FALSE, OCTET
+// STRING holding the value's DER }.
+// At most this many extensions (real certificates have about ten), so
+// checking each against the earlier ones stays small whatever a peer
+// sends.
+const MAX_EXTENSIONS: i64 = 64
+
+fn extensions(b: []u8, list: der.Tlv, inout c: Cert) !void {
+    var p = list.start
+    if (p == list.end) {
+        return error.BadDer
+    }
+    var count = 0
+    while (p < list.end) {
+        count = count + 1
+        if (count > MAX_EXTENSIONS) {
+            return error.BadDer
+        }
+        const ext = try der.expect(b, p, list.end, der.SEQUENCE)
+        const oid = try der.oid(b, ext.start, ext.end)
+        // RFC 5280 4.2: one of each. A second would override the first
+        // here, so a signed restriction could be undone.
+        var q = list.start
+        while (q < p) {
+            const prev = try der.expect(b, q, p, der.SEQUENCE)
+            const prev_oid = try der.oid(b, prev.start, prev.end)
+            if (b[prev_oid.start..prev_oid.end] == b[oid.start..oid.end]) {
+                return error.BadDer
+            }
+            q = prev.end
+        }
+        p = ext.end
+        var v = try der.read(b, oid.end, ext.end)
+        var critical = false
+        if (v.tag == der.BOOLEAN) {
+            critical = try der.boolean(b, v)
+            // DER leaves out a default: an explicit false is not DER.
+            if (!critical) {
+                return error.BadDer
+            }
+            v = try der.read(b, v.end, ext.end)
+        }
+        if (v.tag != der.OCTET_STRING or v.end != ext.end) {
+            return error.BadDer
+        }
+        if (der.oid_is(b, oid, "\x55\x1d\x13")) {
+            try basic_constraints(b, v, &c)
+        } else if (der.oid_is(b, oid, "\x55\x1d\x0f")) {
+            try key_usage(b, v, &c)
+        } else if (der.oid_is(b, oid, "\x55\x1d\x25")) {
+            try ext_key_usage(b, v, &c)
+        } else if (der.oid_is(b, oid, "\x55\x1d\x11")) {
+            const names = try der.expect(b, v.start, v.end, der.SEQUENCE)
+            if (names.end != v.end) {
+                return error.BadDer
+            }
+            c.has_san = true
+            c.san = names
+        } else if (der.oid_is(b, oid, "\x55\x1d\x20")) {
+            // certificatePolicies: no policy is asked for, so any will
+            // do, but it must be well formed.
+            try policies(b, v)
+        } else if (critical) {
+            c.unknown_critical = true
+        }
+    }
+}
+
+// basicConstraints: SEQUENCE { cA BOOLEAN DEFAULT FALSE, pathLen INTEGER
+// OPTIONAL }.
+fn basic_constraints(b: []u8, v: der.Tlv, inout c: Cert) !void {
+    const seq = try der.expect(b, v.start, v.end, der.SEQUENCE)
+    if (seq.end != v.end) {
+        return error.BadDer
+    }
+    c.has_bc = true
+    var p = seq.start
+    if (p < seq.end) {
+        const t = try der.read(b, p, seq.end)
+        if (t.tag == der.BOOLEAN) {
+            c.is_ca = try der.boolean(b, t)
+            if (!c.is_ca) {
+                return error.BadDer
+            }
+            p = t.end
+        }
+    }
+    if (p < seq.end) {
+        // Only a CA may have a pathLenConstraint (RFC 5280 4.2.1.9).
+        const t = try der.expect(b, p, seq.end, der.INTEGER)
+        if (!c.is_ca) {
+            return error.BadDer
+        }
+        c.path_len = try der.small_int(b, t)
+        p = t.end
+    }
+    if (p != seq.end) {
+        return error.BadDer
+    }
+}
+
+// keyUsage: a BIT STRING of nine named bits, its unused bits zero, and
+// not empty (RFC 5280 4.2.1.3); its first byte holds the bits checked
+// here.
+fn key_usage(b: []u8, v: der.Tlv, inout c: Cert) !void {
+    const bits = try der.expect(b, v.start, v.end, der.BIT_STRING)
+    try der.named_bits(b, bits, 2)
+    if (bits.end != v.end or bits.end - bits.start < 2) {
+        return error.BadDer
+    }
+    c.key_usage = @as(i64, b[bits.start + 1])
+}
+
+// certificatePolicies: SEQUENCE OF PolicyInformation { OID, qualifiers
+// SEQUENCE OF PolicyQualifierInfo OPTIONAL }, not empty, at most
+// MAX_EXTENSIONS of them, each policy once (RFC 5280 4.2.1.4); a
+// qualifier is SEQUENCE { OID, one element }, and a list of them is not
+// empty.
+fn policies(b: []u8, v: der.Tlv) !void {
+    const seq = try der.expect(b, v.start, v.end, der.SEQUENCE)
+    if (seq.end != v.end or seq.start == seq.end) {
+        return error.BadDer
+    }
+    var p = seq.start
+    var count = 0
+    while (p < seq.end) {
+        count = count + 1
+        if (count > MAX_EXTENSIONS) {
+            return error.BadDer
+        }
+        const info = try der.expect(b, p, seq.end, der.SEQUENCE)
+        const oid = try der.oid(b, info.start, info.end)
+        // Each policy once: compared with the ones before it.
+        var q = seq.start
+        while (q < p) {
+            const prev = try der.expect(b, q, p, der.SEQUENCE)
+            const prev_oid = try der.oid(b, prev.start, prev.end)
+            if (b[prev_oid.start..prev_oid.end] == b[oid.start..oid.end]) {
+                return error.BadDer
+            }
+            q = prev.end
+        }
+        if (oid.end < info.end) {
+            const quals = try der.expect(b, oid.end, info.end, der.SEQUENCE)
+            if (quals.end != info.end or quals.start == quals.end) {
+                return error.BadDer
+            }
+            var r = quals.start
+            while (r < quals.end) {
+                const qual = try der.expect(b, r, quals.end, der.SEQUENCE)
+                const id = try der.oid(b, qual.start, qual.end)
+                const value = try der.read(b, id.end, qual.end)
+                if (value.end != qual.end) {
+                    return error.BadDer
+                }
+                r = qual.end
+            }
+        }
+        p = info.end
+    }
+}
+
+// extKeyUsage: SEQUENCE OF OID; serverAuth or anyExtendedKeyUsage
+// allow a TLS server.
+fn ext_key_usage(b: []u8, v: der.Tlv, inout c: Cert) !void {
+    const seq = try der.expect(b, v.start, v.end, der.SEQUENCE)
+    if (seq.end != v.end) {
+        return error.BadDer
+    }
+    c.has_eku = true
+    var p = seq.start
+    while (p < seq.end) {
+        const oid = try der.oid(b, p, seq.end)
+        if (der.oid_is(b, oid, "\x2b\x06\x01\x05\x05\x07\x03\x01") or der.oid_is(b, oid, "\x55\x1d\x25\x00")) {
+            c.eku_server = true
+        }
+        p = oid.end
+    }
+}
+
+// Checks chain (leaf first, in the server's order) against roots, for
+// host, at now (seconds since 1970).
+fn verify(chain: CertList, roots: CertList, host: []u8, now: i64) !void {
+    const n = @len(chain.certs)
+    if (n == 0) {
+        return error.UnknownIssuer
+    }
+    if (n > 10) {
+        return error.ChainTooLong
+    }
+    const cb = chain.bytes[0..]
+    const leaf = chain.certs[0]
+    try usable(leaf, now)
+    try match_host(cb, leaf, host)
+    if (leaf.key_usage >= 0 and leaf.key_usage & 0x80 == 0) {
+        return error.BadKeyUsage
+    }
+    if (leaf.has_eku and !leaf.eku_server) {
+        return error.BadExtKeyUsage
+    }
+    const rb = roots.bytes[0..]
+    var i = 0
+    while (i < n) {
+        const c = chain.certs[i]
+        // A root itself: trusted as it is.
+        for (roots.certs) |r| {
+            if (cb[c.whole.at..c.whole.end] == rb[r.whole.at..r.whole.end]) {
+                return
+            }
+        }
+        // Issued by a root: any whose subject is c's issuer and whose
+        // key verifies c's signature.
+        // Names are compared as bytes, as Go does to find an issuer.
+        var named: anyerror = error.UnknownIssuer
+        for (roots.certs) |r| {
+            if (cb[c.issuer.at..c.issuer.end] == rb[r.subject.at..r.subject.end]) {
+                var ok = true
+                check_signature(cb, c, rb, r) catch |e| {
+                    ok = false
+                    // UnsupportedAlgorithm is worth more than BadSignature:
+                    // it says why no root of that name would do.
+                    if (named != error.UnsupportedAlgorithm) {
+                        named = e
+                    }
+                }
+                if (ok) {
+                    try issuer_ok(r, true, i, now)
+                    return
+                }
+            }
+        }
+        if (i + 1 == n) {
+            return named
+        }
+        // Issued by the next one in the chain.
+        const p = chain.certs[i + 1]
+        if (!(cb[c.issuer.at..c.issuer.end] == cb[p.subject.at..p.subject.end])) {
+            return error.UnknownIssuer
+        }
+        try check_signature(cb, c, cb, p)
+        try issuer_ok(p, false, i, now)
+        i = i + 1
+    }
+    return error.UnknownIssuer
+}
+
+// p may issue a certificate with i CA certificates below it. An
+// intermediate must say it is a CA; a root only must not say it is not
+// (an old version 1 root has no basicConstraints at all).
+fn issuer_ok(p: Cert, root: bool, i: i64, now: i64) !void {
+    try usable(p, now)
+    if (p.has_bc and !p.is_ca) {
+        return error.NotCA
+    }
+    if (!root and !p.has_bc) {
+        return error.NotCA
+    }
+    if (p.path_len >= 0 and i > p.path_len) {
+        return error.PathLenExceeded
+    }
+    if (p.key_usage >= 0 and p.key_usage & 0x04 == 0) {
+        return error.BadKeyUsage
+    }
+    if (p.has_eku and !p.eku_server) {
+        return error.BadExtKeyUsage
+    }
+}
+
+fn usable(c: Cert, now: i64) !void {
+    if (c.unknown_critical) {
+        return error.UnknownCriticalExtension
+    }
+    if (now < c.not_before) {
+        return error.NotYetValid
+    }
+    if (now > c.not_after) {
+        return error.Expired
+    }
+}
+
+// c's signature, by p's key.
+fn check_signature(cb: []u8, c: Cert, pb: []u8, p: Cert) !void {
+    const tbs = cb[c.tbs.at..c.tbs.end]
+    const sig = cb[c.sig_at..c.sig_end]
+    const key = pb[p.key_at..p.key_end]
+    var digest: [64]u8 = @splat(0)
+    var dl = 0
+    switch (c.sig_alg) {
+        .ecdsa_sha256, .rsa_sha256 => {
+            const d = sha256.sum(tbs)
+            copy(&digest[0..32], d[0..])
+            dl = 32
+        }
+        .ecdsa_sha384, .rsa_sha384 => {
+            const d = sha512.sum384(tbs)
+            copy(&digest[0..48], d[0..])
+            dl = 48
+        }
+        .ecdsa_sha512, .rsa_sha512 => {
+            const d = sha512.sum512(tbs)
+            copy(&digest[0..64], d[0..])
+            dl = 64
+        }
+        .other => {
+            return error.UnsupportedAlgorithm
+        }
+    }
+    const is_ecdsa = c.sig_alg == .ecdsa_sha256 or c.sig_alg == .ecdsa_sha384 or c.sig_alg == .ecdsa_sha512
+    if (is_ecdsa) {
+        if (p.key_kind == .p256) {
+            try ecdsa.verify_der(ec.p256(), key, digest[0..dl], sig)
+            return
+        }
+        if (p.key_kind == .p384) {
+            try ecdsa.verify_der(ec.p384(), key, digest[0..dl], sig)
+            return
+        }
+        // An RSA key cannot have made an ECDSA signature: it does not
+        // verify. A key of a kind not known here might have.
+        if (p.key_kind == .rsa) {
+            return error.BadSignature
+        }
+        return error.UnsupportedAlgorithm
+    }
+    if (p.key_kind == .p256 or p.key_kind == .p384) {
+        return error.BadSignature
+    }
+    if (p.key_kind != .rsa) {
+        return error.UnsupportedAlgorithm
+    }
+    const k = try rsa.public_key(key, pb[p.exp_at..p.exp_end])
+    const h: rsa.Hash = if (dl == 32) .sha256 else if (dl == 48) .sha384 else .sha512
+    try rsa.verify_pkcs1(k, h, digest[0..dl], sig)
+}
+
+fn copy(inout to: []u8, from: []u8) void {
+    var i = 0
+    while (i < @len(from)) {
+        to[i] = from[i]
+        i = i + 1
+    }
+}
+
+// Does the certificate name host in its subjectAltName?
+fn match_host(b: []u8, c: Cert, host: []u8) !void {
+    if (!c.has_san) {
+        return error.HostMismatch
+    }
+    var ip: [16]u8 = @splat(0)
+    const ip_len = parse_ip(host, &ip[0..])
+    var p = c.san.start
+    while (p < c.san.end) {
+        const name = try der.read(b, p, c.san.end)
+        p = name.end
+        if (ip_len == 0 and name.tag == 0x82) {
+            if (dns_matches(b[name.start..name.end], host)) {
+                return
+            }
+        } else if (ip_len > 0 and name.tag == 0x87) {
+            if (name.end - name.start == ip_len and b[name.start..name.end] == ip[0..ip_len]) {
+                return
+            }
+        }
+    }
+    return error.HostMismatch
+}
+
+// A dNSName pattern against a host name, ignoring case and a final dot
+// on the host. * may only be the whole leftmost label of the pattern,
+// with at least two labels after it, and stands for one label.
+fn dns_matches(pattern: []u8, host_in: []u8) bool {
+    var hl = @len(host_in)
+    if (hl > 0 and host_in[hl - 1] == '.') {
+        hl = hl - 1
+    }
+    const host = host_in[0..hl]
+    if (hl == 0 or @len(pattern) == 0) {
+        return false
+    }
+    if (pattern[0] != '*') {
+        return equal_fold(pattern, host)
+    }
+    // "*." then the rest, which must have a dot and no other *.
+    if (@len(pattern) < 4 or pattern[1] != '.') {
+        return false
+    }
+    const rest = pattern[2..]
+    var dot = false
+    for (rest) |ch| {
+        if (ch == '*') {
+            return false
+        }
+        if (ch == '.') {
+            dot = true
+        }
+    }
+    if (!dot) {
+        return false
+    }
+    // host: one non-empty label, a dot, then rest.
+    var first = 0
+    while (first < hl and host[first] != '.') {
+        first = first + 1
+    }
+    if (first == 0 or first == hl) {
+        return false
+    }
+    return equal_fold(rest, host[first + 1..])
+}
+
+fn equal_fold(x: []u8, y: []u8) bool {
+    if (@len(x) != @len(y)) {
+        return false
+    }
+    var i = 0
+    while (i < @len(x)) {
+        if (lower(x[i]) != lower(y[i])) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn lower(ch: u8) u8 {
+    return if (ch >= 'A' and ch <= 'Z') ch + 32 else ch
+}
+
+// host as an IPv4 (4 bytes) or IPv6 (16 bytes) address in out: how many
+// bytes, or 0 when it is not one.
+fn parse_ip(host: []u8, inout out: []u8) i64 {
+    var colon = false
+    for (host) |ch| {
+        if (ch == ':') {
+            colon = true
+        }
+    }
+    if (colon) {
+        return parse_ipv6(host, &out[0..16])
+    }
+    return parse_ipv4(host, &out[0..4])
+}
+
+fn parse_ipv4(s: []u8, inout out: []u8) i64 {
+    var part = 0
+    var value = 0
+    var count = 0
+    for (s) |ch| {
+        if (ch == '.') {
+            if (count == 0 or part > 2) {
+                return 0
+            }
+            out[part] = @as(u8, value)
+            part = part + 1
+            value = 0
+            count = 0
+        } else if (ch >= '0' and ch <= '9') {
+            value = value * 10 + @as(i64, ch - '0')
+            count = count + 1
+            if (value > 255 or count > 3) {
+                return 0
+            }
+        } else {
+            return 0
+        }
+    }
+    if (part != 3 or count == 0) {
+        return 0
+    }
+    out[3] = @as(u8, value)
+    return 4
+}
+
+// Eight groups of up to four hex digits, or fewer with one "::" for the
+// zeros between; no embedded IPv4.
+fn parse_ipv6(s: []u8, inout out: []u8) i64 {
+    var groups: [8]i64 = @splat(0)
+    var n = 0
+    var gap = -1
+    var i = 0
+    const len = @len(s)
+    if (len >= 2 and s[0] == ':' and s[1] == ':') {
+        gap = 0
+        i = 2
+    } else if (len >= 1 and s[0] == ':') {
+        return 0
+    }
+    while (i < len) {
+        var v = 0
+        var digits = 0
+        while (i < len and hex(s[i]) >= 0) {
+            v = v * 16 + hex(s[i])
+            digits = digits + 1
+            i = i + 1
+        }
+        if (digits == 0 or digits > 4 or n == 8) {
+            return 0
+        }
+        groups[n] = v
+        n = n + 1
+        if (i < len) {
+            if (s[i] != ':') {
+                return 0
+            }
+            i = i + 1
+            if (i < len and s[i] == ':') {
+                if (gap >= 0) {
+                    return 0
+                }
+                gap = n
+                i = i + 1
+            } else if (i == len) {
+                return 0
+            }
+        }
+    }
+    if ((gap < 0 and n != 8) or (gap >= 0 and n > 7)) {
+        return 0
+    }
+    // Groups after the gap go to the end.
+    var g: [8]i64 = @splat(0)
+    if (gap < 0) {
+        g = groups
+    } else {
+        var k = 0
+        while (k < gap) {
+            g[k] = groups[k]
+            k = k + 1
+        }
+        const after = n - gap
+        k = 0
+        while (k < after) {
+            g[8 - after + k] = groups[gap + k]
+            k = k + 1
+        }
+    }
+    var k = 0
+    while (k < 8) {
+        out[2 * k] = @as(u8, g[k] >> 8)
+        out[2 * k + 1] = @as(u8, g[k] & 0xFF)
+        k = k + 1
+    }
+    return 16
+}
+
+fn hex(ch: u8) i64 {
+    if (ch >= '0' and ch <= '9') {
+        return @as(i64, ch - '0')
+    }
+    if (ch >= 'a' and ch <= 'f') {
+        return @as(i64, ch - 'a') + 10
+    }
+    if (ch >= 'A' and ch <= 'F') {
+        return @as(i64, ch - 'A') + 10
+    }
+    return -1
+}

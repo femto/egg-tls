@@ -1,0 +1,18 @@
+// The system's root bundle, if there is one: it reads and parses.
+uses io, alloc, fs
+
+const roots = @import("tls/roots")
+
+fn main(io: Io, a: Allocator, files: Fs) !void {
+    // Only a system without a bundle is skipped; a bundle that does not
+    // read or parse fails the test.
+    const list = roots.system(a, files) catch |e| {
+        if (e == error.NoRoots) {
+            io.print("no system roots")
+            return
+        }
+        return e
+    }
+    defer a.free(list)
+    io.print(list.len(), " roots")
+}

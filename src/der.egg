@@ -1,0 +1,248 @@
+// der: reading DER (X.690), the encoding of certificates.
+//
+//     const cert = try der.expect(b, 0, @len(b), der.SEQUENCE)
+//     const tbs = try der.expect(b, cert.start, cert.end, der.SEQUENCE)
+//     // the next element after tbs starts at tbs.end
+//
+// Only DER: a length is definite and in its shortest form, and a tag is
+// one byte (no high tag numbers, which X.509 does not use). Anything
+// else, or an element running past its limit, is error.BadDer. Elements
+// are positions in the bytes, not copies.
+
+const BOOLEAN: i64 = 0x01
+const INTEGER: i64 = 0x02
+const BIT_STRING: i64 = 0x03
+const OCTET_STRING: i64 = 0x04
+const NULL: i64 = 0x05
+const OID: i64 = 0x06
+const UTC_TIME: i64 = 0x17
+const GENERALIZED_TIME: i64 = 0x18
+const SEQUENCE: i64 = 0x30
+const SET: i64 = 0x31
+
+// An element: where it starts (at, header included), its tag, and its
+// contents b[start..end]; the next element starts at end.
+const Tlv = struct {
+    tag: i64
+    at: i64
+    start: i64
+    end: i64
+}
+
+// The element at b[at..], which must end by limit.
+fn read(b: []u8, at: i64, limit: i64) !Tlv {
+    if (at < 0 or limit > @len(b) or limit - at < 2) {
+        return error.BadDer
+    }
+    const tag = @as(i64, b[at])
+    // 0 is end-of-contents, only for indefinite lengths; 0x1F starts a
+    // high tag number.
+    if (tag == 0 or tag & 0x1F == 0x1F) {
+        return error.BadDer
+    }
+    const first = @as(i64, b[at + 1])
+    var start = at + 2
+    var len = first
+    if (first >= 0x80) {
+        // Long form: 1 to 3 more bytes (16 MiB is plenty), no leading
+        // zero, and only for 128 or more.
+        const n = first & 0x7F
+        if (n == 0 or n > 3 or limit - start < n or b[start] == 0) {
+            return error.BadDer
+        }
+        len = 0
+        var i = 0
+        while (i < n) {
+            len = len << 8 | @as(i64, b[start + i])
+            i = i + 1
+        }
+        if (len < 0x80) {
+            return error.BadDer
+        }
+        start = start + n
+    }
+    if (limit - start < len) {
+        return error.BadDer
+    }
+    return Tlv{ .tag = tag, .at = at, .start = start, .end = start + len }
+}
+
+// read, and the element must have tag.
+fn expect(b: []u8, at: i64, limit: i64, tag: i64) !Tlv {
+    const t = try read(b, at, limit)
+    if (t.tag != tag) {
+        return error.BadDer
+    }
+    return t
+}
+
+// An OBJECT IDENTIFIER at b[at..limit], in its canonical form: each
+// subidentifier's base-128 digits without a leading zero digit (0x80),
+// the last byte ending one (top bit clear).
+fn oid(b: []u8, at: i64, limit: i64) !Tlv {
+    const t = try expect(b, at, limit, OID)
+    if (t.end == t.start or b[t.end - 1] >= 0x80) {
+        return error.BadDer
+    }
+    var i = t.start
+    var first = true
+    while (i < t.end) {
+        if (first and b[i] == 0x80) {
+            return error.BadDer
+        }
+        first = b[i] < 0x80
+        i = i + 1
+    }
+    return t
+}
+
+// The OID's contents are want (its DER contents, as in "\x2a\x86\x48...").
+fn oid_is(b: []u8, t: Tlv, want: str) bool {
+    return t.tag == OID and b[t.start..t.end] == want
+}
+
+// The contents of a and c are the same bytes, header included.
+fn same(b: []u8, a: Tlv, c: Tlv) bool {
+    return b[a.at..a.end] == b[c.at..c.end]
+}
+
+// A BOOLEAN's value: DER's true is 0xFF, false 0x00.
+fn boolean(b: []u8, t: Tlv) !bool {
+    if (t.tag != BOOLEAN or t.end - t.start != 1) {
+        return error.BadDer
+    }
+    if (b[t.start] == 0xFF) {
+        return true
+    }
+    if (b[t.start] == 0) {
+        return false
+    }
+    return error.BadDer
+}
+
+// A small INTEGER that is not negative, minimally encoded, below 2^31.
+fn small_int(b: []u8, t: Tlv) !i64 {
+    const n = t.end - t.start
+    if (t.tag != INTEGER or n < 1 or n > 4 or b[t.start] >= 0x80) {
+        return error.BadDer
+    }
+    if (n > 1 and b[t.start] == 0 and b[t.start + 1] < 0x80) {
+        return error.BadDer
+    }
+    var v = 0
+    var i = t.start
+    while (i < t.end) {
+        v = v << 8 | @as(i64, b[i])
+        i = i + 1
+    }
+    return v
+}
+
+// An INTEGER that is not negative, minimally encoded, of any length (a
+// certificate's serial number).
+fn non_negative(b: []u8, t: Tlv) !void {
+    const n = t.end - t.start
+    if (t.tag != INTEGER or n < 1 or b[t.start] >= 0x80) {
+        return error.BadDer
+    }
+    if (n > 1 and b[t.start] == 0 and b[t.start + 1] < 0x80) {
+        return error.BadDer
+    }
+}
+
+// A BIT STRING of named bits: at most max_bytes bytes of bits, the
+// unused ones zero. DER also wants trailing zero bits dropped, but roots
+// in use break that (Trustwave's ECC roots end their keyUsage with a zero
+// byte), and nothing is gained by refusing them, so that is not checked.
+fn named_bits(b: []u8, t: Tlv, max_bytes: i64) !void {
+    const n = t.end - t.start - 1
+    if (t.tag != BIT_STRING or n < 0 or n > max_bytes) {
+        return error.BadDer
+    }
+    const unused = @as(i64, b[t.start])
+    if (unused > 7 or (n == 0 and unused != 0)) {
+        return error.BadDer
+    }
+    if (n > 0 and @as(i64, b[t.end - 1]) & ((1 << unused) - 1) != 0) {
+        return error.BadDer
+    }
+}
+
+// A BIT STRING's bytes, after the count of unused bits, which must be 0
+// (keys and signatures are whole bytes): where they start.
+fn whole_bits(b: []u8, t: Tlv) !i64 {
+    if (t.tag != BIT_STRING or t.end - t.start < 1 or b[t.start] != 0) {
+        return error.BadDer
+    }
+    return t.start + 1
+}
+
+// A UTCTime or GeneralizedTime, as seconds since 1970 (UTC). DER wants
+// both in UTC with seconds and a Z: YYMMDDHHMMSSZ (years 1950 to 2049)
+// and YYYYMMDDHHMMSSZ (2050 on, as RFC 5280 has it).
+fn time(b: []u8, t: Tlv) !i64 {
+    var year = 0
+    var at = t.start
+    if (t.tag == UTC_TIME and t.end - t.start == 13) {
+        year = try digits(b, at, 2)
+        year = if (year < 50) 2000 + year else 1900 + year
+        at = at + 2
+    } else if (t.tag == GENERALIZED_TIME and t.end - t.start == 15) {
+        year = try digits(b, at, 4)
+        // RFC 5280 4.1.2.5: dates before 2050 are UTCTime.
+        if (year < 2050) {
+            return error.BadDer
+        }
+        at = at + 4
+    } else {
+        return error.BadDer
+    }
+    if (b[t.end - 1] != 'Z') {
+        return error.BadDer
+    }
+    const month = try digits(b, at, 2)
+    const day = try digits(b, at + 2, 2)
+    const hour = try digits(b, at + 4, 2)
+    const minute = try digits(b, at + 6, 2)
+    const second = try digits(b, at + 8, 2)
+    if (month < 1 or month > 12 or day < 1 or day > days_in(year, month) or hour > 23 or minute > 59 or second > 59) {
+        return error.BadDer
+    }
+    return days_from_civil(year, month, day) * 86400 + hour * 3600 + minute * 60 + second
+}
+
+fn digits(b: []u8, at: i64, n: i64) !i64 {
+    var v = 0
+    var i = 0
+    while (i < n) {
+        const c = b[at + i]
+        if (c < '0' or c > '9') {
+            return error.BadDer
+        }
+        v = v * 10 + @as(i64, c - '0')
+        i = i + 1
+    }
+    return v
+}
+
+fn days_in(year: i64, month: i64) i64 {
+    if (month == 2) {
+        const leap = (year % 4 == 0 and year % 100 != 0) or year % 400 == 0
+        return if (leap) 29 else 28
+    }
+    if (month == 4 or month == 6 or month == 9 or month == 11) {
+        return 30
+    }
+    return 31
+}
+
+// Days from 1970-01-01 to the date (Howard Hinnant's days_from_civil).
+fn days_from_civil(year: i64, month: i64, day: i64) i64 {
+    const y = if (month <= 2) year - 1 else year
+    const era = (if (y >= 0) y else y - 399) / 400
+    const yoe = y - era * 400
+    const mp = if (month > 2) month - 3 else month + 9
+    const doy = (153 * mp + 2) / 5 + day - 1
+    const doe = yoe * 365 + yoe / 4 - yoe / 100 + doy
+    return era * 146097 + doe - 719468
+}
