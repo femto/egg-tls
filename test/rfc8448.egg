@@ -205,7 +205,7 @@ fn all_at_once(io: Io, a: Allocator, inout t: support.Tally) !void {
     var got: Buf(u8) = .empty
     defer a.free(got)
     const n = c.read_plain(a, &got, 1000)
-    t.check(io, c.handshake_done() and c.closed() and n == 50, "Finished, data and close_notify in one feed")
+    t.check(io, c.handshake_done() and c.closed() and n == 50 and support.same(a, got[0..], APP), "Finished, data and close_notify in one feed")
 }
 
 // After close_notify the client sends nothing more.
