@@ -43,6 +43,16 @@ for suite in TLS_CHACHA20_POLY1305_SHA256 TLS_AES_128_GCM_SHA256 TLS_AES_256_GCM
     wait "$pid" 2>/dev/null || true
     pid=
 done
+# A server that takes only P-256: the client's second key share.
+openssl s_server -quiet -www -tls1_3 -accept "$PORT" -cert "$dir/cert.pem" \
+    -key "$dir/key.pem" -groups P-256 >"$dir/server.log" 2>&1 &
+pid=$!
+wait_port
+printf 'P-256 key share: '
+EGG_TLS_PORT=$PORT EGG_TLS_SUITE=TLS_CHACHA20_POLY1305_SHA256 ./build/test/live
+kill "$pid"
+wait "$pid" 2>/dev/null || true
+pid=
 # A file of 1 MiB: 64 full records and more, through s_server -HTTP.
 head -c 1048576 /dev/urandom >"$dir/big.bin"
 (cd "$dir" && exec openssl s_server -quiet -HTTP -tls1_3 -accept "$PORT" -cert cert.pem \

@@ -9,12 +9,12 @@ checked against its RFC's test vectors:
 
 1. hashes: SHA-256, SHA-384/512, HMAC, HKDF (done)
 2. AEADs: ChaCha20-Poly1305, AES-128/256-GCM (done)
-3. key exchange: X25519 (done); P-256 comes with step 5, which needs the
-   curve for ECDSA anyway
+3. key exchange: X25519 (done); P-256 (done, with step 5a)
 4. a TLS 1.3 client: record layer, key schedule, handshake (done, but
    without checking the server's certificate)
-5. certificates: DER, X.509, ECDSA, RSA, Ed25519, the system's CA bundle,
-   host names
+5. certificates: ECDSA on P-256 and P-384 (done: 5a), RSA (5b); DER,
+   X.509, the system's CA bundle, host names (5c); checked in the
+   handshake (5d). Ed25519 later
 
 It needs an eggc from after [egg #112](https://github.com/femto/egg/pull/112)
 (wrapping arithmetic `+%`, `rng.fill` into an array, `@secureZero`), which
@@ -166,11 +166,12 @@ fn main(io: Io, a: Allocator, net: Net, rng: Random) !void {
 ```
 
 It offers ChaCha20-Poly1305, AES-128-GCM and AES-256-GCM (in that order)
-and an X25519 key share, and answers a request for a client certificate
+and two key shares, X25519 and P-256 (so a server that takes only P-256
+needs no HelloRetryRequest), and answers a request for a client certificate
 with an empty one. It handles NewSessionTicket (by ignoring it: no
 resumption yet) and KeyUpdate, and sends a KeyUpdate of its own every 2^24
 records. Not yet: a HelloRetryRequest (`error.HelloRetryUnsupported`),
-whether it asks for a group other than X25519 (P-256 comes in step 5) or
+whether it asks for a group other than those two or
 for a cookie to send back; PSK, early data, ALPN, and
 sending an alert when it gives up. A connection that ends without a
 close_notify is `error.Truncated`.
@@ -181,6 +182,44 @@ through it, whole and a byte at a time, and checks every secret and every
 record the client sends against the RFC's, byte for byte.
 `sh test/live.sh` runs it against `openssl s_server`, once per cipher
 suite, and for a 1 MiB response.
+
+## P-256 and P-384
+
+ECDH and ECDSA verification on the NIST curves, as TLS key shares and
+certificates use them:
+
+```egg
+uses io, rand
+
+const ec = @import("tls/ec")
+const ecdsa = @import("tls/ecdsa")
+
+fn main(io: Io, rng: Random) !void {
+    const c = ec.p256()                              // or ec.p384()
+    var mine: [32]u8 = @splat(0)                     // c.size bytes
+    defer @secureZero(&mine)
+    rng.fill(&mine[0..])                             // error.BadScalar if not
+    var ours: [65]u8 = @splat(0)                     // below the order (about
+    try ec.public_key(c, mine[0..], &ours[0..])      // one in 2^32: draw again)
+    var shared: [32]u8 = @splat(0)
+    defer @secureZero(&shared)
+    try ec.shared(c, mine[0..], ours[0..], &shared[0..])   // with its own key, for show
+    // ecdsa.verify_der(c, public_key, digest, der_signature): error.BadSignature
+    io.print(ours[0], " ", @len(shared))
+}
+```
+
+Numbers are 32-bit limbs in Montgomery form (Egg has no 128-bit product
+yet), points projective, added by Renes, Costello and Batina's complete
+formulas, so that doubling, the point at infinity and every other case
+take one path, and a scalar multiplication doubles and adds for every
+bit. Public keys are checked to be on the curve. A scalar multiplication
+takes about 1.5 ms on P-256 and 4.3 ms on P-384 (`--release`);
+verification makes two. `clutch test` checks ECDH against RFC 5903 and
+OpenSSL, and verification against RFC 6979's signatures (SHA-1 to
+SHA-512) and OpenSSL's, with signatures, keys and encodings that must be
+refused; OpenSSL agreed with every expected answer when the vectors were
+made.
 
 ## Secrets in memory
 

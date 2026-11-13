@@ -1,0 +1,188 @@
+// P-256 and P-384: ECDH against RFC 5903 (both sides) and OpenSSL, public
+// keys (n - 1 among them), and ECDSA verification against RFC 6979's
+// signatures (SHA-1 to SHA-512, so digests shorter and longer than the
+// order) and OpenSSL's, each checked by OpenSSL when the vectors were
+// made; then signatures and keys that must be refused, and bad scalars
+// and points.
+uses io, alloc
+
+const ec = @import("tls/ec")
+const ecdsa = @import("tls/ecdsa")
+const support = @import("support/check.egg")
+
+const Sig = struct {
+    curve: str
+    key: str
+    digest: str
+    der: str
+    ok: bool
+    name: str
+}
+
+const Dh = struct {
+    curve: str
+    secret: str
+    public: str
+    peer: str
+    shared: str
+    name: str
+}
+
+fn main(io: Io, a: Allocator) !void {
+    var t = support.tally()
+    const sigs = ecdsa_vectors()
+    for (sigs) |v| {
+        try signature(io, a, &t, v)
+    }
+    const dhs = dh_vectors()
+    for (dhs) |v| {
+        try exchange(io, a, &t, v)
+    }
+    try refused(io, a, &t)
+    try t.done(io)
+}
+
+fn curve_of(name: str) ec.Curve {
+    return if (name == "p256") ec.p256() else ec.p384()
+}
+
+fn signature(io: Io, a: Allocator, inout t: support.Tally, v: Sig) !void {
+    const c = curve_of(v.curve)
+    const key = try support.unhex(a, v.key)
+    defer a.free(key)
+    const digest = try support.unhex(a, v.digest)
+    defer a.free(digest)
+    const der = try support.unhex(a, v.der)
+    defer a.free(der)
+    var verified = true
+    ecdsa.verify_der(c, key[0..], digest[0..], der[0..]) catch {
+        verified = false
+    }
+    t.check(io, verified == v.ok, v.name)
+}
+
+fn exchange(io: Io, a: Allocator, inout t: support.Tally, v: Dh) !void {
+    const c = curve_of(v.curve)
+    const secret = try support.unhex(a, v.secret)
+    defer a.free(secret)
+    var public: [97]u8 = @splat(0)
+    try ec.public_key(c, secret[0..], &public[0..1 + 2 * c.size])
+    t.check_of(io, support.same(a, public[0..1 + 2 * c.size], v.public), "public key:", v.name)
+    if (@len(v.peer) == 0) {
+        return
+    }
+    const peer = try support.unhex(a, v.peer)
+    defer a.free(peer)
+    var shared: [48]u8 = @splat(0)
+    try ec.shared(c, secret[0..], peer[0..], &shared[0..c.size])
+    t.check_of(io, support.same(a, shared[0..c.size], v.shared), "shared secret:", v.name)
+}
+
+// Scalars and points that must be refused.
+fn refused(io: Io, a: Allocator, inout t: support.Tally) !void {
+    const c = ec.p256()
+    var out: [65]u8 = @splat(0)
+    const zero: [32]u8 = @splat(0)
+    t.check(io, err_of_public(c, zero[0..]) == error.BadScalar, "secret 0")
+    const n = try support.unhex(a, "ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551")
+    defer a.free(n)
+    t.check(io, err_of_public(c, n[0..]) == error.BadScalar, "secret n")
+    t.check(io, err_of_public(c, n[1..]) == error.BadScalar, "secret of 31 bytes")
+    var one: [32]u8 = @splat(0)
+    one[31] = 1
+    try ec.public_key(c, one[0..], &out[0..])
+    // G, from its definition.
+    t.check(io, support.same(a, out[0..], "046b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c2964fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5"), "1 G = G")
+    // G with its first byte changed is not on the curve; x = p is out of
+    // range; a compressed point (0x02) is not taken.
+    var bad = out
+    bad[1] = bad[1] ^ 1
+    t.check(io, err_of_shared(c, one[0..], bad[0..]) == error.BadPoint, "a point off the curve")
+    const p_point = try support.unhex(a, "04ffffffff00000001000000000000000000000000ffffffffffffffffffffffff4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5")
+    defer a.free(p_point)
+    t.check(io, err_of_shared(c, one[0..], p_point[0..]) == error.BadPoint, "x = p")
+    var compressed = out
+    compressed[0] = 2
+    t.check(io, err_of_shared(c, one[0..], compressed[0..]) == error.BadPoint, "a point marked compressed")
+    t.check(io, err_of_shared(c, one[0..], out[0..33]) == error.BadPoint, "a point too short")
+}
+
+fn err_of_public(c: ec.Curve, secret: []u8) anyerror {
+    var out: [97]u8 = @splat(0)
+    ec.public_key(c, secret, &out[0..1 + 2 * c.size]) catch |e| {
+        return e
+    }
+    return error.None
+}
+
+fn err_of_shared(c: ec.Curve, secret: []u8, peer: []u8) anyerror {
+    var out: [48]u8 = @splat(0)
+    ec.shared(c, secret, peer, &out[0..c.size]) catch |e| {
+        return e
+    }
+    return error.None
+}
+
+// ECDSA: [curve, public key, digest, DER signature, verifies, name].
+fn ecdsa_vectors() [39]Sig {
+    return [39]Sig{
+        Sig{ .curve = "p256", .key = "0460fed4ba255a9d31c961eb74c6356d68c049b8923b61fa6ce669622e60f29fb67903fe1008b8bc99a41ae9e95628bc64f2f1b20c2d7e9f5177a3c294d4462299", .digest = "8151325dcdbae9e0ff95f9f9658432dbedfdb209", .der = "3044022061340c88c3aaebeb4f6d667f672ca9759a6ccaa9fa8811313039ee4a35471d3202206d7f147dac089441bb2e2fe8f7a3fa264b9c475098fdcf6e00d7c996e1b8b7eb", .ok = true, .name = "RFC 6979 p256 SHA-1 sample" },
+        Sig{ .curve = "p256", .key = "0460fed4ba255a9d31c961eb74c6356d68c049b8923b61fa6ce669622e60f29fb67903fe1008b8bc99a41ae9e95628bc64f2f1b20c2d7e9f5177a3c294d4462299", .digest = "9003e374bc726550c2c289447fd0533160f875709386dfa377bfd41c", .der = "3045022053b2fff5d1752b2c689df257c04c40a587fababb3f6fc2702f1343af7ca9aa3f022100b9afb64fdc03dc1a131c7d2386d11e349f070aa432a4acc918bea988bf75c74c", .ok = true, .name = "RFC 6979 p256 SHA-224 sample" },
+        Sig{ .curve = "p256", .key = "0460fed4ba255a9d31c961eb74c6356d68c049b8923b61fa6ce669622e60f29fb67903fe1008b8bc99a41ae9e95628bc64f2f1b20c2d7e9f5177a3c294d4462299", .digest = "af2bdbe1aa9b6ec1e2ade1d694f41fc71a831d0268e9891562113d8a62add1bf", .der = "3046022100efd48b2aacb6a8fd1140dd9cd45e81d69d2c877b56aaf991c34d0ea84eaf3716022100f7cb1c942d657c41d436c7a1b6e29f65f3e900dbb9aff4064dc4ab2f843acda8", .ok = true, .name = "RFC 6979 p256 SHA-256 sample" },
+        Sig{ .curve = "p256", .key = "0460fed4ba255a9d31c961eb74c6356d68c049b8923b61fa6ce669622e60f29fb67903fe1008b8bc99a41ae9e95628bc64f2f1b20c2d7e9f5177a3c294d4462299", .digest = "9a9083505bc92276aec4be312696ef7bf3bf603f4bbd381196a029f340585312313bca4a9b5b890efee42c77b1ee25fe", .der = "304402200eafea039b20e9b42309fb1d89e213057cbf973dc0cfc8f129edddc800ef771902204861f0491e6998b9455193e34e7b0d284ddd7149a74b95b9261f13abde940954", .ok = true, .name = "RFC 6979 p256 SHA-384 sample" },
+        Sig{ .curve = "p256", .key = "0460fed4ba255a9d31c961eb74c6356d68c049b8923b61fa6ce669622e60f29fb67903fe1008b8bc99a41ae9e95628bc64f2f1b20c2d7e9f5177a3c294d4462299", .digest = "39a5e04aaff7455d9850c605364f514c11324ce64016960d23d5dc57d3ffd8f49a739468ab8049bf18eef820cdb1ad6c9015f838556bc7fad4138b23fdf986c7", .der = "30450221008496a60b5e9b47c825488827e0495b0e3fa109ec4568fd3f8d1097678eb97f0002202362ab1adbe2b8adf9cb9edab740ea6049c028114f2460f96554f61fae3302fe", .ok = true, .name = "RFC 6979 p256 SHA-512 sample" },
+        Sig{ .curve = "p256", .key = "0460fed4ba255a9d31c961eb74c6356d68c049b8923b61fa6ce669622e60f29fb67903fe1008b8bc99a41ae9e95628bc64f2f1b20c2d7e9f5177a3c294d4462299", .digest = "a94a8fe5ccb19ba61c4c0873d391e987982fbbd3", .der = "304402200cbcc86fd6abd1d99e703e1ec50069ee5c0b4ba4b9ac60e409e8ec5910d81a89022001b9d7b73dfaa60d5651ec4591a0136f87653e0fd780c3b1bc872ffdeae479b1", .ok = true, .name = "RFC 6979 p256 SHA-1 test" },
+        Sig{ .curve = "p256", .key = "0460fed4ba255a9d31c961eb74c6356d68c049b8923b61fa6ce669622e60f29fb67903fe1008b8bc99a41ae9e95628bc64f2f1b20c2d7e9f5177a3c294d4462299", .digest = "90a3ed9e32b2aaf4c61c410eb925426119e1a9dc53d4286ade99a809", .der = "3046022100c37edb6f0ae79d47c3c27e962fa269bb4f441770357e114ee511f662ec34a692022100c820053a05791e521fcaad6042d40aea1d6b1a540138558f47d0719800e18f2d", .ok = true, .name = "RFC 6979 p256 SHA-224 test" },
+        Sig{ .curve = "p256", .key = "0460fed4ba255a9d31c961eb74c6356d68c049b8923b61fa6ce669622e60f29fb67903fe1008b8bc99a41ae9e95628bc64f2f1b20c2d7e9f5177a3c294d4462299", .digest = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08", .der = "3045022100f1abb023518351cd71d881567b1ea663ed3efcf6c5132b354f28d3b0b7d383670220019f4113742a2b14bd25926b49c649155f267e60d3814b4c0cc84250e46f0083", .ok = true, .name = "RFC 6979 p256 SHA-256 test" },
+        Sig{ .curve = "p256", .key = "0460fed4ba255a9d31c961eb74c6356d68c049b8923b61fa6ce669622e60f29fb67903fe1008b8bc99a41ae9e95628bc64f2f1b20c2d7e9f5177a3c294d4462299", .digest = "768412320f7b0aa5812fce428dc4706b3cae50e02a64caa16a782249bfe8efc4b7ef1ccb126255d196047dfedf17a0a9", .der = "304602210083910e8b48bb0c74244ebdf7f07a1c5413d61472bd941ef3920e623fbccebeb60221008ddbec54cf8cd5874883841d712142a56a8d0f218f5003cb0296b6b509619f2c", .ok = true, .name = "RFC 6979 p256 SHA-384 test" },
+        Sig{ .curve = "p256", .key = "0460fed4ba255a9d31c961eb74c6356d68c049b8923b61fa6ce669622e60f29fb67903fe1008b8bc99a41ae9e95628bc64f2f1b20c2d7e9f5177a3c294d4462299", .digest = "ee26b0dd4af7e749aa1a8ee3c10ae9923f618980772e473f8819a5d4940e0db27ac185f8a0e1d5f84f88bc887fd67b143732c304cc5fa9ad8e6f57f50028a8ff", .der = "30440220461d93f31b6540894788fd206c07cfa0cc35f46fa3c91816fff1040ad1581a04022039af9f15de0db8d97e72719c74820d304ce5226e32dedae67519e840d1194e55", .ok = true, .name = "RFC 6979 p256 SHA-512 test" },
+        Sig{ .curve = "p384", .key = "04ec3a4e415b4e19a4568618029f427fa5da9a8bc4ae92e02e06aae5286b300c64def8f0ea9055866064a254515480bc138015d9b72d7d57244ea8ef9ac0c621896708a59367f9dfb9f54ca84b3f1c9db1288b231c3ae0d4fe7344fd2533264720", .digest = "8151325dcdbae9e0ff95f9f9658432dbedfdb209", .der = "3066023100ec748d839243d6fbef4fc5c4859a7dffd7f3abddf72014540c16d73309834fa37b9ba002899f6fda3a4a9386790d4eb2023100a3bcfa947beef4732bf247ac17f71676cb31a847b9ff0cbc9c9ed4c1a5b3facf26f49ca031d4857570ccb5ca4424a443", .ok = true, .name = "RFC 6979 p384 SHA-1 sample" },
+        Sig{ .curve = "p384", .key = "04ec3a4e415b4e19a4568618029f427fa5da9a8bc4ae92e02e06aae5286b300c64def8f0ea9055866064a254515480bc138015d9b72d7d57244ea8ef9ac0c621896708a59367f9dfb9f54ca84b3f1c9db1288b231c3ae0d4fe7344fd2533264720", .digest = "9003e374bc726550c2c289447fd0533160f875709386dfa377bfd41c", .der = "3065023042356e76b55a6d9b4631c865445dbe54e056d3b3431766d0509244793c3f9366450f76ee3de43f5a125333a6be0601220231009da0c81787064021e78df658f2fbb0b042bf304665db721f077a4298b095e4834c082c03d83028efbf93a3c23940ca8d", .ok = true, .name = "RFC 6979 p384 SHA-224 sample" },
+        Sig{ .curve = "p384", .key = "04ec3a4e415b4e19a4568618029f427fa5da9a8bc4ae92e02e06aae5286b300c64def8f0ea9055866064a254515480bc138015d9b72d7d57244ea8ef9ac0c621896708a59367f9dfb9f54ca84b3f1c9db1288b231c3ae0d4fe7344fd2533264720", .digest = "af2bdbe1aa9b6ec1e2ade1d694f41fc71a831d0268e9891562113d8a62add1bf", .der = "3065023021b13d1e013c7fa1392d03c5f99af8b30c570c6f98d4ea8e354b63a21d3daa33bde1e888e63355d92fa2b3c36d8fb2cd023100f3aa443fb107745bf4bd77cb3891674632068a10ca67e3d45db2266fa7d1feebefdc63eccd1ac42ec0cb8668a4fa0ab0", .ok = true, .name = "RFC 6979 p384 SHA-256 sample" },
+        Sig{ .curve = "p384", .key = "04ec3a4e415b4e19a4568618029f427fa5da9a8bc4ae92e02e06aae5286b300c64def8f0ea9055866064a254515480bc138015d9b72d7d57244ea8ef9ac0c621896708a59367f9dfb9f54ca84b3f1c9db1288b231c3ae0d4fe7344fd2533264720", .digest = "9a9083505bc92276aec4be312696ef7bf3bf603f4bbd381196a029f340585312313bca4a9b5b890efee42c77b1ee25fe", .der = "306602310094edbb92a5ecb8aad4736e56c691916b3f88140666ce9fa73d64c4ea95ad133c81a648152e44acf96e36dd1e80fabe4602310099ef4aeb15f178cea1fe40db2603138f130e740a19624526203b6351d0a3a94fa329c145786e679e7b82c71a38628ac8", .ok = true, .name = "RFC 6979 p384 SHA-384 sample" },
+        Sig{ .curve = "p384", .key = "04ec3a4e415b4e19a4568618029f427fa5da9a8bc4ae92e02e06aae5286b300c64def8f0ea9055866064a254515480bc138015d9b72d7d57244ea8ef9ac0c621896708a59367f9dfb9f54ca84b3f1c9db1288b231c3ae0d4fe7344fd2533264720", .digest = "39a5e04aaff7455d9850c605364f514c11324ce64016960d23d5dc57d3ffd8f49a739468ab8049bf18eef820cdb1ad6c9015f838556bc7fad4138b23fdf986c7", .der = "3065023100ed0959d5880ab2d869ae7f6c2915c6d60f96507f9cb3e047c0046861da4a799cfe30f35cc900056d7c99cd78824337090230512c8cceee3890a84058ce1e22dbc2198f42323ce8aca9135329f03c068e5112dc7cc3ef3446defceb01a45c2667fdd5", .ok = true, .name = "RFC 6979 p384 SHA-512 sample" },
+        Sig{ .curve = "p384", .key = "04ec3a4e415b4e19a4568618029f427fa5da9a8bc4ae92e02e06aae5286b300c64def8f0ea9055866064a254515480bc138015d9b72d7d57244ea8ef9ac0c621896708a59367f9dfb9f54ca84b3f1c9db1288b231c3ae0d4fe7344fd2533264720", .digest = "a94a8fe5ccb19ba61c4c0873d391e987982fbbd3", .der = "306502304bc35d3a50ef4e30576f58cd96ce6bf638025ee624004a1f7789a8b8e43d0678acd9d29876daf46638645f7f404b11c7023100d5a6326c494ed3ff614703878961c0fde7b2c278f9a65fd8c4b7186201a2991695ba1c84541327e966fa7b50f7382282", .ok = true, .name = "RFC 6979 p384 SHA-1 test" },
+        Sig{ .curve = "p384", .key = "04ec3a4e415b4e19a4568618029f427fa5da9a8bc4ae92e02e06aae5286b300c64def8f0ea9055866064a254515480bc138015d9b72d7d57244ea8ef9ac0c621896708a59367f9dfb9f54ca84b3f1c9db1288b231c3ae0d4fe7344fd2533264720", .digest = "90a3ed9e32b2aaf4c61c410eb925426119e1a9dc53d4286ade99a809", .der = "3065023100e8c9d0b6ea72a0e7837fea1d14a1a9557f29faa45d3e7ee888fc5bf954b5e62464a9a817c47ff78b8c11066b24080e72023007041d4a7a0379ac7232ff72e6f77b6ddb8f09b16cce0ec3286b2bd43fa8c6141c53ea5abef0d8231077a04540a96b66", .ok = true, .name = "RFC 6979 p384 SHA-224 test" },
+        Sig{ .curve = "p384", .key = "04ec3a4e415b4e19a4568618029f427fa5da9a8bc4ae92e02e06aae5286b300c64def8f0ea9055866064a254515480bc138015d9b72d7d57244ea8ef9ac0c621896708a59367f9dfb9f54ca84b3f1c9db1288b231c3ae0d4fe7344fd2533264720", .digest = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08", .der = "306402306d6defac9ab64dabafe36c6bf510352a4cc27001263638e5b16d9bb51d451559f918eedaf2293be5b475cc8f0188636b02302d46f3becbcc523d5f1a1256bf0c9b024d879ba9e838144c8ba6baeb4b53b47d51ab373f9845c0514eefb14024787265", .ok = true, .name = "RFC 6979 p384 SHA-256 test" },
+        Sig{ .curve = "p384", .key = "04ec3a4e415b4e19a4568618029f427fa5da9a8bc4ae92e02e06aae5286b300c64def8f0ea9055866064a254515480bc138015d9b72d7d57244ea8ef9ac0c621896708a59367f9dfb9f54ca84b3f1c9db1288b231c3ae0d4fe7344fd2533264720", .digest = "768412320f7b0aa5812fce428dc4706b3cae50e02a64caa16a782249bfe8efc4b7ef1ccb126255d196047dfedf17a0a9", .der = "30660231008203b63d3c853e8d77227fb377bcf7b7b772e97892a80f36ab775d509d7a5feb0542a7f0812998da8f1dd3ca3cf023db023100ddd0760448d42d8a43af45af836fce4de8be06b485e9b61b827c2f13173923e06a739f040649a667bf3b828246baa5a5", .ok = true, .name = "RFC 6979 p384 SHA-384 test" },
+        Sig{ .curve = "p384", .key = "04ec3a4e415b4e19a4568618029f427fa5da9a8bc4ae92e02e06aae5286b300c64def8f0ea9055866064a254515480bc138015d9b72d7d57244ea8ef9ac0c621896708a59367f9dfb9f54ca84b3f1c9db1288b231c3ae0d4fe7344fd2533264720", .digest = "ee26b0dd4af7e749aa1a8ee3c10ae9923f618980772e473f8819a5d4940e0db27ac185f8a0e1d5f84f88bc887fd67b143732c304cc5fa9ad8e6f57f50028a8ff", .der = "3066023100a0d5d090c9980faf3c2ce57b7ae951d31977dd11c775d314af55f76c676447d06fb6495cd21b4b6e340fc236584fb277023100976984e59b4c77b0e8e4460dca3d9f20e07b9bb1f63beefaf576f6b2e8b224634a2092cd3792e0159ad9cee37659c736", .ok = true, .name = "RFC 6979 p384 SHA-512 test" },
+        Sig{ .curve = "p256", .key = "04b6c27a9c3f86c3ade25f34c1acbb5a88a2c0728459e1a2ea635ba3b530127f836dcde0503d69e5f5eabb2f1d4bea516764d235834e74749aa8b99eecc96548d0", .digest = "74f2bab0f7b496db35967b365a4bedc0f6378888dea671ec307ee99e677fe21d", .der = "3045022100ac5d168f57ea633814146c4bc66d0c2daa1d95f6fadd1495920673199dfa85df0220331c666ad46fef276cb5083da454c324fb0d3b4ba97a0ef1850bc2d496209cd4", .ok = true, .name = "OpenSSL p256 0" },
+        Sig{ .curve = "p256", .key = "049f37656f19ba8130c168a739ae7f6a9fd01d2e46065d347e71bf2e03693bd0cb97bcb1b973e134ac9239144aeaa514243a326ef20846e7e0ab8769674a4d181b", .digest = "b526aef1a341cfe6e5c377ed4c222888eeb81f913a107110a867e009c1758f24", .der = "3045022100ce65b23ab0bb2d60b0358a44f530ee456a9cb4a569095b6c6d5e4261b61b03e502205915e62953a9ce5a7163bb9c9f406a79d3343c0b7592a08d4a76a7ae8b687b8e", .ok = true, .name = "OpenSSL p256 1" },
+        Sig{ .curve = "p256", .key = "04681ccf4054f95e5388491ef4f57c7501a2fa5a40bf6a1f9cacf642edec272405b4a466b772fd92fac0918c1b312d037de19577da8973cc2aff24728ce7e97d93", .digest = "84768ddee659efeafdeb972b55143141bc23b6e333c70e8b68d29774ab09a548", .der = "30440220022cb76ea3ca61b499e5a9045b4a9dd57d99d0b17f217e81b085bf96d3f1f61f022039625d368622854017ae218f93a209cc91f9fa0633215afe0b9e22506384bd0e", .ok = true, .name = "OpenSSL p256 2" },
+        Sig{ .curve = "p256", .key = "04b300f51e19a17857b5ccb7daedfef313cf972b7b34f9f03f5f9c67db1ac20d131e91d2466fc2df50fd393ef28444e5b8d15e4d15471e932df783e5da795741e9", .digest = "fb29a8d5309d7c35b180dbd78c63a455a5d1fb45149a3264c08f1aff43524beb", .der = "3044022040d5a6529a3836ceac1a577278dff3a04a86c31a49b2b91ee207961a90d63c60022021ff22a486b781043a43e0cada4780054ea81dd8c89e87cc97ff7e8625c714e4", .ok = true, .name = "OpenSSL p256 3" },
+        Sig{ .curve = "p384", .key = "048fcc05cce2deef73838da1dbcb015cb328399200d3dd1583fb43f6eaf59d9eabdc7f685c8187c57070f24464a084df23f7a636e7ee612449319350a7ce414a8c00d7c902d28a20d12333942feb7bf2faeb328636361339b7f1abd9f0ef361fe7", .digest = "774b24b28e2b66782feff7c669fadcffa693274b20dca93f6aae7242c8a698a30b420569932f6223794ca52cf582a3ec", .der = "3065023070fe6b9777232f4316c074878d5736be2324c5b057536e55e11fed83b89384fac3ed14eeb7b4d3bca16166ee25668c7c023100fa4651af62a891d69d91a7dd26ceac9cf07beea7f667a9981490b6156759f6666db86e64edde61017913a2a3a878b066", .ok = true, .name = "OpenSSL p384 0" },
+        Sig{ .curve = "p384", .key = "04074ecbe65fa7c68f1d1a6900636b6054dbac8803e596acaf01fb02dbad8526bd4444fb281b86fd12bf4f697b6e051d5fc1a46ff041b686765483f09dd8efd0c07e665d5b7022b8a0f595d05ca79a0cd2dfd2212f3ba1b91e6832bb2a40727448", .digest = "4e6120cfd0861f00c2b713b50c7b53af53de22f601a1e2a48c4787ef299d4b54394f51601b0dbd366b42a3d521bca993", .der = "30660231008e6f005552172f9738898587270b479c5c28a0d4ecdc9ab7ce0408c4bbf4950d2d50f49e251d04d33cce86a5d73318c2023100f6873b65135c3498af59e2c229421bdca55cb36c1f3ce241eeed574bad256a7de582118fd8bb7613b429fd44fac0c1c4", .ok = true, .name = "OpenSSL p384 1" },
+        Sig{ .curve = "p384", .key = "0474b611366752b422955a60dc94fb9e474bbe786bda933f938dd5065753a67f1944ddd5b11e9a6d373e8d773a1006827d3b0fb67ee3a6fd2184efb0601d0e771000577cc18af39c8df4b6260a4452c465d7b503b01e57ce50363f26bdb7aaa054", .digest = "8773043269a1c95c5540b61ab038d69a4ada8c6f4ca2b76c227e018b6fbc8b3f9d3c83fca4e42faf4e6bd0c8e05edefa", .der = "3066023100c6645a02d2a1b190b36ce9f365703925284d3b89819a9953434f4f49be60d9e0faafd8a401e9a7c232d1f114fbefac68023100986622829f41aed02f6e6866d9f054e889cfde07f0d83431e2ac46f34e16373c476ad593853717f1ef58085515ca34fd", .ok = true, .name = "OpenSSL p384 2" },
+        Sig{ .curve = "p384", .key = "0488c4128158e0b5cf2d49edc3d2acbc863c93e0b71c176f411bafb14a892eb86289a93e501ddce82362941a524110f0587e66d4b2bb75894d1ecd20ac71c35e8554b9abdf30c7a103aaa14cb031e806a554e99ac1acf3eb56659c4eb3fbe0c69b", .digest = "ee62c0ca0adc5d480e171edac95e8231748d8682ba3a5478cd2b193d8ca28a0bab6979ddbca04a56fda4c57fb1beb649", .der = "3064023074c778b26b53a8b667c39a31426371acee738ff85fb2fbb9cf9536927348bdbea21d61237a4002e08e2dae73de75e60e0230254d9542f5dddd68202416e24e01e88e1f4dc59b68e41c3bcafb12691692bd6aaeeffdf3033c2321825c15368d35793e", .ok = true, .name = "OpenSSL p384 3" },
+        Sig{ .curve = "p256", .key = "0460fed4ba255a9d31c961eb74c6356d68c049b8923b61fa6ce669622e60f29fb67903fe1008b8bc99a41ae9e95628bc64f2f1b20c2d7e9f5177a3c294d4462299", .digest = "af2bdbe1aa9b6ec1e2ade1d694f41fc71a831d0268e9891562113d8a62add1be", .der = "3046022100efd48b2aacb6a8fd1140dd9cd45e81d69d2c877b56aaf991c34d0ea84eaf3716022100f7cb1c942d657c41d436c7a1b6e29f65f3e900dbb9aff4064dc4ab2f843acda8", .ok = false, .name = "digest changed" },
+        Sig{ .curve = "p256", .key = "0460fed4ba255a9d31c961eb74c6356d68c049b8923b61fa6ce669622e60f29fb67903fe1008b8bc99a41ae9e95628bc64f2f1b20c2d7e9f5177a3c294d4462299", .digest = "af2bdbe1aa9b6ec1e2ade1d694f41fc71a831d0268e9891562113d8a62add1bf", .der = "3046022100efd48b2aacb7a8fd1140dd9cd45e81d69d2c877b56aaf991c34d0ea84eaf3716022100f7cb1c942d657c41d436c7a1b6e29f65f3e900dbb9aff4064dc4ab2f843acda8", .ok = false, .name = "r changed" },
+        Sig{ .curve = "p256", .key = "0460fed4ba255a9d31c961eb74c6356d68c049b8923b61fa6ce669622e60f29fb67903fe1008b8bc98a41ae9e95628bc64f2f1b20c2d7e9f5177a3c294d4462299", .digest = "af2bdbe1aa9b6ec1e2ade1d694f41fc71a831d0268e9891562113d8a62add1bf", .der = "3046022100efd48b2aacb6a8fd1140dd9cd45e81d69d2c877b56aaf991c34d0ea84eaf3716022100f7cb1c942d657c41d436c7a1b6e29f65f3e900dbb9aff4064dc4ab2f843acda8", .ok = false, .name = "key changed (off the curve)" },
+        Sig{ .curve = "p256", .key = "0460fed4ba255a9d31c961eb74c6356d68c049b8923b61fa6ce669622e60f29fb67903fe1008b8bc99a41ae9e95628bc64f2f1b20c2d7e9f5177a3c294d4462299", .digest = "af2bdbe1aa9b6ec1e2ade1d694f41fc71a831d0268e9891562113d8a62add1bf", .der = "3046022101efd48b29acb6a8fe1140dd9cd45e81d65a138228fdc29816b706d96b4b125c67022100f7cb1c942d657c41d436c7a1b6e29f65f3e900dbb9aff4064dc4ab2f843acda8", .ok = false, .name = "r + n" },
+        Sig{ .curve = "p256", .key = "0460fed4ba255a9d31c961eb74c6356d68c049b8923b61fa6ce669622e60f29fb67903fe1008b8bc99a41ae9e95628bc64f2f1b20c2d7e9f5177a3c294d4462299", .digest = "af2bdbe1aa9b6ec1e2ade1d694f41fc71a831d0268e9891562113d8a62add1bf", .der = "3045022100efd48b2aacb6a8fd1140dd9cd45e81d69d2c877b56aaf991c34d0ea84eaf371602200834e36ad29a83bf2bc9385e491d6099c8fdf9d1ed67aa7ea5f51f93782857a9", .ok = true, .name = "s replaced by n - s (as valid: ECDSA allows both)" },
+        Sig{ .curve = "p256", .key = "0460fed4ba255a9d31c961eb74c6356d68c049b8923b61fa6ce669622e60f29fb67903fe1008b8bc99a41ae9e95628bc64f2f1b20c2d7e9f5177a3c294d4462299", .digest = "af2bdbe1aa9b6ec1e2ade1d694f41fc71a831d0268e9891562113d8a62add1bf", .der = "3026020100022100f7cb1c942d657c41d436c7a1b6e29f65f3e900dbb9aff4064dc4ab2f843acda8", .ok = false, .name = "r = 0" },
+        Sig{ .curve = "p256", .key = "0460fed4ba255a9d31c961eb74c6356d68c049b8923b61fa6ce669622e60f29fb67903fe1008b8bc99a41ae9e95628bc64f2f1b20c2d7e9f5177a3c294d4462299", .digest = "af2bdbe1aa9b6ec1e2ade1d694f41fc71a831d0268e9891562113d8a62add1bf", .der = "3046022100efd48b2aacb6a8fd1140dd9cd45e81d69d2c877b56aaf991c34d0ea84eaf3716022100ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551", .ok = false, .name = "s = n" },
+        Sig{ .curve = "p256", .key = "0460fed4ba255a9d31c961eb74c6356d68c049b8923b61fa6ce669622e60f29fb67903fe1008b8bc99a41ae9e95628bc64f2f1b20c2d7e9f5177a3c294d4462299", .digest = "af2bdbe1aa9b6ec1e2ade1d694f41fc71a831d0268e9891562113d8a62add1bf", .der = "3046022100efd48b2aacb6a8fd1140dd9cd45e81d69d2c877b56aaf991c34d0ea84eaf3716022100f7cb1c942d657c41d436c7a1b6e29f65f3e900dbb9aff4064dc4ab2f843acda800", .ok = false, .name = "a byte after the DER" },
+        Sig{ .curve = "p256", .key = "0460fed4ba255a9d31c961eb74c6356d68c049b8923b61fa6ce669622e60f29fb67903fe1008b8bc99a41ae9e95628bc64f2f1b20c2d7e9f5177a3c294d4462299", .digest = "af2bdbe1aa9b6ec1e2ade1d694f41fc71a831d0268e9891562113d8a62add1bf", .der = "304702220000efd48b2aacb6a8fd1140dd9cd45e81d69d2c877b56aaf991c34d0ea84eaf3716022100f7cb1c942d657c41d436c7a1b6e29f65f3e900dbb9aff4064dc4ab2f843acda8", .ok = false, .name = "r not minimally encoded" },
+        Sig{ .curve = "p256", .key = "04074ecbe65fa7c68f1d1a6900636b6054dbac8803e596acaf01fb02dbad8526bd4444fb281b86fd12bf4f697b6e051d5fc1a46ff041b686765483f09dd8efd0c07e665d5b7022b8a0f595d05ca79a0cd2dfd2212f3ba1b91e6832bb2a40727448", .digest = "af2bdbe1aa9b6ec1e2ade1d694f41fc71a831d0268e9891562113d8a62add1bf", .der = "3046022100efd48b2aacb6a8fd1140dd9cd45e81d69d2c877b56aaf991c34d0ea84eaf3716022100f7cb1c942d657c41d436c7a1b6e29f65f3e900dbb9aff4064dc4ab2f843acda8", .ok = false, .name = "another key" },
+        Sig{ .curve = "p384", .key = "04ec3a4e415b4e19a4568618029f427fa5da9a8bc4ae92e02e06aae5286b300c64def8f0ea9055866064a254515480bc138015d9b72d7d57244ea8ef9ac0c621896708a59367f9dfb9f54ca84b3f1c9db1288b231c3ae0d4fe7344fd2533264720", .digest = "af2bdbe1aa9b6ec1e2ade1d694f41fc71a831d0268e9891562113d8a62add1bf", .der = "3046022100efd48b2aacb6a8fd1140dd9cd45e81d69d2c877b56aaf991c34d0ea84eaf3716022100f7cb1c942d657c41d436c7a1b6e29f65f3e900dbb9aff4064dc4ab2f843acda8", .ok = false, .name = "a P-256 signature on a P-384 key" },
+    }
+}
+
+// ECDH: [curve, secret, its public key, the peer's, shared x, name];
+// no peer: only the public key is checked.
+fn dh_vectors() [12]Dh {
+    return [12]Dh{
+        Dh{ .curve = "p256", .secret = "c88f01f510d9ac3f70a292daa2316de544e9aab8afe84049c62a9c57862d1433", .public = "04dad0b65394221cf9b051e1feca5787d098dfe637fc90b9ef945d0c37725811805271a0461cdb8252d61f1c456fa3e59ab1f45b33accf5f58389e0577b8990bb3", .peer = "04d12dfb5289c8d4f81208b70270398c342296970a0bccb74c736fc7554494bf6356fbf3ca366cc23e8157854c13c58d6aac23f046ada30f8353e74f33039872ab", .shared = "d6840f6b42f6edafd13116e0e12565202fef8e9ece7dce03812464d04b9442de", .name = "RFC 5903 p256" },
+        Dh{ .curve = "p256", .secret = "c6ef9c5d78ae012a011164acb397ce2088685d8f06bf9be0b283ab46476bee53", .public = "04d12dfb5289c8d4f81208b70270398c342296970a0bccb74c736fc7554494bf6356fbf3ca366cc23e8157854c13c58d6aac23f046ada30f8353e74f33039872ab", .peer = "04dad0b65394221cf9b051e1feca5787d098dfe637fc90b9ef945d0c37725811805271a0461cdb8252d61f1c456fa3e59ab1f45b33accf5f58389e0577b8990bb3", .shared = "d6840f6b42f6edafd13116e0e12565202fef8e9ece7dce03812464d04b9442de", .name = "RFC 5903 p256, responder" },
+        Dh{ .curve = "p384", .secret = "099f3c7034d4a2c699884d73a375a67f7624ef7c6b3c0f160647b67414dce655e35b538041e649ee3faef896783ab194", .public = "04667842d7d180ac2cde6f74f37551f55755c7645c20ef73e31634fe72b4c55ee6de3ac808acb4bdb4c88732aee95f41aa9482ed1fc0eeb9cafc4984625ccfc23f65032149e0e144ada024181535a0f38eeb9fcff3c2c947dae69b4c634573a81c", .peer = "04e558dbef53eecde3d3fccfc1aea08a89a987475d12fd950d83cfa41732bc509d0d1ac43a0336def96fda41d0774a3571dcfbec7aacf3196472169e838430367f66eebe3c6e70c416dd5f0c68759dd1fff83fa40142209dff5eaad96db9e6386c", .shared = "11187331c279962d93d604243fd592cb9d0a926f422e47187521287e7156c5c4d603135569b9e9d09cf5d4a270f59746", .name = "RFC 5903 p384" },
+        Dh{ .curve = "p384", .secret = "41cb0779b4bdb85d47846725fbec3c9430fab46cc8dc5060855cc9bda0aa2942e0308312916b8ed2960e4bd55a7448fc", .public = "04e558dbef53eecde3d3fccfc1aea08a89a987475d12fd950d83cfa41732bc509d0d1ac43a0336def96fda41d0774a3571dcfbec7aacf3196472169e838430367f66eebe3c6e70c416dd5f0c68759dd1fff83fa40142209dff5eaad96db9e6386c", .peer = "04667842d7d180ac2cde6f74f37551f55755c7645c20ef73e31634fe72b4c55ee6de3ac808acb4bdb4c88732aee95f41aa9482ed1fc0eeb9cafc4984625ccfc23f65032149e0e144ada024181535a0f38eeb9fcff3c2c947dae69b4c634573a81c", .shared = "11187331c279962d93d604243fd592cb9d0a926f422e47187521287e7156c5c4d603135569b9e9d09cf5d4a270f59746", .name = "RFC 5903 p384, responder" },
+        Dh{ .curve = "p256", .secret = "eb8c52dc93f870ac42e209fe38aba056b7e50290bc1e3597397bfc1c4a4fb100", .public = "04b980cfb19161aa725857bd81cf2d70f5065538e4ca2670e706c8692b52e8bb052d19a0127d247745f83173968eccb61c5ac9174063e063600958ee8afe0a7dcb", .peer = "048bd02f5a2f4858c21aaba7c9d42c0db949d05c88dc6b639b7d1ea980eb0a17306284eba08d43b3edd36ff4b3f1e7acbcbbc3976626fe766ab0cf1a274a74c1e2", .shared = "769d543d2f8ab67bf70ab2d04ab5665f58754f0022214cfddcc3252ffed81269", .name = "OpenSSL p256 0" },
+        Dh{ .curve = "p256", .secret = "596cb907cf2dc5f346b628ce67f04d59bfda1b549c0b693d8a4daca428f52bb8", .public = "049a1ffc55ac9f869afe1cf4693ab90f0d33fb0ebd89da3674c8fe7bc7565bf6fc5c4cb8475d0a7b0c8b0a23393a041c48faab2a940ac2e450d5f3075e0339c45b", .peer = "0463800d295acf3a323c07885dcde31929273b152b9fe7fbcc6286fda9d1e23924822983e10e6f838630fe7810ba4880f99738bcf2a08002bcf67ac8f88476a5e4", .shared = "779e676ce5bd1cd4a723361493b5682accf649bc8fac950b1bac153ba8312125", .name = "OpenSSL p256 1" },
+        Dh{ .curve = "p256", .secret = "befc37cd5f8507e8986388613f5892537c77fbad4bb369525a6aef60e857d7af", .public = "0449eb90fd50399dd71b884a53dc43afc1594022491219179d6de971d1697a7c1c888c1bc7a13d6faeaeb325f9cd017e71c10335b5bf234fccc7aeabf3ae75ac9f", .peer = "04a963e2f9a85b0b0f1c5d6a76d033729adddf2c6ce704000cd361eefef8fb8f66847ba3826fdf2a47d467ad67479ac63ce940fe822bf781b1b52ca185f16314e6", .shared = "c4ff8c6fc5a478d17c91391b7f928cf3f1646917ee8b239f47f9d9d3ee196e17", .name = "OpenSSL p256 2" },
+        Dh{ .curve = "p384", .secret = "ba08649b5032b4779c0bb30fc6944af2726e0fb89cad5cbf9d536177dc4089a198e370d14af91810c90128668c461432", .public = "04e8961ba1810cd3c1baa617f359f7ea9e3f84322d44fbefb0fb03359f086392aa386f60035959151bcf87cfa4c33e6bba457dd4216256c0217a5f5d887274761086f013d9ad1505b92849da159d8bfd6cadfa50322612847ce39eb3c232157c84", .peer = "04495dbbb028169d3a98aa7b79db98dbf59d89dc1290fb92b445bdec6b53b6c3f3ea2e592d9086cc38f4ee5647ae91479ff1ac1a13fe1f88760f6a5f956673a96157cc9605c1f14642f091ba1f4f91c6018419f2e1d0222d3134dcf35f9417352f", .shared = "605b7a1022b775fb80a02de81b04c322bf4794b36854cd04f179bb0d9f5cd17b9854f2d62099ddb03f612b20fe9ded3a", .name = "OpenSSL p384 0" },
+        Dh{ .curve = "p384", .secret = "8e4f1acd91ec9f53b0942871686ce8507bc70464b8892c33c4da242f6a5d4f9675598b4c2536678174d74d1cee324f0d", .public = "0411960c427099cb007ee99587b7079c68ef4be0ba5a43788824977805ec6e4f9684023cd6a968465e4c8e3f802a14814936c0e21c551c667232ca4de6f26441643aa70083b0257acbefc87c869ac6dd21221a39b889bc15fd60a15774bf00e376", .peer = "049adedb3da1b932cb409b49082db4294e42943de0d3a710bf7e6873c4abf528831ec3f15abe708d5c45fef555207efbb2f0dadaa0d17874b4872bcd21c1bf80533ac11b24261fdf523cfe50ae4f3514b4c96ddf2625944b77d7e3b195793ae9ec", .shared = "45ebc07038f24ee2b596e7f08e3faf67db6bd90994bcb7cb85372bb696fc8871f11427fa94d9c6f868ed03f53b0b648f", .name = "OpenSSL p384 1" },
+        Dh{ .curve = "p384", .secret = "665daf319ae677aa396bc71c2680c62135009bbaf200e56f1552d435eebf170808810ca6fbeea0aa501ba248bdcb9889", .public = "0445308d8a6090454c2d9f7548a1d7257aac827083bcfbffc3c490ff719b814f0f7365a112562e6238aafd7dfa98647463ef3cfeab9aa7a6367600d5ca4eeefd2fdda9898a2c492afaf9e4fb5b6f37eb3fecfcd55eadc4e35a1bb4e2631f4cba5e", .peer = "045167ff47adee4ef917893fc632e41c3e8588dd3fac8cf572fe2a558d52032b64a2396dd77896201601011da98593cabe4042f0ce2a70eb390ee3c9248db2eea97541a120df0c133f9c4dd93de1d950fe728cdec74a968886edfeefae7621e627", .shared = "e645bfc7b74fcb72634d807c21761b0f7ee95afd37189751b90a824d366129192f7f11ffcada365606496a7524efd678", .name = "OpenSSL p384 2" },
+        Dh{ .curve = "p256", .secret = "ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632550", .public = "046b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296b01cbd1c01e58065711814b583f061e9d431cca994cea1313449bf97c840ae0a", .peer = "", .shared = "", .name = "n - 1 on p256" },
+        Dh{ .curve = "p384", .secret = "ffffffffffffffffffffffffffffffffffffffffffffffffc7634d81f4372ddf581a0db248b0a77aecec196accc52972", .public = "04aa87ca22be8b05378eb1c71ef320ad746e1d3b628ba79b9859f741e082542a385502f25dbf55296c3a545e3872760ab7c9e821b569d9d390a26167406d6d23d6070be242d765eb831625ceec4a0f473ef59f4e30e2817e6285bce2846f15f1a0", .peer = "", .shared = "", .name = "n - 1 on p384" },
+    }
+}

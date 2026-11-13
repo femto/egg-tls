@@ -3,22 +3,23 @@
 // collects in an outbox. tls.client runs one over a TcpConn; tests run
 // one over recorded handshakes.
 //
-//     var c = try Client.start(a, secret, random, "example.com")
+//     var c = try Client.start(a, x25519_secret, p256_secret, random, "example.com")
 //     defer c.deinit(a)
 //     // send c.take_outbox(a), the ClientHello, then until c.connected():
 //     try c.feed(a, received)        // and send c.take_outbox(a) again
 //     try c.send(a, "GET / HTTP/1.1\r\n...")
 //
 // It offers the three TLS 1.3 cipher suites (ChaCha20-Poly1305 first) and
-// an X25519 key share, and takes no PSK or early data. **It does not
+// two key shares, X25519 and P-256, so that a server that takes only
+// P-256 needs no HelloRetryRequest, and takes no PSK or early data. **It does not
 // check the server's certificate yet** (step 5 of the plan): it reads the
 // Certificate and CertificateVerify messages without checking them, so
 // anyone on the path can pretend to be the server. Only
 // tls.client_unverified uses it, for tests against a server of one's own.
 //
 // A HelloRetryRequest fails with error.HelloRetryUnsupported, whatever it
-// asks for: a group other than X25519 (P-256 comes in step 5) or a cookie
-// to send back. Other failures: error.DecodeError (a message that does
+// asks for: a group other than X25519 and P-256, or a cookie to send
+// back. Other failures: error.DecodeError (a message that does
 // not parse), error.UnexpectedMessage (one out of order), error.IllegalParameter
 // (a value the client did not offer), error.ProtocolVersion (a server
 // without TLS 1.3), error.AuthFailed (a record that does not decrypt),
@@ -30,6 +31,7 @@ uses alloc
 const ks = @import("key_schedule.egg")
 const record = @import("record.egg")
 const x25519 = @import("x25519.egg")
+const ec = @import("ec.egg")
 
 const State = enum { server_hello, encrypted_extensions, certificate, certificate_verify, finished, connected, closed }
 
@@ -61,8 +63,10 @@ const Secrets = struct {
 const Client = owned struct {
     state: State
     suite: record.Suite
-    // Our X25519 secret, zeroed once the shared secret is computed.
+    // Our X25519 and P-256 secrets, zeroed once the shared secret is
+    // computed.
     secret: [32]u8
+    p256_secret: [32]u8
     transcript: ks.Transcript
     keys: Secrets
     read: record.Protection
@@ -85,22 +89,28 @@ const Client = owned struct {
     plain: Buf(u8)
 
     // A client whose ClientHello, for host, is in the outbox. secret is a
-    // fresh X25519 secret and random 32 fresh random bytes; host is a DNS
+    // fresh X25519 secret, p256_secret a fresh P-256 one (from 1 to the
+    // order less one: error.BadScalar otherwise), and random 32 fresh
+    // random bytes; host is a DNS
     // name, sent as server_name (an IP address is not: RFC 6066), or empty.
-    fn start(a: Allocator, secret: [32]u8, random: [32]u8, host: []u8) !Client {
+    fn start(a: Allocator, secret: [32]u8, p256_secret: [32]u8, random: [32]u8, host: []u8) !Client {
+        var p256_public: [65]u8 = @splat(0)
+        try ec.public_key(ec.p256(), p256_secret[0..], &p256_public[0..])
         var hello: Buf(u8) = .empty
         defer a.free(hello)
-        try client_hello(a, &hello, random, x25519.public_key(secret), host)
-        return Client.start_with(a, secret, hello[0..])
+        try client_hello(a, &hello, random, x25519.public_key(secret), p256_public, host)
+        return Client.start_with(a, secret, p256_secret, hello[0..])
     }
 
     // A client that sends hello, a whole ClientHello message, which offers
-    // the public key of secret: for tests that replay a recorded handshake.
-    fn start_with(a: Allocator, secret: [32]u8, hello: []u8) Client {
+    // the public keys of secret (X25519) and p256_secret (P-256): for tests
+    // that replay a recorded handshake.
+    fn start_with(a: Allocator, secret: [32]u8, p256_secret: [32]u8, hello: []u8) Client {
         var c = Client{
             .state = .server_hello,
             .suite = .aes_128_gcm_sha256,
             .secret = secret,
+            .p256_secret = p256_secret,
             .transcript = ks.Transcript.init(),
             .keys = Secrets{ .client_hs = @splat(0), .server_hs = @splat(0), .master = @splat(0), .client_ap = @splat(0), .server_ap = @splat(0) },
             .read = record.Protection.none(),
@@ -127,6 +137,7 @@ const Client = owned struct {
     fn deinit(sink self: Client, a: Allocator) void {
         var c = self
         @secureZero(&c.secret)
+        @secureZero(&c.p256_secret)
         @secureZero(&c.keys)
         @secureZero(&c.read)
         @secureZero(&c.write)
@@ -444,8 +455,8 @@ const Client = owned struct {
         }
         try check_extensions(body, 38)
         var version_ok = false
-        var have_share = false
-        var peer: [32]u8 = @splat(0)
+        var group = 0
+        var peer: [65]u8 = @splat(0)
         var at = 40
         while (at < @len(body)) {
             const ext = be16(body, at)
@@ -458,16 +469,20 @@ const Client = owned struct {
                 }
                 version_ok = true
             } else if (ext == 51) {
-                // key_share: u16 group; u16 length; key.
-                if (n != 4 + 32 or be16(data, 0) != 0x001D or be16(data, 2) != 32) {
+                // key_share: u16 group; u16 length; key. X25519's key is
+                // 32 bytes, P-256's an uncompressed point of 65.
+                if (n < 4 or be16(data, 2) != n - 4) {
+                    return error.DecodeError
+                }
+                group = be16(data, 0)
+                if (!(group == 0x001D and n == 4 + 32) and !(group == 0x0017 and n == 4 + 65)) {
                     return error.IllegalParameter
                 }
                 var i = 0
-                while (i < 32) {
+                while (i < n - 4) {
                     peer[i] = data[4 + i]
                     i = i + 1
                 }
-                have_share = true
             } else {
                 // Nothing else was offered that a ServerHello may answer.
                 return error.UnsupportedExtension
@@ -477,12 +492,24 @@ const Client = owned struct {
         if (!version_ok) {
             return error.ProtocolVersion
         }
-        if (!have_share) {
+        if (group == 0) {
             return error.MissingExtension
         }
-        var shared = try x25519.shared(self.secret, peer)
+        var shared: [32]u8 = @splat(0)
         defer @secureZero(&shared)
+        if (group == 0x001D) {
+            var x: [32]u8 = @splat(0)
+            var i = 0
+            while (i < 32) {
+                x[i] = peer[i]
+                i = i + 1
+            }
+            shared = try x25519.shared(self.secret, x)
+        } else {
+            try ec.shared(ec.p256(), self.p256_secret[0..], peer[0..], &shared[0..])
+        }
         @secureZero(&self.secret)
+        @secureZero(&self.p256_secret)
         self.suite = suite
         // The handshake secret goes into master until handshake_keys
         // replaces it with the master secret.
@@ -616,7 +643,7 @@ const Client = owned struct {
 }
 
 // The ClientHello message, with its handshake header, into out.
-fn client_hello(a: Allocator, inout out: Buf(u8), random: [32]u8, public: [32]u8, host: []u8) !void {
+fn client_hello(a: Allocator, inout out: Buf(u8), random: [32]u8, public: [32]u8, p256_public: [65]u8, host: []u8) !void {
     if (@len(host) > 255) {
         return error.HostTooLong
     }
@@ -644,19 +671,20 @@ fn client_hello(a: Allocator, inout out: Buf(u8), random: [32]u8, public: [32]u8
         put16(a, &out, @len(host))
         a.append_str(&out, host)
     }
-    // supported_groups: X25519.
+    // supported_groups: X25519, P-256.
     put16(a, &out, 10)
+    put16(a, &out, 6)
     put16(a, &out, 4)
-    put16(a, &out, 2)
     put16(a, &out, 0x001D)
+    put16(a, &out, 0x0017)
     // signature_algorithms: what step 5 checks. ECDSA P-256 and P-384,
-    // RSA-PSS, Ed25519, and RSA PKCS #1 v1.5 (for certificates).
-    const schemes = [9]i64{ 0x0403, 0x0503, 0x0804, 0x0805, 0x0806, 0x0807, 0x0401, 0x0501, 0x0601 }
+    // RSA-PSS, and RSA PKCS #1 v1.5 (for certificates). Not Ed25519.
+    const schemes = [8]i64{ 0x0403, 0x0503, 0x0804, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601 }
     put16(a, &out, 13)
-    put16(a, &out, 2 + 2 * 9)
-    put16(a, &out, 2 * 9)
+    put16(a, &out, 2 + 2 * 8)
+    put16(a, &out, 2 * 8)
     var i = 0
-    while (i < 9) {
+    while (i < 8) {
         put16(a, &out, schemes[i])
         i = i + 1
     }
@@ -665,13 +693,16 @@ fn client_hello(a: Allocator, inout out: Buf(u8), random: [32]u8, public: [32]u8
     put16(a, &out, 3)
     a.push(&out, 2)
     put16(a, &out, 0x0304)
-    // key_share: X25519.
+    // key_share: X25519, P-256.
     put16(a, &out, 51)
-    put16(a, &out, 2 + 4 + 32)
-    put16(a, &out, 4 + 32)
+    put16(a, &out, 2 + 4 + 32 + 4 + 65)
+    put16(a, &out, 4 + 32 + 4 + 65)
     put16(a, &out, 0x001D)
     put16(a, &out, 32)
     a.append_str(&out, public[0..])
+    put16(a, &out, 0x0017)
+    put16(a, &out, 65)
+    a.append_str(&out, p256_public[0..])
     const ext_len = @len(out) - ext_at - 2
     out[ext_at] = @as(u8, ext_len >> 8)
     out[ext_at + 1] = @as(u8, ext_len & 0xFF)
