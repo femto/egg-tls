@@ -111,12 +111,18 @@ run env EGG_TLS_SUITE=TLS_CHACHA20_POLY1305_SHA256
 stop
 serve leaf256 -www
 # server_alert N: the server logged receiving alert N from the client.
+# It may log a little after the client exits: up to 2 s.
 server_alert() {
-    if ! grep -q "SSL alert number $1\$" "$dir/server.log"; then
-        echo "FAIL the server did not get alert $1:" >&2
-        cat "$dir/server.log" >&2
-        exit 1
-    fi
+    i=0
+    until grep -q "SSL alert number $1\$" "$dir/server.log"; do
+        i=$((i + 1))
+        if [ "$i" -gt 20 ]; then
+            echo "FAIL the server did not get alert $1:" >&2
+            cat "$dir/server.log" >&2
+            exit 1
+        fi
+        sleep 0.1
+    done
     echo "  the server got alert $1"
 }
 printf 'the wrong host: '

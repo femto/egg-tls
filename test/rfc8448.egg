@@ -376,6 +376,25 @@ fn alerts(io: Io, a: Allocator, inout t: support.Tally) !void {
     // After a fatal alert, close_notify sends nothing.
     c1.close_notify(a)
     try sent(io, a, &t, &c1, "", "nothing after a fatal alert", "alerts")
+    // Connected, then the server's fatal alert (handshake_failure, under
+    // its application key): no close_notify back.
+    var c5 = try fresh(a)
+    defer c5.deinit(a)
+    try give(a, &c5, REC_SH, false)
+    try give(a, &c5, REC_SFLIGHT, false)
+    a.free(c5.take_outbox())
+    const sap = try support.bytes32(SAP)
+    var server = record.Protection.init(.aes_128_gcm_sha256, sap[0..])
+    var alert = [24]u8{ 23, 3, 3, 0, 19, 2, 40, 21, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }
+    const hdr = [5]u8{ 23, 3, 3, 0, 19 }
+    server.seal(hdr[0..], &alert[5..])
+    var got5: anyerror = error.None
+    c5.feed(a, alert[0..]) catch |e| {
+        got5 = e
+    }
+    c5.close_notify(a)
+    t.check(io, got5 == error.AlertReceived and c5.alert() == 40, "the server's fatal alert, connected")
+    try sent(io, a, &t, &c5, "", "no close_notify after the server's fatal alert", "alerts")
 }
 
 // A client that has sent the RFC's ClientHello (taken out of its outbox).

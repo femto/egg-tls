@@ -461,6 +461,8 @@ const Client = owned struct {
         if (body[1] == 0 and was_connected) {
             return
         }
+        // After a fatal alert nothing is sent, close_notify neither.
+        self.sent_close = true
         return error.AlertReceived
     }
 
