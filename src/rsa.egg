@@ -199,7 +199,9 @@ fn verify_pss(k: PublicKey, h: Hash, digest: []u8, signature: []u8, salt_len: i6
         return error.BadSignature
     }
     const em = m[skip..k.size]
-    if (em_len < hl + salt_len + 2 or em[em_len - 1] != 0xBC) {
+    // Room for the hash, the salt, the 1 before it and the trailer;
+    // compared without adding salt_len, which may be anything.
+    if (em_len < hl + 2 or salt_len > em_len - hl - 2 or em[em_len - 1] != 0xBC) {
         return error.BadSignature
     }
     const db_len = em_len - hl - 1

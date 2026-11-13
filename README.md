@@ -256,7 +256,7 @@ fn main(io: Io) !void {
 }
 ```
 
-Moduli are 2048 to 8192 bits, exponents odd and below 2^31. PKCS #1 v1.5
+Moduli are 2048 to 8192 bits; exponents odd, from 3 to 2^31 - 1. PKCS #1 v1.5
 builds the whole encoding a signature must have and compares it, rather
 than parsing what the signature gives, which is how Bleichenbacher's 2006
 forgeries got past parsers; its DigestInfo must name the hash and carry
