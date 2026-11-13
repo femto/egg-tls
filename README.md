@@ -12,7 +12,7 @@ checked against its RFC's test vectors:
 3. key exchange: X25519 (done); P-256 (done, with step 5a)
 4. a TLS 1.3 client: record layer, key schedule, handshake (done, but
    without checking the server's certificate)
-5. certificates: ECDSA on P-256 and P-384 (done: 5a), RSA (5b); DER,
+5. certificates: ECDSA on P-256 and P-384 (done: 5a), RSA (done: 5b); DER,
    X.509, the system's CA bundle, host names (5c); checked in the
    handshake (5d). Ed25519 later
 
@@ -232,6 +232,39 @@ OpenSSL, and verification against RFC 6979's signatures (SHA-1 to
 SHA-512) and OpenSSL's, with signatures, keys and encodings that must be
 refused; OpenSSL agreed with every expected answer when the vectors were
 made.
+
+## RSA
+
+Verification only, PKCS #1 v1.5 (how most certificates are signed) and
+PSS (how TLS 1.3 signs a handshake), with SHA-256, SHA-384 or SHA-512:
+
+```egg
+uses io
+
+const rsa = @import("tls/rsa")
+
+fn main(io: Io) !void {
+    var modulus: [256]u8 = @splat(0xFF)        // from a certificate, really
+    modulus[255] = 0xFB                         // odd, and 2048 bits
+    const k = try rsa.public_key(modulus[0..], "\x01\x00\x01")
+    const digest: [32]u8 = @splat(0)
+    const signature: [256]u8 = @splat(1)
+    rsa.verify_pkcs1(k, .sha256, digest[0..], signature[0..]) catch |e| {
+        io.print(@errorName(e))                 // BadSignature
+    }
+    // rsa.verify_pss(k, .sha256, digest, signature, 32): 32 bytes of salt
+}
+```
+
+Moduli are 2048 to 8192 bits, exponents odd and below 2^31. PKCS #1 v1.5
+builds the whole encoding a signature must have and compares it, rather
+than parsing what the signature gives, which is how Bleichenbacher's 2006
+forgeries got past parsers; its DigestInfo must name the hash and carry
+its NULL. Signatures are public, so none of this is constant time; a
+verification takes well under a millisecond. `clutch test` checks it
+against OpenSSL's keys (2048 to 8192 bits, e = 3 too) and signatures,
+and against encodings built by hand and signed with the raw private
+operation, every expected answer agreed by OpenSSL.
 
 ## Secrets in memory
 

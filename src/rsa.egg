@@ -1,0 +1,433 @@
+// rsa: verifying RSA signatures (RFC 8017): PKCS #1 v1.5, as most
+// certificates are signed, and PSS, as TLS 1.3's CertificateVerify is.
+//
+//     const k = try rsa.public_key(modulus, exponent)   // big-endian bytes
+//     try rsa.verify_pkcs1(k, .sha256, digest, signature)
+//     try rsa.verify_pss(k, .sha256, digest, signature, 32)   // salt length
+//
+// A modulus is 2048 to 8192 bits (error.KeyTooSmall, error.KeyTooLarge)
+// and odd; the exponent odd, from 3 to 2^31 - 1 (error.BadKey). A
+// signature is as many bytes as the modulus. Any failure to verify is
+// error.BadSignature.
+//
+// PKCS #1 v1.5 is checked by building the encoding the signature must
+// have, 00 01 FF..FF 00 DigestInfo digest, and comparing all of it, not
+// by parsing what the signature gives (which is how forgeries of the
+// kind Bleichenbacher found in 2006 got through). Its DigestInfo names
+// SHA-256, SHA-384 or SHA-512; not SHA-1. PSS uses MGF1 with the same
+// hash.
+//
+// Everything here is public, so nothing is constant time. Numbers are
+// 32-bit limbs, least significant first, in Montgomery form.
+
+const sha256 = @import("sha256.egg")
+const sha512 = @import("sha512.egg")
+
+const M32: u64 = 0xFFFF_FFFF
+
+// 8192 bits.
+const Big = [256]u32
+
+const Hash = enum { sha256, sha384, sha512 }
+
+fn hash_len(h: Hash) i64 {
+    switch (h) {
+        .sha256 => {
+            return 32
+        }
+        .sha384 => {
+            return 48
+        }
+        .sha512 => {
+            return 64
+        }
+    }
+}
+
+const PublicKey = struct {
+    n: Big
+    // Limbs and bytes of the modulus, and its bits.
+    limbs: i64
+    size: i64
+    bits: i64
+    e: u64
+    // -1 / n mod 2^32, R mod n and R^2 mod n, R = 2^(32 limbs).
+    n0inv: u64
+    one: Big
+    r2: Big
+}
+
+// A public key from its modulus and exponent, big-endian (leading zeros
+// allowed, as DER's INTEGERs have one).
+fn public_key(modulus: []u8, exponent: []u8) !PublicKey {
+    var lo = 0
+    while (lo < @len(modulus) and modulus[lo] == 0) {
+        lo = lo + 1
+    }
+    const m = modulus[lo..]
+    if (@len(m) == 0) {
+        return error.BadKey
+    }
+    var top = 0
+    var b = @as(i64, m[0])
+    while (b > 0) {
+        top = top + 1
+        b = b >> 1
+    }
+    const bits = 8 * (@len(m) - 1) + top
+    if (bits < 2048) {
+        return error.KeyTooSmall
+    }
+    if (bits > 8192) {
+        return error.KeyTooLarge
+    }
+    if (m[@len(m) - 1] & 1 == 0) {
+        return error.BadKey
+    }
+    var e: u64 = 0
+    for (exponent) |x| {
+        if (e >= 0x80_0000) {
+            return error.BadKey
+        }
+        e = e << 8 | @as(u64, x)
+    }
+    if (e < 3 or e > 0x7FFF_FFFF or e & 1 == 0) {
+        return error.BadKey
+    }
+    const limbs = (@len(m) + 3) / 4
+    var k = PublicKey{ .n = from_be(m), .limbs = limbs, .size = @len(m), .bits = bits, .e = e, .n0inv = 0, .one = @splat(0), .r2 = @splat(0) }
+    // -1 / n mod 2^32 by Newton's iteration.
+    const n0 = @as(u64, k.n[0])
+    var inv: u64 = 1
+    var i = 0
+    while (i < 5) {
+        inv = (inv *% (2 -% n0 *% inv)) & M32
+        i = i + 1
+    }
+    k.n0inv = (0 -% inv) & M32
+    // R mod n: 2^(bits - 1) is below n; double it up to 2^(32 limbs).
+    var x: Big = @splat(0)
+    x[(bits - 1) / 32] = @as(u32, 1) << @as(u32, (bits - 1) % 32)
+    i = bits - 1
+    while (i < 32 * limbs) {
+        x = add(k, x, x)
+        i = i + 1
+    }
+    k.one = x
+    // R^2 mod n is R in Montgomery form: 2^(32 limbs), built from 1 by
+    // squaring (doubles the exponent) and doubling (adds one to it).
+    const target = 32 * limbs
+    var y = k.one
+    var bit = 62
+    while (bit >= 0) {
+        if (target >> bit != 0) {
+            y = mul(k, y, y)
+            if ((target >> bit) & 1 == 1) {
+                y = add(k, y, y)
+            }
+        }
+        bit = bit - 1
+    }
+    k.r2 = y
+    return k
+}
+
+// PKCS #1 v1.5 (RFC 8017, 8.2.2): digest is h's hash of the message.
+fn verify_pkcs1(k: PublicKey, h: Hash, digest: []u8, signature: []u8) !void {
+    var em: [1024]u8 = @splat(0)
+    try open(k, signature, &em[0..k.size])
+    const hl = hash_len(h)
+    if (@len(digest) != hl) {
+        return error.BadSignature
+    }
+    // 00 01 FF..FF 00, the DigestInfo's DER up to the digest, the digest.
+    var want: [1024]u8 = @splat(0)
+    const prefix = digest_info(h)
+    const t = @len(prefix) + hl
+    want[1] = 1
+    var i = 2
+    while (i < k.size - t - 1) {
+        want[i] = 0xFF
+        i = i + 1
+    }
+    i = 0
+    while (i < @len(prefix)) {
+        want[k.size - t + i] = prefix[i]
+        i = i + 1
+    }
+    i = 0
+    while (i < hl) {
+        want[k.size - hl + i] = digest[i]
+        i = i + 1
+    }
+    if (!(em[0..k.size] == want[0..k.size])) {
+        return error.BadSignature
+    }
+}
+
+// The DER of DigestInfo { AlgorithmIdentifier { the hash's OID, NULL },
+// OCTET STRING } up to the digest itself.
+fn digest_info(h: Hash) str {
+    switch (h) {
+        .sha256 => {
+            return "\x30\x31\x30\x0d\x06\x09\x60\x86\x48\x01\x65\x03\x04\x02\x01\x05\x00\x04\x20"
+        }
+        .sha384 => {
+            return "\x30\x41\x30\x0d\x06\x09\x60\x86\x48\x01\x65\x03\x04\x02\x02\x05\x00\x04\x30"
+        }
+        .sha512 => {
+            return "\x30\x51\x30\x0d\x06\x09\x60\x86\x48\x01\x65\x03\x04\x02\x03\x05\x00\x04\x40"
+        }
+    }
+}
+
+// PSS (RFC 8017, 8.1.2 and 9.1.2) with MGF1 over h and a salt of
+// salt_len bytes.
+fn verify_pss(k: PublicKey, h: Hash, digest: []u8, signature: []u8, salt_len: i64) !void {
+    var m: [1024]u8 = @splat(0)
+    try open(k, signature, &m[0..k.size])
+    const hl = hash_len(h)
+    if (@len(digest) != hl or salt_len < 0) {
+        return error.BadSignature
+    }
+    // EM is emBits = bits - 1 long: one byte shorter than the modulus
+    // when bits - 1 is a multiple of 8, and then the first byte is 0.
+    const em_bits = k.bits - 1
+    const em_len = (em_bits + 7) / 8
+    const skip = k.size - em_len
+    if (skip == 1 and m[0] != 0) {
+        return error.BadSignature
+    }
+    const em = m[skip..k.size]
+    if (em_len < hl + salt_len + 2 or em[em_len - 1] != 0xBC) {
+        return error.BadSignature
+    }
+    const db_len = em_len - hl - 1
+    const hh = em[db_len..db_len + hl]
+    // The bits above emBits must be clear.
+    const top_mask = @as(u8, 0xFF >> @as(u8, 8 * em_len - em_bits))
+    if (em[0] & ~top_mask != 0) {
+        return error.BadSignature
+    }
+    // DB = maskedDB xor MGF1(H).
+    var db: [1024]u8 = @splat(0)
+    mgf1(h, hh, &db[0..db_len])
+    var i = 0
+    while (i < db_len) {
+        db[i] = db[i] ^ em[i]
+        i = i + 1
+    }
+    db[0] = db[0] & top_mask
+    // Zeros, a 1, the salt.
+    const ps = db_len - salt_len - 1
+    i = 0
+    while (i < ps) {
+        if (db[i] != 0) {
+            return error.BadSignature
+        }
+        i = i + 1
+    }
+    if (db[ps] != 1) {
+        return error.BadSignature
+    }
+    // H = Hash(8 zero bytes, the digest, the salt).
+    const zeros: [8]u8 = @splat(0)
+    var want: [64]u8 = @splat(0)
+    hash3(h, zeros[0..], digest, db[ps + 1..db_len], &want[0..hl])
+    if (!(want[0..hl] == hh)) {
+        return error.BadSignature
+    }
+}
+
+// MGF1 (RFC 8017, B.2.1): Hash(seed, counter) for counter 0, 1, ...,
+// filling out.
+fn mgf1(h: Hash, seed: []u8, inout out: []u8) void {
+    const hl = hash_len(h)
+    var block: [64]u8 = @splat(0)
+    var at = 0
+    var counter = 0
+    while (at < @len(out)) {
+        const c = [4]u8{ @as(u8, counter >> 24), @as(u8, (counter >> 16) & 0xFF), @as(u8, (counter >> 8) & 0xFF), @as(u8, counter & 0xFF) }
+        hash3(h, seed, c[0..], "", &block[0..hl])
+        var i = 0
+        while (i < hl and at < @len(out)) {
+            out[at] = block[i]
+            at = at + 1
+            i = i + 1
+        }
+        counter = counter + 1
+    }
+}
+
+// h's hash of a, b and c, one after another.
+fn hash3(h: Hash, a: []u8, b: []u8, c: []u8, inout out: []u8) void {
+    switch (h) {
+        .sha256 => {
+            var x = sha256.Sha256.init()
+            x.update(a)
+            x.update(b)
+            x.update(c)
+            const d = x.final()
+            copy(&out[0..], d[0..])
+        }
+        .sha384 => {
+            var x = sha512.Sha384.init()
+            x.update(a)
+            x.update(b)
+            x.update(c)
+            const d = x.final()
+            copy(&out[0..], d[0..])
+        }
+        .sha512 => {
+            var x = sha512.Sha512.init()
+            x.update(a)
+            x.update(b)
+            x.update(c)
+            const d = x.final()
+            copy(&out[0..], d[0..])
+        }
+    }
+}
+
+fn copy(inout to: []u8, from: []u8) void {
+    var i = 0
+    while (i < @len(from)) {
+        to[i] = from[i]
+        i = i + 1
+    }
+}
+
+// RSAVP1: signature^e mod n, as k.size bytes in out. The signature must be
+// exactly k.size bytes and below n.
+fn open(k: PublicKey, signature: []u8, inout out: []u8) !void {
+    if (@len(signature) != k.size) {
+        return error.BadSignature
+    }
+    const s = from_be(signature)
+    if (!below(k, s)) {
+        return error.BadSignature
+    }
+    const sm = mul(k, s, k.r2)
+    var r = sm
+    var bit = 30
+    while ((k.e >> @as(u64, bit)) & 1 == 0) {
+        bit = bit - 1
+    }
+    bit = bit - 1
+    while (bit >= 0) {
+        r = mul(k, r, r)
+        if ((k.e >> @as(u64, bit)) & 1 == 1) {
+            r = mul(k, r, sm)
+        }
+        bit = bit - 1
+    }
+    var one: Big = @splat(0)
+    one[0] = 1
+    to_be(mul(k, r, one), &out[0..])
+}
+
+// (a + b) mod n, for a and b below n.
+fn add(k: PublicKey, a: Big, b: Big) Big {
+    var s: Big = @splat(0)
+    var carry: u64 = 0
+    var i = 0
+    while (i < k.limbs) {
+        const t = @as(u64, a[i]) + @as(u64, b[i]) + carry
+        s[i] = @as(u32, t & M32)
+        carry = t >> 32
+        i = i + 1
+    }
+    return reduce_once(k, s, carry)
+}
+
+// s + carry 2^(32 limbs), less n if that is not negative.
+fn reduce_once(k: PublicKey, s: Big, carry: u64) Big {
+    var d: Big = @splat(0)
+    var borrow: u64 = 0
+    var i = 0
+    while (i < k.limbs) {
+        const t = @as(u64, s[i]) -% @as(u64, k.n[i]) -% borrow
+        d[i] = @as(u32, t & M32)
+        borrow = (t >> 32) & 1
+        i = i + 1
+    }
+    if (borrow == 1 and carry == 0) {
+        return s
+    }
+    return d
+}
+
+// a b / R mod n (CIOS), for a and b below n.
+fn mul(k: PublicKey, a: Big, b: Big) Big {
+    var t: [258]u64 = @splat(0)
+    const n = k.limbs
+    var i = 0
+    while (i < n) {
+        const bi = @as(u64, b[i])
+        var carry: u64 = 0
+        var j = 0
+        while (j < n) {
+            const s = t[j] + @as(u64, a[j]) * bi + carry
+            t[j] = s & M32
+            carry = s >> 32
+            j = j + 1
+        }
+        var s = t[n] + carry
+        t[n] = s & M32
+        t[n + 1] = s >> 32
+        const u = (t[0] * k.n0inv) & M32
+        s = t[0] + u * @as(u64, k.n[0])
+        carry = s >> 32
+        j = 1
+        while (j < n) {
+            s = t[j] + u * @as(u64, k.n[j]) + carry
+            t[j - 1] = s & M32
+            carry = s >> 32
+            j = j + 1
+        }
+        s = t[n] + carry
+        t[n - 1] = s & M32
+        t[n] = t[n + 1] + (s >> 32)
+        i = i + 1
+    }
+    var r: Big = @splat(0)
+    i = 0
+    while (i < n) {
+        r[i] = @as(u32, t[i])
+        i = i + 1
+    }
+    return reduce_once(k, r, t[n])
+}
+
+fn below(k: PublicKey, a: Big) bool {
+    var i = k.limbs - 1
+    while (i >= 0) {
+        if (a[i] != k.n[i]) {
+            return a[i] < k.n[i]
+        }
+        i = i - 1
+    }
+    return false
+}
+
+fn from_be(b: []u8) Big {
+    var r: Big = @splat(0)
+    const len = @len(b)
+    var i = 0
+    while (i < len) {
+        const j = len - 1 - i
+        r[j / 4] = r[j / 4] | (@as(u32, b[i]) << @as(u32, 8 * (j % 4)))
+        i = i + 1
+    }
+    return r
+}
+
+fn to_be(a: Big, inout out: []u8) void {
+    const len = @len(out)
+    var i = 0
+    while (i < len) {
+        const j = len - 1 - i
+        out[i] = @as(u8, (a[j / 4] >> @as(u32, 8 * (j % 4))) & 0xFF)
+        i = i + 1
+    }
+}
