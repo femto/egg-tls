@@ -33,6 +33,7 @@ const AesGcm = struct {
     fn seal(self: AesGcm, nonce: [12]u8, aad: []u8, inout buf: []u8) void {
         const n = @len(buf) - 16
         var g = ghash.Ghash.init(self.h)
+        defer @secureZero(&g)
         g.update(aad)
         g.pad16()
         var counter: u32 = 2
@@ -66,6 +67,7 @@ const AesGcm = struct {
         }
         const n = @len(buf) - 16
         var g = ghash.Ghash.init(self.h)
+        defer @secureZero(&g)
         g.update(aad)
         g.pad16()
         var counter: u32 = 2

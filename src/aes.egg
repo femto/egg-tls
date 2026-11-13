@@ -92,6 +92,7 @@ fn schedule(key: []u8, nk: i64, rounds: i64) Aes {
     }
     const total = (rounds + 1) * 4
     var tmp = w[nk - 1]
+    defer @secureZero(&tmp)
     var j = 0
     var k = 0
     while (i < total) {

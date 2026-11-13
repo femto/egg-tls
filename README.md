@@ -89,8 +89,10 @@ uses io
 const aes_gcm = @import("tls/aes_gcm")
 
 fn main(io: Io) !void {
-    const key: [16]u8 = @splat(1)
-    const g = aes_gcm.AesGcm.init128(key)    // init256 takes a [32]u8
+    var key: [16]u8 = @splat(1)
+    defer @secureZero(&key)
+    var g = aes_gcm.AesGcm.init128(key)    // init256 takes a [32]u8
+    defer @secureZero(&g)                  // it holds the expanded key
     const nonce: [12]u8 = @splat(2)        // for show: never twice with one key
     var buf: [21]u8 = @splat(0)
     buf[0] = 'h'
@@ -141,9 +143,10 @@ rounds) and against the RFC's algorithm in Ruby's big integers.
 
 What holds a key, or bytes derived from one, for the length of an
 operation is zeroed with `@secureZero` (stores the C compiler keeps) when
-the operation ends: X25519's scalar and ladder, HMAC's padded keys,
-Poly1305's one-time key, each chunk of AEAD key stream, the tag mask
-E(K, J0), HKDF's intermediate keys, a hash's state copied to finish it.
+the operation ends: X25519's scalar, ladder and inversion, HMAC's padded
+keys, Poly1305's one-time key, each chunk of AEAD key stream, the tag
+mask E(K, J0), GHASH's state (with its key H = E(K, 0)), AES's key
+schedule, HKDF's intermediate keys, a hash's state copied to finish it.
 Two things are not:
 
 - Values you keep: an `AesGcm`, an `Hmac`, a hash, a key array. Zero them

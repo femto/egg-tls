@@ -217,6 +217,7 @@ fn square(a: Gf) Gf {
 // a^(p - 2) = 1 / a: the exponent's bits are fixed, not secret.
 fn invert(a: Gf) Gf {
     var c = a
+    defer @secureZero(&c)
     var i = 253
     while (i >= 0) {
         c = square(c)
