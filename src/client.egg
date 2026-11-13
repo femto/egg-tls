@@ -23,7 +23,8 @@
 // (a value the client did not offer), error.ProtocolVersion (a server
 // without TLS 1.3), error.AuthFailed (a record that does not decrypt),
 // error.BadFinished, error.RecordOverflow, error.AlertReceived (the server
-// sent an alert other than close_notify; alert() is its description).
+// sent an alert other than close_notify, or close_notify before the
+// handshake finished; alert() is its description).
 uses alloc
 
 const ks = @import("key_schedule.egg")
@@ -141,6 +142,12 @@ const Client = owned struct {
 
     fn connected(self: Client) bool {
         return self.state == .connected
+    }
+
+    // The handshake finished, even if the server has closed since (its
+    // Finished and close_notify may arrive together).
+    fn handshake_done(self: Client) bool {
+        return self.established
     }
 
     // The server has sent close_notify: nothing more will arrive.

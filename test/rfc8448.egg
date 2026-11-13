@@ -28,6 +28,7 @@ fn main(io: Io, a: Allocator) !void {
     try after_hello(io, a, &t)
     try interleaved(io, a, &t)
     try closing(io, a, &t)
+    try all_at_once(io, a, &t)
     try key_update(io, a, &t)
     try t.done(io)
 }
@@ -183,6 +184,28 @@ fn interleaved(io: Io, a: Allocator, inout t: support.Tally) !void {
         got = e
     }
     t.check(io, got == error.UnexpectedMessage and !c.has_plain(), "application data inside a handshake message")
+}
+
+// The server's whole flight, data and close_notify in one feed: the
+// handshake is done, the data kept, and the connection closed.
+fn all_at_once(io: Io, a: Allocator, inout t: support.Tally) !void {
+    const ch = try support.unhex(a, CH)
+    defer a.free(ch)
+    var c = client.Client.start_with(a, try support.bytes32(CPRIV), ch[0..])
+    defer c.deinit(a)
+    var all: Buf(u8) = .empty
+    defer a.free(all)
+    const recs = [5]str{ REC_SH, REC_SFLIGHT, REC_NST, REC_SAPP, REC_SALERT }
+    for (recs) |r| {
+        const bytes = try support.unhex(a, r)
+        defer a.free(bytes)
+        a.append_str(&all, bytes)
+    }
+    try c.feed(a, all[0..])
+    var got: Buf(u8) = .empty
+    defer a.free(got)
+    const n = c.read_plain(a, &got, 1000)
+    t.check(io, c.handshake_done() and c.closed() and n == 50, "Finished, data and close_notify in one feed")
 }
 
 // After close_notify the client sends nothing more.
