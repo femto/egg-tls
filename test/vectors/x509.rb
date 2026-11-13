@@ -113,6 +113,45 @@ def forge(base, key)
   tlv(0x30, tbs_der + alg + tlv(0x03, "\x00".b + sig))
 end
 
+# RSA-PSS signatures (RFC 4055): a certificate's signature algorithm, inner
+# and outer, replaced by id-RSASSA-PSS with params, and the TBSCertificate
+# signed again by the issuer's RSA key with PSS (md, MGF1 over mgf, salt).
+OID_PSS = "1.2.840.113549.1.1.10"
+OID_MGF1 = "1.2.840.113549.1.1.8"
+HASH_OID = { "SHA1" => "1.3.14.3.2.26", "SHA256" => "2.16.840.1.101.3.4.2.1",
+             "SHA384" => "2.16.840.1.101.3.4.2.2", "SHA512" => "2.16.840.1.101.3.4.2.3" }
+def hash_id(md, null: true) = tlv(0x30, OpenSSL::ASN1::ObjectId(HASH_OID[md]).to_der + (null ? "\x05\x00".b : "".b))
+def pss_params(md, mgf: md, salt:, null: true, extra: "".b)
+  tlv(0x30, tlv(0xA0, hash_id(md, null: null)) +
+            tlv(0xA1, tlv(0x30, OpenSSL::ASN1::ObjectId(OID_MGF1).to_der + hash_id(mgf, null: null))) +
+            tlv(0xA2, OpenSSL::ASN1::Integer(salt).to_der) + extra)
+end
+def pss_sign(base, key, params, md, mgf: md, salt:)
+  parts = OpenSSL::ASN1.decode(base.to_der).value[0].value.map { |x| x.to_der }
+  alg = tlv(0x30, OpenSSL::ASN1::ObjectId(OID_PSS).to_der + params)
+  parts[2] = alg
+  tbs_der = tlv(0x30, parts.join)
+  sig = key.sign(md, tbs_der, rsa_padding_mode: "pss", rsa_pss_saltlen: salt, rsa_mgf1_md: mgf)
+  tlv(0x30, tbs_der + alg + tlv(0x03, "\x00".b + sig))
+end
+pss_base = cert("example.com", leaf_key, issuer: c["root_rsa"], issuer_key: rsa_root_key, ku: LEAF_KU, eku: "serverAuth", san: SAN)
+pss = {}
+pss["pss_sha256"] = pss_sign(pss_base, rsa_root_key, pss_params("SHA256", salt: 32), "SHA256", salt: 32)
+pss["pss_sha384"] = pss_sign(pss_base, rsa_root_key, pss_params("SHA384", salt: 48), "SHA384", salt: 48)
+pss["pss_sha512"] = pss_sign(pss_base, rsa_root_key, pss_params("SHA512", salt: 64), "SHA512", salt: 64)
+pss["pss_no_null"] = pss_sign(pss_base, rsa_root_key, pss_params("SHA256", salt: 32, null: false), "SHA256", salt: 32)
+pss["pss_salt20"] = pss_sign(pss_base, rsa_root_key, pss_params("SHA256", salt: 20), "SHA256", salt: 20)
+pss["pss_mgf_sha1"] = pss_sign(pss_base, rsa_root_key, pss_params("SHA256", mgf: "SHA1", salt: 32), "SHA256", mgf: "SHA1", salt: 32)
+pss["pss_defaults"] = pss_sign(pss_base, rsa_root_key, "".b, "SHA1", salt: 20)
+pss["pss_trailer2"] = pss_sign(pss_base, rsa_root_key, pss_params("SHA256", salt: 32, extra: tlv(0xA3, "\x02\x01\x02".b)), "SHA256", salt: 32)
+pss["pss_junk"] = pss_sign(pss_base, rsa_root_key, pss_params("SHA256", salt: 32, extra: "\x05\x00".b), "SHA256", salt: 32)
+bad_pss = pss["pss_sha256"].bytes
+bad_pss[-7] ^= 1
+pss["pss_bad_sig"] = bad_pss.pack("C*")
+# An intermediate signed with PSS, over a leaf signed with ECDSA.
+inter_pss_base = cert("Test Inter", inter_key, issuer: c["root_rsa"], issuer_key: rsa_root_key, ca: true, pathlen: 0, ku: CA_KU)
+pss["inter_pss"] = pss_sign(inter_pss_base, rsa_root_key, pss_params("SHA384", salt: 48), "SHA384", salt: 48)
+
 SAN_DER = OpenSSL::X509::ExtensionFactory.new.create_extension("subjectAltName", SAN).to_der
 bad = {}
 bad["bad_tag0"] = forge(c["leaf"], inter_key) { |_, e| e.map! { |x| x == SAN_DER ? ext("subjectAltName", tlv(0x30, "\x00\x00".b + tlv(0x82, "example.com"))) : x } }
@@ -143,6 +182,17 @@ ok_ku = forge(c["leaf"], inter_key) { |_, e| e[1] = ext("keyUsage", "\x03\x03\x0
 
 # [name, chain, roots, host, now, answer, how OpenSSL compares]
 cases = [
+  ["RSA-PSS, SHA-256", %w[pss_sha256], %w[root_rsa], "example.com", NOW, "ok"],
+  ["RSA-PSS, SHA-384", %w[pss_sha384], %w[root_rsa], "example.com", NOW, "ok"],
+  ["RSA-PSS, SHA-512", %w[pss_sha512], %w[root_rsa], "example.com", NOW, "ok"],
+  ["RSA-PSS, hash parameters absent rather than NULL", %w[pss_no_null], %w[root_rsa], "example.com", NOW, "ok"],
+  ["RSA-PSS intermediate (SHA-384), ECDSA leaf", %w[leaf inter_pss], %w[root_rsa], "example.com", NOW, "ok"],
+  ["RSA-PSS, signature changed", %w[pss_bad_sig], %w[root_rsa], "example.com", NOW, "BadSignature"],
+  ["RSA-PSS, a 20-byte salt with SHA-256", %w[pss_salt20], %w[root_rsa], "example.com", NOW, "UnsupportedAlgorithm", "OpenSSL takes any salt length; tls/x509, as Go, wants the hash's"],
+  ["RSA-PSS, MGF1 over SHA-1 with SHA-256", %w[pss_mgf_sha1], %w[root_rsa], "example.com", NOW, "UnsupportedAlgorithm", "OpenSSL takes another MGF1 hash; tls/x509, as Go, wants the same"],
+  ["RSA-PSS, the defaults (SHA-1)", %w[pss_defaults], %w[root_rsa], "example.com", NOW, "UnsupportedAlgorithm", "OpenSSL takes SHA-1 here"],
+  ["RSA-PSS, trailer 2", %w[pss_trailer2], %w[root_rsa], "example.com", NOW, "BadDer"],
+  ["RSA-PSS, something after the parameters", %w[pss_junk], %w[root_rsa], "example.com", NOW, "BadDer"],
   ["certificatePolicies with a CPS qualifier", %w[ok_policies inter], %w[root_rsa], "example.com", NOW, "ok"],
   ["more than 64 extensions", %w[bad_many_extensions inter], %w[root_rsa], "example.com", NOW, "BadDer", "OpenSSL has no limit; a limit keeps the check for repeats small"],
   ["a policy twice", %w[bad_policy_twice inter], %w[root_rsa], "example.com", NOW, "BadDer", "OpenSSL does not parse policies it is not asked about"],
@@ -209,6 +259,7 @@ cases = [
 ]
 
 bad.each { |n, der| c[n] = der }
+pss.each { |n, der| c[n] = der }
 c["ok_ku"] = ok_ku
 c["ok_policies"] = ok_policies
 

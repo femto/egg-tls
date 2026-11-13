@@ -322,7 +322,8 @@ fn main(io: Io, a: Allocator, files: Fs, clock: Clock) !void {
 The chain is taken in the order the server sends it: each certificate
 must be issued by the next, until one is a root or is issued by one (no
 search for another path). Each signature is checked (ECDSA on P-256 and
-P-384, RSA PKCS #1 v1.5; SHA-256, -384, -512), and each certificate's
+P-384, RSA PKCS #1 v1.5, and RSA-PSS with the hash's own MGF1 and salt
+length, as Go takes it; SHA-256, -384, -512), and each certificate's
 validity, notAfter's second included (RFC 5280). Intermediates must be
 CAs with keyCertSign if they have keyUsage, within pathLenConstraint;
 wherever extKeyUsage is, it must allow serverAuth; the leaf needs
@@ -331,9 +332,8 @@ subjectAltName, as a DNS name (any case, a final dot allowed; `*` only
 as the whole leftmost label, with two labels after it) or an IPv4 or
 IPv6 address; the common name is never used. A critical extension it
 does not know fails the certificate, nameConstraints included (not
-supported yet). Revocation is not checked. Not yet: RSA-PSS and Ed25519
-signatures in certificates, and Windows's certificate store (give PEM
-there).
+supported yet). Revocation is not checked. Not yet: Ed25519 signatures
+in certificates, and Windows's certificate store (give PEM there).
 
 DER is read strictly: definite, shortest lengths, explicit defaults
 refused. `roots.system` reads the first bundle of `/etc/ssl/cert.pem`,
