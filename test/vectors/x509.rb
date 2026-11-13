@@ -89,8 +89,67 @@ c["leaf_long"] = cert("example.com", leaf_key, issuer: c["root_long"], issuer_ke
                       nb: Time.utc(2049, 12, 31, 23, 59, 59), na: Time.utc(2051, 3, 1, 12, 0, 0), digest: "SHA384")
 c["other_root"] = cert("Test RSA Root", other_key, ca: true, ku: CA_KU)
 
+# Certificates made wrong on purpose: a leaf's TBSCertificate taken
+# apart into the DER of its fields, changed, and signed again by inter.
+def tlv(tag, content)
+  n = content.bytesize
+  len = n < 0x80 ? [n].pack("C") : (n < 0x100 ? [0x81, n].pack("C*") : [0x82, n >> 8, n & 0xFF].pack("C*"))
+  [tag].pack("C") + len + content
+end
+
+def ext(oid, value, critical: false)
+  tlv(0x30, OpenSSL::ASN1::ObjectId(oid).to_der + (critical ? "\x01\x01\xff".b : "".b) + tlv(0x04, value))
+end
+
+def forge(base, key)
+  tbs = OpenSSL::ASN1.decode(base.to_der).value[0]
+  parts = tbs.value.map { |x| x.to_der }
+  exts = OpenSSL::ASN1.decode(parts[7]).value[0].value.map { |x| x.to_der }
+  yield parts, exts
+  parts[7] = tlv(0xA3, tlv(0x30, exts.join)) if parts[7] && parts[7].getbyte(0) == 0xA3 && !parts[7].frozen?
+  tbs_der = tlv(0x30, parts.compact.join)
+  alg = OpenSSL::ASN1::Sequence([OpenSSL::ASN1::ObjectId("ecdsa-with-SHA256")]).to_der
+  sig = key.sign("SHA256", tbs_der)
+  tlv(0x30, tbs_der + alg + tlv(0x03, "\x00".b + sig))
+end
+
+SAN_DER = OpenSSL::X509::ExtensionFactory.new.create_extension("subjectAltName", SAN).to_der
+bad = {}
+bad["bad_tag0"] = forge(c["leaf"], inter_key) { |_, e| e.map! { |x| x == SAN_DER ? ext("subjectAltName", tlv(0x30, "\x00\x00".b + tlv(0x82, "example.com"))) : x } }
+bad["bad_gentime"] = forge(c["leaf"], inter_key) { |p, _| p[4] = tlv(0x30, tlv(0x17, "200101000000Z") + tlv(0x18, "20350101000000Z")) }
+bad["bad_version0"] = forge(c["leaf_no_bc"], inter_key) { |p, _| p[0] = tlv(0xA0, "\x02\x01\x00".b) }
+bad["bad_version3"] = forge(c["leaf"], inter_key) { |p, _| p[0] = tlv(0xA0, "\x02\x01\x03".b) }
+bad["bad_version_extra"] = forge(c["leaf"], inter_key) { |p, _| p[0] = tlv(0xA0, "\x02\x01\x02\x05\x00".b) }
+bad["bad_serial_negative"] = forge(c["leaf"], inter_key) { |p, _| p[1] = "\x02\x01\xfb".b }
+bad["bad_serial_long_form"] = forge(c["leaf"], inter_key) { |p, _| p[1] = "\x02\x02\x00\x05".b }
+bad["bad_pathlen_leaf"] = forge(c["leaf"], inter_key) { |_, e| e[0] = ext("basicConstraints", tlv(0x30, "\x02\x01\x01".b), critical: true) }
+bad["bad_duplicate_san"] = forge(c["leaf"], inter_key) { |_, e| e << ext("subjectAltName", tlv(0x30, tlv(0x82, "evil.example"))) }
+bad["bad_ku_unused_bits"] = forge(c["leaf"], inter_key) { |_, e| e[1] = ext("keyUsage", "\x03\x02\x07\x81".b, critical: true) }
+bad["bad_ku_too_long"] = forge(c["leaf"], inter_key) { |_, e| e[1] = ext("keyUsage", "\x03\x04\x00\x80\x00\x01".b, critical: true) }
+bad["bad_oid"] = forge(c["leaf"], inter_key) { |_, e| e << tlv(0x30, "\x06\x03\x80\x01\x02".b + tlv(0x04, "\x05\x00".b)) }
+bad["bad_policies"] = forge(c["leaf"], inter_key) { |_, e| e << ext("certificatePolicies", tlv(0x30, tlv(0x30, "\x02\x01\x01".b))) }
+bad["bad_ext_wrapper"] = forge(c["leaf"], inter_key) { |p, e| p[7] = tlv(0xA3, tlv(0x30, e.join) + "\x05\x00".b).freeze }
+# The Trustwave ECC roots' keyUsage: unused bits zero, but a trailing
+# zero byte DER would drop. Taken.
+ok_ku = forge(c["leaf"], inter_key) { |_, e| e[1] = ext("keyUsage", "\x03\x03\x07\x80\x00".b, critical: true) }
+
 # [name, chain, roots, host, now, answer, how OpenSSL compares]
 cases = [
+  ["keyUsage with a trailing zero byte", %w[ok_ku inter], %w[root_rsa], "example.com", NOW, "ok"],
+  ["an element with tag 0 (end-of-contents) in subjectAltName", %w[bad_tag0 inter], %w[root_rsa], "example.com", NOW, "BadDer", "OpenSSL takes a SAN entry it does not know"],
+  ["GeneralizedTime before 2050", %w[bad_gentime inter], %w[root_rsa], "example.com", NOW, "BadDer", "OpenSSL takes either kind of time for any year"],
+  ["version v1 written out", %w[bad_version0 inter], %w[root_rsa], "example.com", NOW, "BadDer", "OpenSSL takes a default written out, and extensions in a v1 certificate"],
+  ["version 4 (3)", %w[bad_version3 inter], %w[root_rsa], "example.com", NOW, "BadDer", "OpenSSL takes versions it does not know"],
+  ["something after the version", %w[bad_version_extra inter], %w[root_rsa], "example.com", NOW, "BadDer"],
+  ["a negative serial number", %w[bad_serial_negative inter], %w[root_rsa], "example.com", NOW, "BadDer", "OpenSSL takes negative serials (Go 1.23 refuses them)"],
+  ["a serial number with a needless zero", %w[bad_serial_long_form inter], %w[root_rsa], "example.com", NOW, "BadDer"],
+  ["pathLenConstraint on a leaf", %w[bad_pathlen_leaf inter], %w[root_rsa], "example.com", NOW, "BadDer", "OpenSSL takes it"],
+  ["subjectAltName twice", %w[bad_duplicate_san inter], %w[root_rsa], "example.com", NOW, "BadDer"],
+  ["keyUsage with unused bits set", %w[bad_ku_unused_bits inter], %w[root_rsa], "example.com", NOW, "BadDer", "OpenSSL ignores the unused bits"],
+  ["keyUsage of more than nine bits", %w[bad_ku_too_long inter], %w[root_rsa], "example.com", NOW, "BadDer", "OpenSSL takes it"],
+  ["an extension OID not in canonical form", %w[bad_oid inter], %w[root_rsa], "example.com", NOW, "BadDer"],
+  ["certificatePolicies that do not parse", %w[bad_policies inter], %w[root_rsa], "example.com", NOW, "BadDer", "OpenSSL does not parse policies it is not asked about"],
+  ["something after the extensions", %w[bad_ext_wrapper inter], %w[root_rsa], "example.com", NOW, "BadDer"],
   ["EC leaf, EC intermediate, RSA root", %w[leaf inter], %w[root_rsa], "example.com", NOW, "ok"],
   ["RSA leaf, P-384 intermediate and root (SHA-384)", %w[leaf_rsa inter2], %w[root_ec], "example.com", NOW, "ok"],
   ["signed with SHA-512", %w[leaf_sha512 inter], %w[root_rsa], "example.com", NOW, "ok"],
@@ -116,7 +175,7 @@ cases = [
   ["intermediate expired", %w[leaf inter_expired], %w[root_rsa], "example.com", NOW, "Expired"],
   ["no intermediate", %w[leaf], %w[root_rsa], "example.com", NOW, "UnknownIssuer"],
   ["untrusted root", %w[leaf inter], %w[root_ec], "example.com", NOW, "UnknownIssuer"],
-  ["root of the same name, another key", %w[leaf inter], %w[other_root], "example.com", NOW, "BadSignature"],
+  ["root of the same name, another key", %w[leaf inter], %w[other_root], "example.com", NOW, "BadSignature", "OpenSSL also matches issuers by key identifier, so it finds none: unknown issuer"],
   ["out of order", %w[leaf inter2 inter], %w[root_rsa], "example.com", NOW, "UnknownIssuer", "OpenSSL builds its own path"],
   ["leaf signature changed", %w[leaf_bad_sig inter], %w[root_rsa], "example.com", NOW, "BadSignature"],
   ["intermediate not a CA", %w[leaf inter_not_ca], %w[root_rsa], "example.com", NOW, "NotCA"],
@@ -136,20 +195,54 @@ cases = [
   ["eleven certificates", %w[leaf inter] * 5 + %w[leaf], %w[root_rsa], "example.com", NOW, "ChainTooLong", "OpenSSL has no such limit"],
 ]
 
+bad.each { |n, der| c[n] = der }
+c["ok_ku"] = ok_ku
+
+# OpenSSL's verify errors that mean each answer: the oracle must fail for
+# the same reason, not only fail.
+V = OpenSSL::X509
+REASONS = {
+  "Expired" => [V::V_ERR_CERT_HAS_EXPIRED],
+  "NotYetValid" => [V::V_ERR_CERT_NOT_YET_VALID],
+  "UnknownIssuer" => [V::V_ERR_UNABLE_TO_GET_ISSUER_CERT_LOCALLY, V::V_ERR_UNABLE_TO_GET_ISSUER_CERT, V::V_ERR_DEPTH_ZERO_SELF_SIGNED_CERT, V::V_ERR_SELF_SIGNED_CERT_IN_CHAIN],
+  "BadSignature" => [V::V_ERR_CERT_SIGNATURE_FAILURE],
+  "NotCA" => [V::V_ERR_INVALID_CA],
+  "PathLenExceeded" => [V::V_ERR_PATH_LENGTH_EXCEEDED],
+  # OpenSSL calls an issuer without keyCertSign no CA at all.
+  "BadKeyUsage" => [V::V_ERR_KEYUSAGE_NO_CERTSIGN, V::V_ERR_INVALID_PURPOSE, V::V_ERR_INVALID_CA],
+  "BadExtKeyUsage" => [V::V_ERR_INVALID_PURPOSE],
+  "UnknownCriticalExtension" => [V::V_ERR_UNHANDLED_CRITICAL_EXTENSION],
+}
+load = ->(x) { x.is_a?(String) ? OpenSSL::X509::Certificate.new(x) : x }
 cases.each do |name, chain, roots, host, now, want, differs|
   next if differs
-  store = OpenSSL::X509::Store.new
-  roots.each { |r| store.add_cert(c.fetch(r)) }
-  store.purpose = OpenSSL::X509::PURPOSE_SSL_SERVER
-  store.time = Time.at(now)
-  ctx = OpenSSL::X509::StoreContext.new(store, c.fetch(chain[0]), chain[1..].map { |x| c.fetch(x) })
-  ok = ctx.verify && OpenSSL::SSL.verify_certificate_identity(c.fetch(chain[0]), host)
-  abort "OpenSSL says #{ok} (#{ctx.error_string}) for #{name}" unless ok == (want == "ok")
+  verdict = begin
+    store = OpenSSL::X509::Store.new
+    roots.each { |r| store.add_cert(load.(c.fetch(r))) }
+    store.purpose = OpenSSL::X509::PURPOSE_SSL_SERVER
+    store.time = Time.at(now)
+    leaf = load.(c.fetch(chain[0]))
+    ctx = OpenSSL::X509::StoreContext.new(store, leaf, chain[1..].map { |x| load.(c.fetch(x)) })
+    if !ctx.verify then [:fails, ctx.error]
+    elsif !OpenSSL::SSL.verify_certificate_identity(leaf, host) then [:fails, :host]
+    else [:ok]
+    end
+  rescue OpenSSL::X509::CertificateError, OpenSSL::ASN1::ASN1Error
+    [:fails, :parse]
+  end
+  agree =
+    case want
+    when "ok" then verdict == [:ok]
+    when "HostMismatch" then verdict == [:fails, :host]
+    when "BadDer" then verdict[0] == :fails
+    else verdict[0] == :fails && REASONS.fetch(want).include?(verdict[1])
+    end
+  abort "OpenSSL says #{verdict.inspect} for #{name}, want #{want}" unless agree
 end
 
 lit = ->(x) { "\"#{x}\"" }
 out = +"// The test PKI: name, DER.\nfn certs() [#{c.size}]Named {\n    return [#{c.size}]Named{\n"
-c.each { |n, x| out << "        Named{ .name = #{lit.(n)}, .der = #{lit.(x.to_der.unpack1('H*'))} },\n" }
+c.each { |n, x| out << "        Named{ .name = #{lit.(n)}, .der = #{lit.((x.is_a?(String) ? x : x.to_der).unpack1('H*'))} },\n" }
 out << "    }\n}\n\n// Chains: name, certificates (leaf first), roots, host, time, answer.\n"
 out << "fn cases() [#{cases.size}]Case {\n    return [#{cases.size}]Case{\n"
 cases.each do |name, chain, roots, host, now, want, differs|

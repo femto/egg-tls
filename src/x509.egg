@@ -106,7 +106,7 @@ fn parse(b: []u8, at: i64, end: i64) !Cert {
         return error.BadDer
     }
     var c = Cert{
-        .whole = whole, .tbs = tbs, .sig_alg = sig_alg_of(b, outer_alg),
+        .whole = whole, .tbs = tbs, .sig_alg = try sig_alg_of(b, outer_alg),
         .sig_at = try der.whole_bits(b, sig), .sig_end = sig.end,
         .issuer = tbs, .subject = tbs, .not_before = 0, .not_after = 0,
         .key_kind = .other, .key_at = 0, .key_end = 0, .exp_at = 0, .exp_end = 0,
@@ -120,10 +120,17 @@ fn parse(b: []u8, at: i64, end: i64) !Cert {
     var version = 0
     var t = try der.read(b, p, tbs.end)
     if (t.tag == 0xA0) {
-        version = try der.small_int(b, try der.expect(b, t.start, t.end, der.INTEGER))
+        // [0] EXPLICIT INTEGER: v2 (1) or v3 (2); v1 (0) is the default,
+        // which DER leaves out.
+        const v = try der.expect(b, t.start, t.end, der.INTEGER)
+        version = try der.small_int(b, v)
+        if (v.end != t.end or version < 1 or version > 2) {
+            return error.BadDer
+        }
         p = t.end
     }
     const serial = try der.expect(b, p, tbs.end, der.INTEGER)
+    try der.non_negative(b, serial)
     const inner_alg = try der.expect(b, serial.end, tbs.end, der.SEQUENCE)
     if (!der.same(b, inner_alg, outer_alg)) {
         return error.BadDer
@@ -149,8 +156,9 @@ fn parse(b: []u8, at: i64, end: i64) !Cert {
             if (version != 2) {
                 return error.BadDer
             }
-            try extensions(b, try der.expect(b, t.start, t.end, der.SEQUENCE), &c)
-            if (t.end != tbs.end) {
+            const list = try der.expect(b, t.start, t.end, der.SEQUENCE)
+            try extensions(b, list, &c)
+            if (list.end != t.end or t.end != tbs.end) {
                 return error.BadDer
             }
             p = t.end
@@ -161,10 +169,8 @@ fn parse(b: []u8, at: i64, end: i64) !Cert {
     return c
 }
 
-fn sig_alg_of(b: []u8, alg: der.Tlv) SigAlg {
-    const oid = der.read(b, alg.start, alg.end) catch {
-        return .other
-    }
+fn sig_alg_of(b: []u8, alg: der.Tlv) !SigAlg {
+    const oid = try der.oid(b, alg.start, alg.end)
     if (der.oid_is(b, oid, "\x2a\x86\x48\xce\x3d\x04\x03\x02")) {
         return .ecdsa_sha256
     }
@@ -194,10 +200,13 @@ fn public_key_info(b: []u8, spki: der.Tlv, inout c: Cert) !void {
     if (key.end != spki.end) {
         return error.BadDer
     }
-    const oid = try der.expect(b, alg.start, alg.end, der.OID)
+    const oid = try der.oid(b, alg.start, alg.end)
     if (der.oid_is(b, oid, "\x2a\x86\x48\xce\x3d\x02\x01")) {
         // id-ecPublicKey; the parameters name the curve.
         const curve = try der.read(b, oid.end, alg.end)
+        if (curve.tag == der.OID) {
+            _ = try der.oid(b, oid.end, alg.end)
+        }
         if (der.oid_is(b, curve, "\x2a\x86\x48\xce\x3d\x03\x01\x07")) {
             c.key_kind = .p256
         } else if (der.oid_is(b, curve, "\x2b\x81\x04\x00\x22")) {
@@ -231,8 +240,19 @@ fn extensions(b: []u8, list: der.Tlv, inout c: Cert) !void {
     }
     while (p < list.end) {
         const ext = try der.expect(b, p, list.end, der.SEQUENCE)
+        const oid = try der.oid(b, ext.start, ext.end)
+        // RFC 5280 4.2: one of each. A second would override the first
+        // here, so a signed restriction could be undone.
+        var q = list.start
+        while (q < p) {
+            const prev = try der.expect(b, q, p, der.SEQUENCE)
+            const prev_oid = try der.oid(b, prev.start, prev.end)
+            if (b[prev_oid.start..prev_oid.end] == b[oid.start..oid.end]) {
+                return error.BadDer
+            }
+            q = prev.end
+        }
         p = ext.end
-        const oid = try der.expect(b, ext.start, ext.end, der.OID)
         var v = try der.read(b, oid.end, ext.end)
         var critical = false
         if (v.tag == der.BOOLEAN) {
@@ -260,7 +280,9 @@ fn extensions(b: []u8, list: der.Tlv, inout c: Cert) !void {
             c.has_san = true
             c.san = names
         } else if (der.oid_is(b, oid, "\x55\x1d\x20")) {
-            // certificatePolicies: no policy is asked for, so any will do.
+            // certificatePolicies: no policy is asked for, so any will
+            // do, but it must be well formed.
+            try policies(b, v)
         } else if (critical) {
             c.unknown_critical = true
         }
@@ -287,7 +309,11 @@ fn basic_constraints(b: []u8, v: der.Tlv, inout c: Cert) !void {
         }
     }
     if (p < seq.end) {
+        // Only a CA may have a pathLenConstraint (RFC 5280 4.2.1.9).
         const t = try der.expect(b, p, seq.end, der.INTEGER)
+        if (!c.is_ca) {
+            return error.BadDer
+        }
         c.path_len = try der.small_int(b, t)
         p = t.end
     }
@@ -296,13 +322,38 @@ fn basic_constraints(b: []u8, v: der.Tlv, inout c: Cert) !void {
     }
 }
 
-// keyUsage: a BIT STRING; its first byte holds the bits checked here.
+// keyUsage: a BIT STRING of nine named bits, its unused bits zero, and
+// not empty (RFC 5280 4.2.1.3); its first byte holds the bits checked
+// here.
 fn key_usage(b: []u8, v: der.Tlv, inout c: Cert) !void {
     const bits = try der.expect(b, v.start, v.end, der.BIT_STRING)
-    if (bits.end != v.end or bits.end - bits.start < 2 or b[bits.start] > 7) {
+    try der.named_bits(b, bits, 2)
+    if (bits.end != v.end or bits.end - bits.start < 2) {
         return error.BadDer
     }
     c.key_usage = @as(i64, b[bits.start + 1])
+}
+
+// certificatePolicies: SEQUENCE OF PolicyInformation { OID, qualifiers
+// SEQUENCE OPTIONAL }, not empty.
+fn policies(b: []u8, v: der.Tlv) !void {
+    const seq = try der.expect(b, v.start, v.end, der.SEQUENCE)
+    if (seq.end != v.end or seq.start == seq.end) {
+        return error.BadDer
+    }
+    var p = seq.start
+    while (p < seq.end) {
+        const info = try der.expect(b, p, seq.end, der.SEQUENCE)
+        const oid = try der.oid(b, info.start, info.end)
+        var end = oid.end
+        if (end < info.end) {
+            end = (try der.expect(b, end, info.end, der.SEQUENCE)).end
+        }
+        if (end != info.end) {
+            return error.BadDer
+        }
+        p = info.end
+    }
 }
 
 // extKeyUsage: SEQUENCE OF OID; serverAuth or anyExtendedKeyUsage
@@ -315,7 +366,7 @@ fn ext_key_usage(b: []u8, v: der.Tlv, inout c: Cert) !void {
     c.has_eku = true
     var p = seq.start
     while (p < seq.end) {
-        const oid = try der.expect(b, p, seq.end, der.OID)
+        const oid = try der.oid(b, p, seq.end)
         if (der.oid_is(b, oid, "\x2b\x06\x01\x05\x05\x07\x03\x01") or der.oid_is(b, oid, "\x55\x1d\x25\x00")) {
             c.eku_server = true
         }
@@ -355,21 +406,27 @@ fn verify(chain: CertList, roots: CertList, host: []u8, now: i64) !void {
         }
         // Issued by a root: any whose subject is c's issuer and whose
         // key verifies c's signature.
-        var named = false
+        // Names are compared as bytes, as Go does to find an issuer.
+        var named: anyerror = error.UnknownIssuer
         for (roots.certs) |r| {
             if (cb[c.issuer.at..c.issuer.end] == rb[r.subject.at..r.subject.end]) {
-                named = true
-                if (signed_by(cb, c, rb, r)) {
+                var ok = true
+                check_signature(cb, c, rb, r) catch |e| {
+                    ok = false
+                    // UnsupportedAlgorithm is worth more than BadSignature:
+                    // it says why no root of that name would do.
+                    if (named != error.UnsupportedAlgorithm) {
+                        named = e
+                    }
+                }
+                if (ok) {
                     try issuer_ok(r, true, i, now)
                     return
                 }
             }
         }
         if (i + 1 == n) {
-            if (named) {
-                return error.BadSignature
-            }
-            return error.UnknownIssuer
+            return named
         }
         // Issued by the next one in the chain.
         const p = chain.certs[i + 1]
@@ -417,13 +474,6 @@ fn usable(c: Cert, now: i64) !void {
     }
 }
 
-fn signed_by(cb: []u8, c: Cert, pb: []u8, p: Cert) bool {
-    check_signature(cb, c, pb, p) catch {
-        return false
-    }
-    return true
-}
-
 // c's signature, by p's key.
 fn check_signature(cb: []u8, c: Cert, pb: []u8, p: Cert) !void {
     const tbs = cb[c.tbs.at..c.tbs.end]
@@ -461,7 +511,15 @@ fn check_signature(cb: []u8, c: Cert, pb: []u8, p: Cert) !void {
             try ecdsa.verify_der(ec.p384(), key, digest[0..dl], sig)
             return
         }
+        // An RSA key cannot have made an ECDSA signature: it does not
+        // verify. A key of a kind not known here might have.
+        if (p.key_kind == .rsa) {
+            return error.BadSignature
+        }
         return error.UnsupportedAlgorithm
+    }
+    if (p.key_kind == .p256 or p.key_kind == .p384) {
+        return error.BadSignature
     }
     if (p.key_kind != .rsa) {
         return error.UnsupportedAlgorithm

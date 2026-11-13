@@ -280,10 +280,13 @@ const roots = @import("tls/roots")
 fn main(io: Io, a: Allocator, files: Fs, clock: Clock) !void {
     const trusted = try roots.system(a, files)       // or roots.add_pem
     defer a.free(trusted)
-    const chain = x509.CertList.empty()               // the server's, leaf first: a var,
-    defer a.free(chain)                               // and chain.add(a, der) for each
+    var chain = x509.CertList.empty()                 // the server's, leaf first
+    defer a.free(chain)
+    const leaf = try files.read(a, "leaf.der")        // in TLS, from the handshake
+    defer a.free(leaf)
+    try chain.add(a, leaf)                            // and the intermediates after it
     x509.verify(chain, trusted, "example.com", clock.now() / 1000000000) catch |e| {
-        io.print(@errorName(e))                       // UnknownIssuer: no certificates
+        io.print(@errorName(e))                       // UnknownIssuer, Expired, ...
     }
 }
 ```

@@ -6,7 +6,8 @@
 //     const skipped = try roots.add_pem(a, &mine, pem_text)
 //
 // PEM is base64 between "-----BEGIN CERTIFICATE-----" and
-// "-----END CERTIFICATE-----" lines; anything outside them is ignored. A
+// "-----END CERTIFICATE-----", each a line of its own (\n or \r\n);
+// anything outside them is ignored. A
 // certificate that does not parse is skipped and counted, so one odd
 // entry in a bundle does not lose the rest; base64 that does not decode,
 // or a BEGIN with no END, is error.BadPem.
@@ -31,8 +32,13 @@ fn system(a: Allocator, files: Fs) !x509.CertList {
         "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",
     }
     for (paths) |path| {
-        const text = files.read(a, path) catch {
-            continue
+        // A missing file is the next path's turn; anything else (no
+        // permission, a read that fails) is an answer, not a fallback.
+        const text = files.read(a, path) catch |e| {
+            if (e == error.NotFound) {
+                continue
+            }
+            return e
         }
         defer a.free(text)
         var list = x509.CertList.empty()
@@ -56,12 +62,12 @@ fn add_pem(a: Allocator, inout list: x509.CertList, text: []u8) !i64 {
     defer a.free(bytes)
     var at = 0
     while (true) {
-        const b = find(text, begin, at)
+        const b = find_line(text, begin, at)
         if (b < 0) {
             break
         }
         const body = b + @len(begin)
-        const e = find(text, end, body)
+        const e = find_line(text, end, body)
         if (e < 0) {
             return error.BadPem
         }
@@ -75,13 +81,17 @@ fn add_pem(a: Allocator, inout list: x509.CertList, text: []u8) !i64 {
     return skipped
 }
 
-// Where needle first is in s at or after from, or -1.
-fn find(s: []u8, needle: str, from: i64) i64 {
-    const n = @len(needle)
+// Where line first is a whole line of s at or after from (a line start
+// before it, a line end or the end of s after it), or -1.
+fn find_line(s: []u8, line: str, from: i64) i64 {
+    const n = @len(line)
     var i = from
     while (i + n <= @len(s)) {
-        if (s[i..i + n] == needle) {
-            return i
+        if (s[i..i + n] == line and (i == 0 or s[i - 1] == '\n')) {
+            const after = i + n
+            if (after == @len(s) or s[after] == '\n' or (s[after] == '\r' and after + 1 < @len(s) and s[after + 1] == '\n')) {
+                return i
+            }
         }
         i = i + 1
     }

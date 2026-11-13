@@ -35,7 +35,9 @@ fn read(b: []u8, at: i64, limit: i64) !Tlv {
         return error.BadDer
     }
     const tag = @as(i64, b[at])
-    if (tag & 0x1F == 0x1F) {
+    // 0 is end-of-contents, only for indefinite lengths; 0x1F starts a
+    // high tag number.
+    if (tag == 0 or tag & 0x1F == 0x1F) {
         return error.BadDer
     }
     const first = @as(i64, b[at + 1])
@@ -74,9 +76,29 @@ fn expect(b: []u8, at: i64, limit: i64, tag: i64) !Tlv {
     return t
 }
 
-// The OID's contents are oid (its DER contents, as in "\x2a\x86\x48...").
-fn oid_is(b: []u8, t: Tlv, oid: str) bool {
-    return t.tag == OID and b[t.start..t.end] == oid
+// An OBJECT IDENTIFIER at b[at..limit], in its canonical form: each
+// subidentifier's base-128 digits without a leading zero digit (0x80),
+// the last byte ending one (top bit clear).
+fn oid(b: []u8, at: i64, limit: i64) !Tlv {
+    const t = try expect(b, at, limit, OID)
+    if (t.end == t.start or b[t.end - 1] >= 0x80) {
+        return error.BadDer
+    }
+    var i = t.start
+    var first = true
+    while (i < t.end) {
+        if (first and b[i] == 0x80) {
+            return error.BadDer
+        }
+        first = b[i] < 0x80
+        i = i + 1
+    }
+    return t
+}
+
+// The OID's contents are want (its DER contents, as in "\x2a\x86\x48...").
+fn oid_is(b: []u8, t: Tlv, want: str) bool {
+    return t.tag == OID and b[t.start..t.end] == want
 }
 
 // The contents of a and c are the same bytes, header included.
@@ -116,6 +138,36 @@ fn small_int(b: []u8, t: Tlv) !i64 {
     return v
 }
 
+// An INTEGER that is not negative, minimally encoded, of any length (a
+// certificate's serial number).
+fn non_negative(b: []u8, t: Tlv) !void {
+    const n = t.end - t.start
+    if (t.tag != INTEGER or n < 1 or b[t.start] >= 0x80) {
+        return error.BadDer
+    }
+    if (n > 1 and b[t.start] == 0 and b[t.start + 1] < 0x80) {
+        return error.BadDer
+    }
+}
+
+// A BIT STRING of named bits: at most max_bytes bytes of bits, the
+// unused ones zero. DER also wants trailing zero bits dropped, but roots
+// in use break that (Trustwave's ECC roots end their keyUsage with a zero
+// byte), and nothing is gained by refusing them, so that is not checked.
+fn named_bits(b: []u8, t: Tlv, max_bytes: i64) !void {
+    const n = t.end - t.start - 1
+    if (t.tag != BIT_STRING or n < 0 or n > max_bytes) {
+        return error.BadDer
+    }
+    const unused = @as(i64, b[t.start])
+    if (unused > 7 or (n == 0 and unused != 0)) {
+        return error.BadDer
+    }
+    if (n > 0 and @as(i64, b[t.end - 1]) & ((1 << unused) - 1) != 0) {
+        return error.BadDer
+    }
+}
+
 // A BIT STRING's bytes, after the count of unused bits, which must be 0
 // (keys and signatures are whole bytes): where they start.
 fn whole_bits(b: []u8, t: Tlv) !i64 {
@@ -127,7 +179,7 @@ fn whole_bits(b: []u8, t: Tlv) !i64 {
 
 // A UTCTime or GeneralizedTime, as seconds since 1970 (UTC). DER wants
 // both in UTC with seconds and a Z: YYMMDDHHMMSSZ (years 1950 to 2049)
-// and YYYYMMDDHHMMSSZ.
+// and YYYYMMDDHHMMSSZ (2050 on, as RFC 5280 has it).
 fn time(b: []u8, t: Tlv) !i64 {
     var year = 0
     var at = t.start
@@ -137,6 +189,10 @@ fn time(b: []u8, t: Tlv) !i64 {
         at = at + 2
     } else if (t.tag == GENERALIZED_TIME and t.end - t.start == 15) {
         year = try digits(b, at, 4)
+        // RFC 5280 4.1.2.5: dates before 2050 are UTCTime.
+        if (year < 2050) {
+            return error.BadDer
+        }
         at = at + 4
     } else {
         return error.BadDer
