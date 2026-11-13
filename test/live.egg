@@ -27,7 +27,13 @@ fn main(io: Io, a: Allocator, args: Args, net: Net, rng: Random, files: Fs, cloc
     if (@len(ca_path) > 0) {
         const pem = try files.read(a, ca_path)
         defer a.free(pem)
-        _ = try roots.add_pem(a, &trusted, pem)
+        // A CA that did not load would make "a CA not trusted" pass for
+        // the wrong reason.
+        const skipped = try roots.add_pem(a, &trusted, pem)
+        if (trusted.len() == 0 or skipped > 0) {
+            io.print("FAIL the CA in ", ca_path, " did not load")
+            return error.Failed
+        }
     }
     const conn = try net.tcp_connect("127.0.0.1", port)
     const host = args.env("EGG_TLS_HOST") orelse "localhost"

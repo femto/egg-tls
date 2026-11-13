@@ -33,8 +33,10 @@ fn main(io: Io, a: Allocator, args: Args, net: Net, rng: Random, files: Fs, cloc
 }
 
 fn get(io: Io, a: Allocator, rng: Random, clock: Clock, net: Net, trusted: x509.CertList, host: []u8) !void {
-    const t0 = clock.monotonic()
+    const t00 = clock.monotonic()
     const conn = try net.tcp_connect(host, 443)
+    const connect_ms = (clock.monotonic() - t00) / 1000000
+    const t0 = clock.monotonic()
     var c = tls.client(a, rng, clock, trusted, conn, host) catch |e| {
         io.print("  in the handshake: ", @errorName(e))
         return e
@@ -46,15 +48,19 @@ fn get(io: Io, a: Allocator, rng: Random, clock: Clock, net: Net, trusted: x509.
     try c.write(a, request)
     var buf: Buf(u8) = .empty
     defer a.free(buf)
-    _ = c.read(a, &buf, 64) catch |e| {
+    const n = c.read(a, &buf, 64) catch |e| {
         io.print("  reading the response: ", @errorName(e))
         return e
+    }
+    if (n < 5 or !(buf[0..5] == "HTTP/")) {
+        io.print("  no HTTP response (", n, " bytes)")
+        return error.NoResponse
     }
     var line = 0
     while (line < @len(buf) and buf[line] != '\r') {
         line = line + 1
     }
-    io.print(host, ": ", suite_name(c.suite()), ", handshake ", ms, " ms, ", buf[0..line])
+    io.print(host, ": ", suite_name(c.suite()), ", connect ", connect_ms, " ms, handshake ", ms, " ms, ", buf[0..line])
 }
 
 fn suite_name(s: record.Suite) str {
