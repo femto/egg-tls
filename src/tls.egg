@@ -12,8 +12,9 @@
 //   4. the record layer, key schedule and handshake of a TLS 1.3 client
 //      (done: tls/key_schedule, tls/record, tls/client, and TlsConn
 //      here), without checking the server's certificate
-//   5. certificates: ECDSA on P-256 and P-384 (done: tls/ecdsa), RSA,
-//      DER, X.509, the system's CA bundle, host names; Ed25519 later
+//   5. certificates: ECDSA on P-256 and P-384 (done: tls/ecdsa), RSA
+//      (done: tls/rsa), DER, X.509, the system's CA bundle, host names;
+//      Ed25519 later
 //
 // A client over a TcpConn, once step 5 is done:
 //
