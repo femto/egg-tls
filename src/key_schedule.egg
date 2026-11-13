@@ -1,0 +1,161 @@
+// key_schedule: TLS 1.3's key schedule (RFC 8446, section 7.1) over the
+// hash a cipher suite names, chosen when the ServerHello arrives.
+//
+//     var t = Transcript.init()
+//     t.update(client_hello)
+//     t.update(server_hello)
+//     var th: [48]u8 = @splat(0)
+//     t.digest(.sha256, &th[0..32])
+//     var secret: [48]u8 = @splat(0)
+//     derive_secret(.sha256, handshake_secret[0..32], "c hs traffic", th[0..32], &secret[0..32])
+//
+// Secrets are byte slices of the hash's length: 32 for SHA-256, 48 for
+// SHA-384. Each function writes its result into out, which must be
+// exactly as long as the result (expand_label's length is @len(out)).
+
+const sha256 = @import("sha256.egg")
+const sha512 = @import("sha512.egg")
+const hmac = @import("hmac.egg")
+const hkdf = @import("hkdf.egg")
+
+const HashKind = enum { sha256, sha384 }
+
+fn hash_len(h: HashKind) i64 {
+    return if (h == .sha256) 32 else 48
+}
+
+// The hash of the handshake so far. The cipher suite, and so the hash, is
+// known only from the ServerHello, after the ClientHello is hashed, so
+// both run until then; the handshake is a few kilobytes.
+const Transcript = struct {
+    s256: sha256.Sha256
+    s384: sha512.Sha384
+
+    fn init() Transcript {
+        return Transcript{ .s256 = sha256.Sha256.init(), .s384 = sha512.Sha384.init() }
+    }
+
+    fn update(inout self: Transcript, data: []u8) void {
+        self.s256.update(data)
+        self.s384.update(data)
+    }
+
+    // The hash of everything given to update; self is unchanged.
+    fn digest(self: Transcript, h: HashKind, inout out: []u8) void {
+        if (h == .sha256) {
+            const d = self.s256.final()
+            copy(&out[0..], d[0..])
+        } else {
+            const d = self.s384.final()
+            copy(&out[0..], d[0..])
+        }
+    }
+}
+
+fn extract(h: HashKind, salt: []u8, ikm: []u8, inout prk: []u8) void {
+    if (h == .sha256) {
+        hkdf.Hkdf(sha256.Sha256).extract(salt, ikm, &prk[0..])
+    } else {
+        hkdf.Hkdf(sha512.Sha384).extract(salt, ikm, &prk[0..])
+    }
+}
+
+// HKDF-Expand-Label(secret, label, context, @len(out)): HKDF-Expand with
+// the info struct { u16 length; "tls13 " + label; context }. Labels and
+// contexts here are short (a label, a hash), and out at most a hash long.
+fn expand_label(h: HashKind, secret: []u8, label: str, context: []u8, inout out: []u8) void {
+    var info: [514]u8 = @splat(0)
+    const prefix = "tls13 "
+    const n = @len(out)
+    info[0] = @as(u8, n >> 8)
+    info[1] = @as(u8, n & 0xFF)
+    info[2] = @as(u8, @len(prefix) + @len(label))
+    var at = 3
+    for (prefix) |c| {
+        info[at] = c
+        at = at + 1
+    }
+    for (label) |c| {
+        info[at] = c
+        at = at + 1
+    }
+    info[at] = @as(u8, @len(context))
+    at = at + 1
+    for (context) |c| {
+        info[at] = c
+        at = at + 1
+    }
+    // Only error.TooLong, for more than 255 hashes of output.
+    if (h == .sha256) {
+        hkdf.Hkdf(sha256.Sha256).expand(secret, info[0..at], &out[0..]) catch return
+    } else {
+        hkdf.Hkdf(sha512.Sha384).expand(secret, info[0..at], &out[0..]) catch return
+    }
+}
+
+// Derive-Secret(secret, label, messages), given the transcript hash of the
+// messages: a secret as long as the hash.
+fn derive_secret(h: HashKind, secret: []u8, label: str, transcript_hash: []u8, inout out: []u8) void {
+    expand_label(h, secret, label, transcript_hash, &out[0..])
+}
+
+// Derive-Secret(secret, "derived", ""): the salt of the next extraction.
+fn derived(h: HashKind, secret: []u8, inout out: []u8) void {
+    const hl = hash_len(h)
+    var empty: [48]u8 = @splat(0)
+    Transcript.init().digest(h, &empty[0..hl])
+    derive_secret(h, secret, "derived", empty[0..hl], &out[0..])
+}
+
+// The early secret without a PSK: HKDF-Extract(0, a hash's length of zeros).
+fn early_secret(h: HashKind, inout out: []u8) void {
+    const zeros: [48]u8 = @splat(0)
+    extract(h, "", zeros[0..hash_len(h)], &out[0..])
+}
+
+// The handshake secret from the early secret and the (EC)DHE shared secret.
+fn handshake_secret(h: HashKind, early: []u8, shared: []u8, inout out: []u8) void {
+    var salt: [48]u8 = @splat(0)
+    defer @secureZero(&salt)
+    const hl = hash_len(h)
+    derived(h, early, &salt[0..hl])
+    extract(h, salt[0..hl], shared, &out[0..])
+}
+
+// The master secret from the handshake secret.
+fn master_secret(h: HashKind, handshake: []u8, inout out: []u8) void {
+    var salt: [48]u8 = @splat(0)
+    defer @secureZero(&salt)
+    const hl = hash_len(h)
+    derived(h, handshake, &salt[0..hl])
+    const zeros: [48]u8 = @splat(0)
+    extract(h, salt[0..hl], zeros[0..hl], &out[0..])
+}
+
+// A Finished message's verify_data: HMAC(finished_key, transcript hash),
+// where finished_key = HKDF-Expand-Label(base, "finished", "", hash length).
+fn verify_data(h: HashKind, base: []u8, transcript_hash: []u8, inout out: []u8) void {
+    const hl = hash_len(h)
+    var key: [48]u8 = @splat(0)
+    defer @secureZero(&key)
+    expand_label(h, base, "finished", "", &key[0..hl])
+    if (h == .sha256) {
+        var m = hmac.Hmac(sha256.Sha256).init(key[0..hl])
+        defer @secureZero(&m)
+        m.update(transcript_hash)
+        m.final(&out[0..])
+    } else {
+        var m = hmac.Hmac(sha512.Sha384).init(key[0..hl])
+        defer @secureZero(&m)
+        m.update(transcript_hash)
+        m.final(&out[0..])
+    }
+}
+
+fn copy(inout to: []u8, from: []u8) void {
+    var i = 0
+    while (i < @len(from)) {
+        to[i] = from[i]
+        i = i + 1
+    }
+}

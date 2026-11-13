@@ -11,7 +11,8 @@ checked against its RFC's test vectors:
 2. AEADs: ChaCha20-Poly1305, AES-128/256-GCM (done)
 3. key exchange: X25519 (done); P-256 comes with step 5, which needs the
    curve for ECDSA anyway
-4. a TLS 1.3 client: record layer, key schedule, handshake
+4. a TLS 1.3 client: record layer, key schedule, handshake (done, but
+   without checking the server's certificate)
 5. certificates: DER, X.509, ECDSA, RSA, Ed25519, the system's CA bundle,
    host names
 
@@ -139,6 +140,48 @@ refuses an all-zero result, as RFC 8446 requires of a client. `clutch
 test` checks it against RFC 7748 (including the iterated test, a thousand
 rounds) and against the RFC's algorithm in Ruby's big integers.
 
+## The client
+
+Until step 5 checks certificates, `tls.client` fails with
+`error.Unsupported`. `tls.client_unverified` connects **without checking
+who answers**: anyone on the path can read and change everything. It is
+for tests against a server of your own.
+
+```egg
+uses io, alloc, net, rand
+
+const tls = @import("tls")
+
+fn main(io: Io, a: Allocator, net: Net, rng: Random) !void {
+    const conn = try net.tcp_connect("127.0.0.1", 4433)
+    var c = try tls.client_unverified(a, rng, conn, "localhost")
+    defer c.close(a)                       // close_notify, then the socket
+    try c.write(a, "GET / HTTP/1.0\r\n\r\n")
+    var buf: Buf(u8) = .empty
+    defer a.free(buf)
+    while (try c.read(a, &buf, 65536) > 0) {   // 0 after close_notify
+        io.print(buf)
+    }
+}
+```
+
+It offers ChaCha20-Poly1305, AES-128-GCM and AES-256-GCM (in that order)
+and an X25519 key share, and answers a request for a client certificate
+with an empty one. It handles NewSessionTicket (by ignoring it: no
+resumption yet) and KeyUpdate, and sends a KeyUpdate of its own every 2^24
+records. Not yet: a HelloRetryRequest (`error.HelloRetryUnsupported`),
+whether it asks for a group other than X25519 (P-256 comes in step 5) or
+for a cookie to send back; PSK, early data, ALPN, and
+sending an alert when it gives up. A connection that ends without a
+close_notify is `error.Truncated`.
+
+`tls/client` is the same client with no socket, fed bytes and leaving
+what it sends in an outbox. `clutch test` replays RFC 8448's handshake
+through it, whole and a byte at a time, and checks every secret and every
+record the client sends against the RFC's, byte for byte.
+`sh test/live.sh` runs it against `openssl s_server`, once per cipher
+suite, and for a 1 MiB response.
+
 ## Secrets in memory
 
 What holds a key, or bytes derived from one, for the length of an
@@ -146,8 +189,10 @@ operation is zeroed with `@secureZero` (stores the C compiler keeps) when
 the operation ends: X25519's scalar, ladder and inversion, HMAC's padded
 keys, Poly1305's one-time key, each chunk of AEAD key stream, the tag
 mask E(K, J0), GHASH's state (with its key H = E(K, 0)), AES's key
-schedule, HKDF's intermediate keys, a hash's state copied to finish it.
-Two things are not:
+schedule, HKDF's intermediate keys, a hash's state copied to finish it,
+and the client's X25519 secret (once used), its handshake secrets (once
+the handshake is over), and the rest of its keys and the application data
+it holds when it is closed. Two things are not:
 
 - Values you keep: an `AesGcm`, an `Hmac`, a hash, a key array. Zero them
   when done: `defer @secureZero(&g)`.

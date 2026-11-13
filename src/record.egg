@@ -1,0 +1,129 @@
+// record: TLS 1.3 record protection (RFC 8446, section 5): the three
+// cipher suites, and one direction's AEAD keyed from a traffic secret.
+//
+//     var w = Protection.init(.aes_128_gcm_sha256, secret[0..32])
+//     defer @secureZero(&w)
+//     // buf: the record's content, its type, then 16 spare bytes
+//     w.seal(header[0..], &buf[0..])
+//     // buf: the encrypted record body, which follows the header
+//
+// The nonce of each record is the traffic iv xor its sequence number,
+// which seal and open count; a new traffic secret starts a new
+// Protection, and so the count again from 0.
+
+const ks = @import("key_schedule.egg")
+const cp = @import("chacha20poly1305.egg")
+const aes_gcm = @import("aes_gcm.egg")
+
+// In the order a ClientHello offers them: ChaCha20-Poly1305 first, which
+// is faster here than AES without AES instructions.
+const Suite = enum { chacha20_poly1305_sha256, aes_128_gcm_sha256, aes_256_gcm_sha384 }
+
+// The code a ClientHello or ServerHello names a suite by.
+fn suite_code(s: Suite) i64 {
+    switch (s) {
+        .chacha20_poly1305_sha256 => {
+            return 0x1303
+        }
+        .aes_128_gcm_sha256 => {
+            return 0x1301
+        }
+        .aes_256_gcm_sha384 => {
+            return 0x1302
+        }
+    }
+}
+
+fn suite_of(code: i64) ?Suite {
+    if (code == 0x1303) {
+        return .chacha20_poly1305_sha256
+    }
+    if (code == 0x1301) {
+        return .aes_128_gcm_sha256
+    }
+    if (code == 0x1302) {
+        return .aes_256_gcm_sha384
+    }
+    return null
+}
+
+fn suite_hash(s: Suite) ks.HashKind {
+    return if (s == .aes_256_gcm_sha384) .sha384 else .sha256
+}
+
+// One direction's keys. The AEAD is chosen by suite, not held in a union:
+// a switch would copy the key out of it for every record, onto a stack
+// that nothing zeros.
+const Protection = struct {
+    suite: Suite
+    // ChaCha20-Poly1305's key, or zeros.
+    chacha: [32]u8
+    // AES-GCM's expanded key, or one of zeros.
+    aes: aes_gcm.AesGcm
+    iv: [12]u8
+    seq: u64
+
+    // A Protection that protects nothing yet: all zeros.
+    fn none() Protection {
+        return Protection{ .suite = .chacha20_poly1305_sha256, .chacha = @splat(0), .aes = aes_gcm.AesGcm.init128(@splat(0)), .iv = @splat(0), .seq = 0 }
+    }
+
+    // The key and iv of a traffic secret, as HKDF-Expand-Label(secret,
+    // "key" and "iv", "", their lengths) give them.
+    fn init(s: Suite, secret: []u8) Protection {
+        const h = suite_hash(s)
+        var p = Protection.none()
+        p.suite = s
+        ks.expand_label(h, secret, "iv", "", &p.iv[0..])
+        if (s == .chacha20_poly1305_sha256) {
+            ks.expand_label(h, secret, "key", "", &p.chacha[0..])
+        } else if (s == .aes_128_gcm_sha256) {
+            var key: [16]u8 = @splat(0)
+            defer @secureZero(&key)
+            ks.expand_label(h, secret, "key", "", &key[0..])
+            p.aes = aes_gcm.AesGcm.init128(key)
+        } else {
+            var key: [32]u8 = @splat(0)
+            defer @secureZero(&key)
+            ks.expand_label(h, secret, "key", "", &key[0..])
+            p.aes = aes_gcm.AesGcm.init256(key)
+        }
+        return p
+    }
+
+    // Encrypts the next record in place: buf holds the inner plaintext and
+    // then 16 bytes for the tag; aad is the record header.
+    fn seal(inout self: Protection, aad: []u8, inout buf: []u8) void {
+        const n = nonce(self.iv, self.seq)
+        if (self.suite == .chacha20_poly1305_sha256) {
+            cp.seal(self.chacha, n, aad, &buf[0..])
+        } else {
+            self.aes.seal(n, aad, &buf[0..])
+        }
+        self.seq = self.seq + 1
+    }
+
+    // Decrypts the next record in place, or error.AuthFailed.
+    fn open(inout self: Protection, aad: []u8, inout buf: []u8) !void {
+        const n = nonce(self.iv, self.seq)
+        if (self.suite == .chacha20_poly1305_sha256) {
+            try cp.open(self.chacha, n, aad, &buf[0..])
+        } else {
+            try self.aes.open(n, aad, &buf[0..])
+        }
+        self.seq = self.seq + 1
+    }
+}
+
+// A record's nonce: the iv, its last 8 bytes xor the sequence number,
+// big-endian. Not a method: a Protection passed by value would copy its
+// keys.
+fn nonce(iv: [12]u8, seq: u64) [12]u8 {
+    var n = iv
+    var i = 0
+    while (i < 8) {
+        n[11 - i] = n[11 - i] ^ @as(u8, (seq >> @as(u64, 8 * i)) & 0xFF)
+        i = i + 1
+    }
+    return n
+}
