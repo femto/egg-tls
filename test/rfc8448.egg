@@ -1,0 +1,297 @@
+// The TLS 1.3 client against RFC 8448's simple 1-RTT handshake
+// (section 3; AES-128-GCM with SHA-256, X25519): the key schedule secret
+// by secret, then the whole client replayed on the recorded records,
+// whole and a byte at a time, which must send exactly the RFC's client
+// records (Finished, application data, close_notify). Then what must
+// fail: a changed record, a HelloRetryRequest, a suite not offered, a
+// server without TLS 1.3, an alert; our own ClientHello, byte for byte;
+// and a KeyUpdate the server asks to be answered.
+uses io, alloc
+
+const ks = @import("tls/key_schedule")
+const record = @import("tls/record")
+const client = @import("tls/client")
+const x25519 = @import("tls/x25519")
+const support = @import("support/check.egg")
+
+fn main(io: Io, a: Allocator) !void {
+    var t = support.tally()
+    try schedule(io, a, &t)
+    try replay(io, a, &t, false)
+    try replay(io, a, &t, true)
+    try tampered(io, a, &t)
+    try refused(io, a, &t, REC_HRR, error.HelloRetryUnsupported, "HelloRetryRequest")
+    try refused(io, a, &t, REC_BADSUITE, error.IllegalParameter, "a suite not offered")
+    try refused(io, a, &t, REC_NOVERSION, error.ProtocolVersion, "no supported_versions")
+    try refused(io, a, &t, "15030300020228", error.AlertReceived, "a plaintext alert")
+    try our_hello(io, a, &t)
+    try key_update(io, a, &t)
+    try t.done(io)
+}
+
+fn schedule(io: Io, a: Allocator, inout t: support.Tally) !void {
+    const h = ks.HashKind.sha256
+    const shared = try x25519.shared(try support.bytes32(CPRIV), try support.bytes32(SPUB))
+    t.check(io, support.same(a, shared[0..], SHARED), "X25519 shared secret")
+    var early: [32]u8 = @splat(0)
+    ks.early_secret(h, &early[0..])
+    t.check(io, support.same(a, early[0..], EARLY), "early secret")
+    var hs: [32]u8 = @splat(0)
+    ks.handshake_secret(h, early[0..], shared[0..], &hs[0..])
+    t.check(io, support.same(a, hs[0..], HS), "handshake secret")
+    const ch = try support.unhex(a, CH)
+    defer a.free(ch)
+    const sh = try support.unhex(a, SH)
+    defer a.free(sh)
+    var tr = ks.Transcript.init()
+    tr.update(ch[0..])
+    tr.update(sh[0..])
+    var th: [32]u8 = @splat(0)
+    tr.digest(h, &th[0..])
+    t.check(io, support.same(a, th[0..], TH_HS), "transcript hash, ClientHello..ServerHello")
+    var chs: [32]u8 = @splat(0)
+    ks.derive_secret(h, hs[0..], "c hs traffic", th[0..], &chs[0..])
+    t.check(io, support.same(a, chs[0..], CHS), "client handshake traffic secret")
+    var shs: [32]u8 = @splat(0)
+    ks.derive_secret(h, hs[0..], "s hs traffic", th[0..], &shs[0..])
+    t.check(io, support.same(a, shs[0..], SHS), "server handshake traffic secret")
+    var key: [16]u8 = @splat(0)
+    ks.expand_label(h, shs[0..], "key", "", &key[0..])
+    t.check(io, support.same(a, key[0..], SHS_KEY), "server handshake key")
+    var iv: [12]u8 = @splat(0)
+    ks.expand_label(h, shs[0..], "iv", "", &iv[0..])
+    t.check(io, support.same(a, iv[0..], SHS_IV), "server handshake iv")
+    var master: [32]u8 = @splat(0)
+    ks.master_secret(h, hs[0..], &master[0..])
+    t.check(io, support.same(a, master[0..], MASTER), "master secret")
+    // The Finished messages are checked by replay, record for record.
+    const th_ap = try support.bytes32(TH_AP)
+    var cap: [32]u8 = @splat(0)
+    ks.derive_secret(h, master[0..], "c ap traffic", th_ap[0..], &cap[0..])
+    t.check(io, support.same(a, cap[0..], CAP), "client application traffic secret")
+    var sap: [32]u8 = @splat(0)
+    ks.derive_secret(h, master[0..], "s ap traffic", th_ap[0..], &sap[0..])
+    t.check(io, support.same(a, sap[0..], SAP), "server application traffic secret")
+}
+
+// The client from the RFC's ClientHello and key, through the RFC's
+// records; bytewise: every record a byte at a time.
+fn replay(io: Io, a: Allocator, inout t: support.Tally, bytewise: bool) !void {
+    const name = if (bytewise) "a byte at a time" else "whole records"
+    const ch = try support.unhex(a, CH)
+    defer a.free(ch)
+    var c = client.Client.start_with(a, try support.bytes32(CPRIV), ch[0..])
+    defer c.deinit(a)
+    try sent(io, a, &t, &c, REC_CH, "ClientHello record", name)
+    try give(a, &c, REC_SH, bytewise)
+    t.check_of(io, !c.connected(), "not connected after the ServerHello:", name)
+    try give(a, &c, REC_SFLIGHT, bytewise)
+    t.check_of(io, c.connected(), "connected:", name)
+    t.check_of(io, c.cipher_suite() == .aes_128_gcm_sha256, "suite:", name)
+    try sent(io, a, &t, &c, REC_CFIN, "client Finished record", name)
+    try give(a, &c, REC_NST, bytewise)
+    try sent(io, a, &t, &c, "", "nothing for a NewSessionTicket", name)
+    const app = try support.unhex(a, APP)
+    defer a.free(app)
+    try c.send(a, app[0..])
+    try sent(io, a, &t, &c, REC_CAPP, "application data record", name)
+    try give(a, &c, REC_SAPP, bytewise)
+    var got: Buf(u8) = .empty
+    defer a.free(got)
+    const n = c.read_plain(a, &got, 1000)
+    t.check_of(io, n == 50 and support.same(a, got[0..], APP), "application data received:", name)
+    c.close_notify(a)
+    try sent(io, a, &t, &c, REC_CALERT, "close_notify record", name)
+    try give(a, &c, REC_SALERT, bytewise)
+    t.check_of(io, c.closed() and c.alert() == 0, "closed by close_notify:", name)
+}
+
+// The RFC's server flight with one byte changed fails to decrypt.
+fn tampered(io: Io, a: Allocator, inout t: support.Tally) !void {
+    const ch = try support.unhex(a, CH)
+    defer a.free(ch)
+    var c = client.Client.start_with(a, try support.bytes32(CPRIV), ch[0..])
+    defer c.deinit(a)
+    try give(a, &c, REC_SH, false)
+    var flight = try support.unhex(a, REC_SFLIGHT)
+    defer a.free(flight)
+    flight[100] = flight[100] ^ 1
+    var failed = false
+    c.feed(a, flight[0..]) catch |e| {
+        failed = e == error.AuthFailed
+    }
+    t.check(io, failed, "a changed record: error.AuthFailed")
+}
+
+// A server's first record that the client must refuse with want.
+fn refused(io: Io, a: Allocator, inout t: support.Tally, rec: str, want: anyerror, name: str) !void {
+    const ch = try support.unhex(a, CH)
+    defer a.free(ch)
+    var c = client.Client.start_with(a, try support.bytes32(CPRIV), ch[0..])
+    defer c.deinit(a)
+    const bytes = try support.unhex(a, rec)
+    defer a.free(bytes)
+    var got: anyerror = error.None
+    c.feed(a, bytes[0..]) catch |e| {
+        got = e
+    }
+    t.check(io, got == want, name)
+    if (got != want) {
+        io.print("  got ", @errorName(got))
+    }
+}
+
+// Client.start's ClientHello, against one built by hand from RFC 8446.
+fn our_hello(io: Io, a: Allocator, inout t: support.Tally) !void {
+    var random: [32]u8 = @splat(0)
+    var i = 0
+    while (i < 32) {
+        random[i] = @as(u8, i)
+        i = i + 1
+    }
+    var c = try client.Client.start(a, try support.bytes32(CPRIV), random, "example.com")
+    defer c.deinit(a)
+    const out = c.take_outbox()
+    defer a.free(out)
+    t.check(io, support.same(a, out[0..], REC_OUR_CH), "our ClientHello")
+    // An IP address is not sent as server_name.
+    var d = try client.Client.start(a, try support.bytes32(CPRIV), random, "127.0.0.1")
+    defer d.deinit(a)
+    const out2 = d.take_outbox()
+    defer a.free(out2)
+    t.check(io, @len(out2) == @len(out) - 20, "no server_name for an IP address")
+}
+
+// After the RFC's handshake, the server sends KeyUpdate(update_requested):
+// the client answers with its own KeyUpdate under its old key, then
+// sends and reads under the next ones.
+fn key_update(io: Io, a: Allocator, inout t: support.Tally) !void {
+    const h = ks.HashKind.sha256
+    const ch = try support.unhex(a, CH)
+    defer a.free(ch)
+    var c = client.Client.start_with(a, try support.bytes32(CPRIV), ch[0..])
+    defer c.deinit(a)
+    try give(a, &c, REC_SH, false)
+    try give(a, &c, REC_SFLIGHT, false)
+    try give(a, &c, REC_NST, false)
+    a.free(c.take_outbox())
+    // The server's KeyUpdate, its second record under the application key.
+    const sap = try support.bytes32(SAP)
+    var server = record.Protection.init(.aes_128_gcm_sha256, sap[0..])
+    server.seq = 1
+    var ku: [27]u8 = @splat(0)
+    ku[0] = 23
+    ku[1] = 3
+    ku[2] = 3
+    ku[4] = 6 + 16
+    const body = [6]u8{ 24, 0, 0, 1, 1, 22 }
+    i_copy(&ku[5..11], body[0..])
+    const hdr = [5]u8{ 23, 3, 3, 0, 22 }
+    server.seal(hdr[0..], &ku[5..])
+    try c.feed(a, ku[0..])
+    // Its answer, under the client's first application key (its record 0).
+    const cap = try support.bytes32(CAP)
+    var mine = record.Protection.init(.aes_128_gcm_sha256, cap[0..])
+    var out = c.take_outbox()
+    defer a.free(out)
+    t.check(io, @len(out) == 5 + 6 + 16, "a KeyUpdate in answer")
+    const ohdr = [5]u8{ out[0], out[1], out[2], out[3], out[4] }
+    mine.open(ohdr[0..], &out[5..]) catch {}
+    t.check(io, out[5] == 24 and out[8] == 1 and out[9] == 0 and out[10] == 22, "KeyUpdate(update_not_requested)")
+    // Data after it, under the client's next key.
+    var next: [32]u8 = @splat(0)
+    ks.expand_label(h, cap[0..], "traffic upd", "", &next[0..])
+    var mine2 = record.Protection.init(.aes_128_gcm_sha256, next[0..])
+    try c.send(a, "hi")
+    var out3 = c.take_outbox()
+    defer a.free(out3)
+    const hdr3 = [5]u8{ out3[0], out3[1], out3[2], out3[3], out3[4] }
+    var opened = true
+    mine2.open(hdr3[0..], &out3[5..]) catch {
+        opened = false
+    }
+    t.check(io, opened and out3[5] == 'h' and out3[6] == 'i' and out3[7] == 23, "data under the next client key")
+    // And the server's data under its next key.
+    var snext: [32]u8 = @splat(0)
+    ks.expand_label(h, sap[0..], "traffic upd", "", &snext[0..])
+    var server2 = record.Protection.init(.aes_128_gcm_sha256, snext[0..])
+    var d: [24]u8 = @splat(0)
+    d[0] = 23
+    d[1] = 3
+    d[2] = 3
+    d[4] = 3 + 16
+    d[5] = 'o'
+    d[6] = 'k'
+    d[7] = 23
+    const dhdr = [5]u8{ 23, 3, 3, 0, 19 }
+    server2.seal(dhdr[0..], &d[5..])
+    try c.feed(a, d[0..])
+    var got: Buf(u8) = .empty
+    defer a.free(got)
+    _ = c.read_plain(a, &got, 100)
+    t.check(io, @len(got) == 2 and got[0] == 'o' and got[1] == 'k', "data under the next server key")
+}
+
+fn i_copy(inout to: []u8, from: []u8) void {
+    var i = 0
+    while (i < @len(from)) {
+        to[i] = from[i]
+        i = i + 1
+    }
+}
+
+// The client's outbox is the hex want (taken out of it).
+fn sent(io: Io, a: Allocator, inout t: support.Tally, inout c: client.Client, want: str, what: str, name: str) !void {
+    const out = c.take_outbox()
+    defer a.free(out)
+    t.check_of(io, support.same(a, out[0..], want), what, name)
+}
+
+// The hex records to the client, whole or a byte at a time.
+fn give(a: Allocator, inout c: client.Client, rec: str, bytewise: bool) !void {
+    const bytes = try support.unhex(a, rec)
+    defer a.free(bytes)
+    if (!bytewise) {
+        try c.feed(a, bytes[0..])
+        return
+    }
+    var i = 0
+    while (i < @len(bytes)) {
+        try c.feed(a, bytes[i..i + 1])
+        i = i + 1
+    }
+}
+
+const CPRIV = "49af42ba7f7994852d713ef2784bcbcaa7911de26adc5642cb634540e7ea5005"
+const CPUB = "99381de560e4bd43d23d8e435a7dbafeb3c06e51c13cae4d5413691e529aaf2c"
+const SPUB = "c9828876112095fe66762bdbf7c672e156d6cc253b833df1dd69b1b04e751f0f"
+const CH = "010000c00303cb34ecb1e78163ba1c38c6dacb196a6dffa21a8d9912ec18a2ef6283024dece7000006130113031302010000910000000b0009000006736572766572ff01000100000a00140012001d0017001800190100010101020103010400230000003300260024001d002099381de560e4bd43d23d8e435a7dbafeb3c06e51c13cae4d5413691e529aaf2c002b0003020304000d0020001e040305030603020308040805080604010501060102010402050206020202002d00020101001c00024001"
+const SH = "020000560303a6af06a4121860dc5e6e60249cd34c95930c8ac5cb1434dac155772ed3e2692800130100002e00330024001d0020c9828876112095fe66762bdbf7c672e156d6cc253b833df1dd69b1b04e751f0f002b00020304"
+const SHARED = "8bd4054fb55b9d63fdfbacf9f04b9f0d35e6d63f537563efd46272900f89492d"
+const EARLY = "33ad0a1c607ec03b09e6cd9893680ce210adf300aa1f2660e1b22e10f170f92a"
+const HS = "1dc826e93606aa6fdc0aadc12f741b01046aa6b99f691ed221a9f0ca043fbeac"
+const CHS = "b3eddb126e067f35a780b3abf45e2d8f3b1a950738f52e9600746a0e27a55a21"
+const SHS = "b67b7d690cc16c4e75e54213cb2d37b4e9c912bcded9105d42befd59d391ad38"
+const MASTER = "18df06843d13a08bf2a449844c5f8a478001bc4d4c627984d5a41da8d0402919"
+const CAP = "9e40646ce79a7f9dc05af8889bce6552875afa0b06df0087f792ebb7c17504a5"
+const SAP = "a11af9f05531f856ad47116b45a950328204b4f44bfb6b3a4b4f1f3fcb631643"
+const SHS_KEY = "3fce516009c21727d0f2e4e86ee403bc"
+const SHS_IV = "5d313eb2671276ee13000b30"
+const SFIN = "9b9b141d906337fbd2cbdce71df4deda4ab42c309572cb7fffee5454b78f0718"
+const CFIN = "a8ec436d677634ae525ac1fcebe11a039ec17694fac6e98527b642f2edd5ce61"
+const TH_AP = "9608102a0f1ccc6db6250b7b7e417b1a000eaada3daae4777a7686c9ff83df13"
+const TH_HS = "860c06edc07858ee8e78f0e7428c58edd6b43f2ca3e6e95f02ed063cf0e1cad8"
+const REC_CH = "16030100c4010000c00303cb34ecb1e78163ba1c38c6dacb196a6dffa21a8d9912ec18a2ef6283024dece7000006130113031302010000910000000b0009000006736572766572ff01000100000a00140012001d0017001800190100010101020103010400230000003300260024001d002099381de560e4bd43d23d8e435a7dbafeb3c06e51c13cae4d5413691e529aaf2c002b0003020304000d0020001e040305030603020308040805080604010501060102010402050206020202002d00020101001c00024001"
+const REC_SH = "160303005a020000560303a6af06a4121860dc5e6e60249cd34c95930c8ac5cb1434dac155772ed3e2692800130100002e00330024001d0020c9828876112095fe66762bdbf7c672e156d6cc253b833df1dd69b1b04e751f0f002b00020304"
+const REC_SFLIGHT = "17030302a2d1ff334a56f5bff6594a07cc87b580233f500f45e489e7f33af35edf7869fcf40aa40aa2b8ea73f848a7ca07612ef9f945cb960b4068905123ea78b111b429ba9191cd05d2a389280f526134aadc7fc78c4b729df828b5ecf7b13bd9aefb0e57f271585b8ea9bb355c7c79020716cfb9b1183ef3ab20e37d57a6b9d7477609aee6e122a4cf51427325250c7d0e509289444c9b3a648f1d71035d2ed65b0e3cdd0cbae8bf2d0b227812cbb360987255cc744110c453baa4fcd610928d809810e4b7ed1a8fd991f06aa6248204797e36a6a73b70a2559c09ead686945ba246ab66e5edd8044b4c6de3fcf2a89441ac66272fd8fb330ef8190579b3684596c960bd596eea520a56a8d650f563aad27409960dca63d3e688611ea5e22f4415cf9538d51a200c27034272968a264ed6540c84838d89f72c24461aad6d26f59ecaba9acbbb317b66d902f4f292a36ac1b639c637ce343117b659622245317b49eeda0c6258f100d7d961ffb138647e92ea330faeea6dfa31c7a84dc3bd7e1b7a6c7178af36879018e3f252107f243d243dc7339d5684c8b0378bf30244da8c87c843f5e56eb4c5e8280a2b48052cf93b16499a66db7cca71e4599426f7d461e66f99882bd89fc50800becca62d6c74116dbd2972fda1fa80f85df881edbe5a37668936b335583b599186dc5c6918a396fa48a181d6b6fa4f9d62d513afbb992f2b992f67f8afe67f76913fa388cb5630c8ca01e0c65d11c66a1e2ac4c85977b7c7a6999bbf10dc35ae69f5515614636c0b9b68c19ed2e31c0b3b66763038ebba42f3b38edc0399f3a9f23faa63978c317fc9fa66a73f60f0504de93b5b845e275592c12335ee340bbc4fddd502784016e4b3be7ef04dda49f4b440a30cb5d2af939828fd4ae3794e44f94df5a631ede42c1719bfdabf0253fe5175be898e750edc53370d2b"
+const REC_CFIN = "170303003575ec4dc238cce60b298044a71e219c56cc77b0517fe9b93c7a4bfc44d87f38f80338ac98fc46deb384bd1caeacab6867d726c40546"
+const REC_NST = "17030300de3a6b8f90414a97d6959c3487680de5134a2b240e6cffac116e95d41d6af8f6b580dcf3d11d63c758db289a015940252f55713e061dc13e078891a38efbcf5753ad8ef170ad3c7353d16d9da773b9ca7f2b9fa1b6c0d4a3d03f75e09c30ba1e62972ac46f75f7b981be63439b2999ce13064615139891d5e4c5b406f16e3fc181a77ca475840025db2f0a77f81b5ab05b94c01346755f69232c86519d86cbeeac87aac347d143f9605d64f650db4d023e70e952ca49fe5137121c74bc2697687e248746d6df353005f3bce18696129c8153556b3b6c6779b37bf15985684f"
+const REC_CAPP = "1703030043a23f7054b62c94d0affafe8228ba55cbefacea42f914aa66bcab3f2b9819a8a5b46b395bd54a9a20441e2b62974e1f5a6292a2977014bd1e3deae63aeebb21694915e4"
+const REC_SAPP = "17030300432e937e11ef4ac740e538ad36005fc4a46932fc3225d05f82aa1b36e30efaf97d90e6dffc602dcb501a59a8fcc49c4bf2e5f0a21c0047c2abf332540dd032e167c2955d"
+const APP = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f3031"
+const REC_CALERT = "1703030013c9872760655666b74d7ff1153efd6db6d0b0e3"
+const REC_SALERT = "1703030013b58fd67166ebf599d24720cfbe7efa7a8864a9"
+const REC_HRR = "160303005a020000560303cf21ad74e59a6111be1d8c021e65b891c2a211167abb8c5e079e09e2c8a8339c00130100002e00330024001d0020c9828876112095fe66762bdbf7c672e156d6cc253b833df1dd69b1b04e751f0f002b00020304"
+const REC_BADSUITE = "160303005a020000560303a6af06a4121860dc5e6e60249cd34c95930c8ac5cb1434dac155772ed3e2692800130400002e00330024001d0020c9828876112095fe66762bdbf7c672e156d6cc253b833df1dd69b1b04e751f0f002b00020304"
+const REC_NOVERSION = "1603030054020000500303a6af06a4121860dc5e6e60249cd34c95930c8ac5cb1434dac155772ed3e2692800130100002800330024001d0020c9828876112095fe66762bdbf7c672e156d6cc253b833df1dd69b1b04e751f0f"
+const REC_OUR_CH = "1603010098010000940303000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f0000061303130113020100006500000010000e00000b6578616d706c652e636f6d000a00040002001d000d00140012040305030804080508060807040105010601002b0003020304003300260024001d002099381de560e4bd43d23d8e435a7dbafeb3c06e51c13cae4d5413691e529aaf2c"

@@ -11,10 +11,125 @@
 //   3. key exchange: X25519 (done: tls/x25519); P-256 comes with step 5,
 //      which needs the curve for ECDSA anyway
 //   4. the record layer, key schedule and handshake of a TLS 1.3 client
+//      (done: tls/key_schedule, tls/record, tls/client, and TlsConn
+//      here), without checking the server's certificate
 //   5. certificates: DER, X.509, ECDSA, RSA, Ed25519, the system's CA
 //      bundle, host names
 //
-// Then a client over a TcpConn:
+// A client over a TcpConn, once step 5 is done:
 //
-//     var c = try tls.client(a, rng, conn, "example.com")
-//     try c.write("GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
+//     var c = try tls.client(a, rng, try net.tcp_connect(host, 443), host)
+//     defer c.close(a)
+//     try c.write(a, "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
+//     var buf: Buf(u8) = .empty
+//     defer a.free(buf)
+//     while (try c.read(a, &buf, 65536) > 0) { ... }
+//
+// Until then client fails with error.Unsupported, and client_unverified
+// connects without checking who answers.
+uses alloc, net, rand
+
+const tls_client = @import("client.egg")
+const record = @import("record.egg")
+
+const TlsConn = owned struct {
+    conn: TcpConn
+    c: tls_client.Client
+
+    // Up to n bytes of what the server sent, in place of what buf held:
+    // how many, and 0 once the server has closed the connection with a
+    // close_notify. The TCP connection ending without one is
+    // error.Truncated: an attacker can end it too.
+    fn read(inout self: TlsConn, a: Allocator, inout buf: Buf(u8), n: i64) !i64 {
+        if (n <= 0) {
+            a.resize(&buf, 0, 0)
+            return 0
+        }
+        var chunk: Buf(u8) = .empty
+        defer a.free(chunk)
+        while (!self.c.has_plain()) {
+            if (self.c.closed()) {
+                a.resize(&buf, 0, 0)
+                return 0
+            }
+            try self.pull(a, &chunk)
+        }
+        return self.c.read_plain(a, &buf, n)
+    }
+
+    // All of data, encrypted, at once.
+    fn write(inout self: TlsConn, a: Allocator, data: []u8) !void {
+        try self.c.send(a, data)
+        try self.flush(a)
+    }
+
+    // The cipher suite the server chose.
+    fn suite(self: TlsConn) record.Suite {
+        return self.c.cipher_suite()
+    }
+
+    // Sends a close_notify (if it can) and closes the TCP connection.
+    fn close(sink self: TlsConn, a: Allocator) void {
+        var t = self
+        t.c.close_notify(a)
+        t.flush(a) catch {}
+        t.conn.close()
+        t.c.deinit(a)
+        @forget(t)
+    }
+
+    // Reads what has arrived and hands it to the client; sends anything
+    // it answers with (a KeyUpdate).
+    fn pull(inout self: TlsConn, a: Allocator, inout chunk: Buf(u8)) !void {
+        const got = try self.conn.read(a, &chunk, 65536)
+        if (got == 0) {
+            return error.Truncated
+        }
+        try self.c.feed(a, chunk[0..])
+        try self.flush(a)
+    }
+
+    fn flush(inout self: TlsConn, a: Allocator) !void {
+        const out = self.c.take_outbox()
+        defer a.free(out)
+        if (@len(out) > 0) {
+            try self.conn.write(out)
+        }
+    }
+}
+
+// A TLS connection to host over conn, once step 5 checks certificates.
+// Until then: error.Unsupported, and conn is closed.
+fn client(a: Allocator, rng: Random, sink conn: TcpConn, host: []u8) !TlsConn {
+    conn.close()
+    return error.Unsupported
+}
+
+// A TLS connection over conn **that does not check the server's
+// certificate**: anyone between here and host can read and change all of
+// it. Only for tests against a server of one's own, until step 5.
+fn client_unverified(a: Allocator, rng: Random, sink conn: TcpConn, host: []u8) !TlsConn {
+    var secret: [32]u8 = @splat(0)
+    defer @secureZero(&secret)
+    rng.fill(&secret[0..])
+    var random: [32]u8 = @splat(0)
+    rng.fill(&random[0..])
+    const c = tls_client.Client.start(a, secret, random, host) catch |e| {
+        conn.close()
+        return e
+    }
+    var t = TlsConn{ .conn = conn, .c = c }
+    var chunk: Buf(u8) = .empty
+    defer a.free(chunk)
+    t.flush(a) catch |e| {
+        t.close(a)
+        return e
+    }
+    while (!t.c.connected()) {
+        t.pull(a, &chunk) catch |e| {
+            t.close(a)
+            return e
+        }
+    }
+    return t
+}

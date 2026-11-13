@@ -1,0 +1,770 @@
+// client: the TLS 1.3 client (RFC 8446) as a state machine over bytes,
+// with no socket: what arrives is given to feed, and what is to be sent
+// collects in an outbox. tls.client runs one over a TcpConn; tests run
+// one over recorded handshakes.
+//
+//     var c = try Client.start(a, secret, random, "example.com")
+//     defer c.deinit(a)
+//     // send c.take_outbox(a), the ClientHello, then until c.connected():
+//     try c.feed(a, received)        // and send c.take_outbox(a) again
+//     try c.send(a, "GET / HTTP/1.1\r\n...")
+//
+// It offers the three TLS 1.3 cipher suites (ChaCha20-Poly1305 first) and
+// an X25519 key share, and takes no PSK or early data. **It does not
+// check the server's certificate yet** (step 5 of the plan): it reads the
+// Certificate and CertificateVerify messages without checking them, so
+// anyone on the path can pretend to be the server. Only
+// tls.client_unverified uses it, for tests against a server of one's own.
+//
+// A HelloRetryRequest fails with error.HelloRetryUnsupported: one can only
+// ask for a group other than X25519, which comes with P-256 in step 5, or
+// for a cookie. Other failures: error.DecodeError (a message that does
+// not parse), error.UnexpectedMessage (one out of order), error.IllegalParameter
+// (a value the client did not offer), error.ProtocolVersion (a server
+// without TLS 1.3), error.AuthFailed (a record that does not decrypt),
+// error.BadFinished, error.RecordOverflow, error.AlertReceived (the server
+// sent an alert other than close_notify; alert() is its description).
+uses alloc
+
+const ks = @import("key_schedule.egg")
+const record = @import("record.egg")
+const x25519 = @import("x25519.egg")
+
+const State = enum { server_hello, encrypted_extensions, certificate, certificate_verify, finished, connected, closed }
+
+// Content types of records.
+const CHANGE_CIPHER_SPEC: u8 = 20
+const ALERT: u8 = 21
+const HANDSHAKE: u8 = 22
+const APPLICATION_DATA: u8 = 23
+
+// The longest plaintext a record holds, and the longest encrypted body.
+const MAX_PLAIN: i64 = 16384
+const MAX_CIPHER: i64 = 16384 + 256
+// The longest handshake message taken (a certificate chain, mostly).
+const MAX_HANDSHAKE: i64 = 262144
+
+// The secrets a client holds, each as long as the suite's hash (at most
+// 48 bytes). The handshake's are zeroed once the handshake is over.
+const Secrets = struct {
+    client_hs: [48]u8
+    server_hs: [48]u8
+    master: [48]u8
+    client_ap: [48]u8
+    server_ap: [48]u8
+}
+
+const Client = owned struct {
+    state: State
+    suite: record.Suite
+    // Our X25519 secret, zeroed once the shared secret is computed.
+    secret: [32]u8
+    transcript: ks.Transcript
+    keys: Secrets
+    read: record.Protection
+    write: record.Protection
+    // The server asked for a client certificate: we send an empty one.
+    cert_requested: bool
+    // The handshake finished: there are application keys to send with.
+    established: bool
+    cert_context: Buf(u8)
+    alert_desc: i64
+    // Bytes received that do not yet make a whole record.
+    inbox: Buf(u8)
+    // Handshake bytes that do not yet make a whole message.
+    hs: Buf(u8)
+    // Records to send.
+    outbox: Buf(u8)
+    // Application data received, not yet taken.
+    plain: Buf(u8)
+
+    // A client whose ClientHello, for host, is in the outbox. secret is a
+    // fresh X25519 secret and random 32 fresh random bytes; host is a DNS
+    // name, sent as server_name (an IP address is not: RFC 6066), or empty.
+    fn start(a: Allocator, secret: [32]u8, random: [32]u8, host: []u8) !Client {
+        var hello: Buf(u8) = .empty
+        defer a.free(hello)
+        try client_hello(a, &hello, random, x25519.public_key(secret), host)
+        return Client.start_with(a, secret, hello[0..])
+    }
+
+    // A client that sends hello, a whole ClientHello message, which offers
+    // the public key of secret: for tests that replay a recorded handshake.
+    fn start_with(a: Allocator, secret: [32]u8, hello: []u8) Client {
+        var c = Client{
+            .state = .server_hello,
+            .suite = .aes_128_gcm_sha256,
+            .secret = secret,
+            .transcript = ks.Transcript.init(),
+            .keys = Secrets{ .client_hs = @splat(0), .server_hs = @splat(0), .master = @splat(0), .client_ap = @splat(0), .server_ap = @splat(0) },
+            .read = record.Protection.none(),
+            .write = record.Protection.none(),
+            .cert_requested = false,
+            .established = false,
+            .cert_context = .empty,
+            .alert_desc = -1,
+            .inbox = .empty,
+            .hs = .empty,
+            .outbox = .empty,
+            .plain = .empty,
+        }
+        c.transcript.update(hello)
+        // A plaintext record; its version is 0x0301 for old middleboxes.
+        a.push(&c.outbox, HANDSHAKE)
+        put16(a, &c.outbox, 0x0301)
+        put16(a, &c.outbox, @len(hello))
+        a.append_str(&c.outbox, hello)
+        return c
+    }
+
+    fn deinit(sink self: Client, a: Allocator) void {
+        var c = self
+        @secureZero(&c.secret)
+        @secureZero(&c.keys)
+        @secureZero(&c.read)
+        @secureZero(&c.write)
+        a.free(c.cert_context)
+        a.free(c.inbox)
+        a.free(c.hs)
+        a.free(c.outbox)
+        @secureZero(&c.plain[0..])
+        a.free(c.plain)
+        @forget(c)
+    }
+
+    fn connected(self: Client) bool {
+        return self.state == .connected
+    }
+
+    // The server has sent close_notify: nothing more will arrive.
+    fn closed(self: Client) bool {
+        return self.state == .closed
+    }
+
+    fn cipher_suite(self: Client) record.Suite {
+        return self.suite
+    }
+
+    // The description of the alert that ended the connection, or -1.
+    fn alert(self: Client) i64 {
+        return self.alert_desc
+    }
+
+    // What is to be sent, taken out of the outbox.
+    fn take_outbox(inout self: Client) Buf(u8) {
+        return @take(&self.outbox)
+    }
+
+    fn has_plain(self: Client) bool {
+        return @len(self.plain) > 0
+    }
+
+    // Up to n bytes of application data received, in place of what buf
+    // held; how many.
+    fn read_plain(inout self: Client, a: Allocator, inout buf: Buf(u8), n: i64) i64 {
+        if (n >= @len(self.plain)) {
+            a.free(@replace(&buf, @take(&self.plain)))
+            return @len(buf)
+        }
+        a.resize(&buf, n, 0)
+        var i = 0
+        while (i < n) {
+            buf[i] = self.plain[i]
+            i = i + 1
+        }
+        drop_front(a, &self.plain, n)
+        return n
+    }
+
+    // Takes in bytes received, which may hold any part of any number of
+    // records: whole records are handled, the rest kept for later.
+    fn feed(inout self: Client, a: Allocator, data: []u8) !void {
+        a.append_str(&self.inbox, data)
+        var at = 0
+        var rec: Buf(u8) = .empty
+        defer a.free(rec)
+        while (self.state != .closed and @len(self.inbox) - at >= 5) {
+            const kind = self.inbox[at]
+            const n = be16(self.inbox[0..], at + 3)
+            if (n > MAX_CIPHER) {
+                return error.RecordOverflow
+            }
+            if (@len(self.inbox) - at - 5 < n) {
+                break
+            }
+            const header = [5]u8{ self.inbox[at], self.inbox[at + 1], self.inbox[at + 2], self.inbox[at + 3], self.inbox[at + 4] }
+            a.resize(&rec, 0, 0)
+            a.append_str(&rec, self.inbox[at + 5..at + 5 + n])
+            at = at + 5 + n
+            try self.record_in(a, kind, header, &rec)
+        }
+        drop_front(a, &self.inbox, at)
+    }
+
+    // Application data, sent in records of at most 16 KiB.
+    fn send(inout self: Client, a: Allocator, data: []u8) !void {
+        if (self.state != .connected) {
+            return error.NotConnected
+        }
+        var at = 0
+        while (at < @len(data)) {
+            const end = if (@len(data) - at > MAX_PLAIN) at + MAX_PLAIN else @len(data)
+            self.seal_record(a, APPLICATION_DATA, data[at..end])
+            at = end
+        }
+    }
+
+    // A close_notify alert, after which nothing more is sent.
+    fn close_notify(inout self: Client, a: Allocator) void {
+        if (self.established) {
+            const body = [2]u8{ 1, 0 }
+            self.seal_record(a, ALERT, body[0..])
+        }
+    }
+
+    // One record: its type, header, and body (decrypted here in place).
+    fn record_in(inout self: Client, a: Allocator, kind: u8, header: [5]u8, inout rec: Buf(u8)) !void {
+        if (kind == ALERT) {
+            // A plaintext alert: the server failed before keys were set
+            // up, or does not use them.
+            if (self.state == .connected) {
+                return error.UnexpectedMessage
+            }
+            try self.alert_in(rec[0..])
+            return
+        }
+        if (self.state == .server_hello) {
+            if (kind != HANDSHAKE) {
+                return error.UnexpectedMessage
+            }
+            try self.handshake_in(a, rec[0..])
+            return
+        }
+        if (kind == CHANGE_CIPHER_SPEC) {
+            // Sent for middleboxes during the handshake (RFC 8446, D.4).
+            if (self.state == .connected or @len(rec) != 1 or rec[0] != 1) {
+                return error.UnexpectedMessage
+            }
+            return
+        }
+        if (kind != APPLICATION_DATA) {
+            return error.UnexpectedMessage
+        }
+        try self.read.open(header[0..], &rec[0..])
+        // The inner plaintext: the content, its type, then zeros.
+        var end = @len(rec) - 16
+        while (end > 0 and rec[end - 1] == 0) {
+            end = end - 1
+        }
+        if (end == 0) {
+            return error.UnexpectedMessage
+        }
+        const inner = rec[end - 1]
+        if (end - 1 > MAX_PLAIN) {
+            return error.RecordOverflow
+        }
+        if (inner == HANDSHAKE) {
+            try self.handshake_in(a, rec[0..end - 1])
+        } else if (inner == ALERT) {
+            try self.alert_in(rec[0..end - 1])
+        } else if (inner == APPLICATION_DATA and self.state == .connected) {
+            a.append_str(&self.plain, rec[0..end - 1])
+        } else {
+            return error.UnexpectedMessage
+        }
+        @secureZero(&rec[0..])
+    }
+
+    fn alert_in(inout self: Client, body: []u8) !void {
+        if (@len(body) != 2) {
+            return error.DecodeError
+        }
+        self.alert_desc = @as(i64, body[1])
+        if (body[1] == 0) {
+            self.state = .closed
+            return
+        }
+        self.state = .closed
+        return error.AlertReceived
+    }
+
+    // Handshake bytes: each whole message is handled in turn.
+    fn handshake_in(inout self: Client, a: Allocator, data: []u8) !void {
+        a.append_str(&self.hs, data)
+        var msg: Buf(u8) = .empty
+        defer a.free(msg)
+        while (@len(self.hs) >= 4) {
+            const n = be24(self.hs[0..], 1)
+            if (n > MAX_HANDSHAKE) {
+                return error.DecodeError
+            }
+            if (@len(self.hs) < 4 + n) {
+                break
+            }
+            a.resize(&msg, 0, 0)
+            a.append_str(&msg, self.hs[0..4 + n])
+            drop_front(a, &self.hs, 4 + n)
+            try self.message(a, msg[0..])
+        }
+    }
+
+    // One handshake message, whole, with its 4-byte header.
+    fn message(inout self: Client, a: Allocator, msg: []u8) !void {
+        const kind = msg[0]
+        const body = msg[4..]
+        switch (self.state) {
+            .server_hello => {
+                if (kind != 2) {
+                    return error.UnexpectedMessage
+                }
+                try self.server_hello(body)
+                self.transcript.update(msg)
+                self.handshake_keys()
+                // The ServerHello must end its record: what follows is
+                // encrypted.
+                if (@len(self.hs) != 0) {
+                    return error.UnexpectedMessage
+                }
+                self.state = .encrypted_extensions
+            }
+            .encrypted_extensions => {
+                if (kind != 8) {
+                    return error.UnexpectedMessage
+                }
+                try check_extensions(body, 0)
+                self.transcript.update(msg)
+                self.state = .certificate
+            }
+            .certificate => {
+                if (kind == 13 and !self.cert_requested) {
+                    try self.certificate_request(a, body)
+                    self.transcript.update(msg)
+                } else if (kind == 11) {
+                    try check_certificate(body)
+                    self.transcript.update(msg)
+                    self.state = .certificate_verify
+                } else {
+                    return error.UnexpectedMessage
+                }
+            }
+            .certificate_verify => {
+                if (kind != 15) {
+                    return error.UnexpectedMessage
+                }
+                // { u16 scheme; u16 length; signature }: checked in step 5.
+                if (@len(body) < 4 or be16(body, 2) != @len(body) - 4) {
+                    return error.DecodeError
+                }
+                self.transcript.update(msg)
+                self.state = .finished
+            }
+            .finished => {
+                if (kind != 20) {
+                    return error.UnexpectedMessage
+                }
+                try self.server_finished(a, msg)
+                if (@len(self.hs) != 0) {
+                    return error.UnexpectedMessage
+                }
+            }
+            .connected => {
+                if (kind == 4) {
+                    // NewSessionTicket: no resumption yet.
+                    return
+                }
+                if (kind == 24) {
+                    try self.key_update(a, body)
+                    return
+                }
+                return error.UnexpectedMessage
+            }
+            .closed => {
+                return error.UnexpectedMessage
+            }
+        }
+    }
+
+    fn server_hello(inout self: Client, body: []u8) !void {
+        // u16 version; random[32]; u8 session id length, id; u16 suite;
+        // u8 compression; u16 extensions length, extensions.
+        if (@len(body) < 2 + 32 + 1) {
+            return error.DecodeError
+        }
+        if (be16(body, 0) != 0x0303) {
+            return error.ProtocolVersion
+        }
+        // The random of a ServerHello that is a HelloRetryRequest: SHA-256
+        // of "HelloRetryRequest".
+        const hello_retry = [32]u8{
+            0xCF, 0x21, 0xAD, 0x74, 0xE5, 0x9A, 0x61, 0x11, 0xBE, 0x1D, 0x8C, 0x02, 0x1E, 0x65, 0xB8, 0x91,
+            0xC2, 0xA2, 0x11, 0x16, 0x7A, 0xBB, 0x8C, 0x5E, 0x07, 0x9E, 0x09, 0xE2, 0xC8, 0xA8, 0x33, 0x9C,
+        }
+        if (body[2..34] == hello_retry[0..]) {
+            return error.HelloRetryUnsupported
+        }
+        // We send an empty session id; the echo must be empty too.
+        if (body[34] != 0) {
+            return error.IllegalParameter
+        }
+        if (@len(body) < 35 + 2 + 1 + 2) {
+            return error.DecodeError
+        }
+        const suite = record.suite_of(be16(body, 35)) orelse return error.IllegalParameter
+        if (body[37] != 0) {
+            return error.IllegalParameter
+        }
+        try check_extensions(body, 38)
+        var version_ok = false
+        var have_share = false
+        var peer: [32]u8 = @splat(0)
+        var at = 40
+        while (at < @len(body)) {
+            const ext = be16(body, at)
+            const n = be16(body, at + 2)
+            const data = body[at + 4..at + 4 + n]
+            if (ext == 43) {
+                // supported_versions: the one chosen.
+                if (n != 2 or be16(data, 0) != 0x0304) {
+                    return error.IllegalParameter
+                }
+                version_ok = true
+            } else if (ext == 51) {
+                // key_share: u16 group; u16 length; key.
+                if (n != 4 + 32 or be16(data, 0) != 0x001D or be16(data, 2) != 32) {
+                    return error.IllegalParameter
+                }
+                var i = 0
+                while (i < 32) {
+                    peer[i] = data[4 + i]
+                    i = i + 1
+                }
+                have_share = true
+            } else {
+                // Nothing else was offered that a ServerHello may answer.
+                return error.UnsupportedExtension
+            }
+            at = at + 4 + n
+        }
+        if (!version_ok) {
+            return error.ProtocolVersion
+        }
+        if (!have_share) {
+            return error.MissingExtension
+        }
+        var shared = try x25519.shared(self.secret, peer)
+        defer @secureZero(&shared)
+        @secureZero(&self.secret)
+        self.suite = suite
+        // The handshake secret goes into master until handshake_keys
+        // replaces it with the master secret.
+        const h = record.suite_hash(suite)
+        const hl = ks.hash_len(h)
+        var early: [48]u8 = @splat(0)
+        defer @secureZero(&early)
+        ks.early_secret(h, &early[0..hl])
+        ks.handshake_secret(h, early[0..hl], shared[0..], &self.keys.master[0..hl])
+    }
+
+    // After the ServerHello is in the transcript: the handshake traffic
+    // secrets and keys, and the master secret.
+    fn handshake_keys(inout self: Client) void {
+        const h = record.suite_hash(self.suite)
+        const hl = ks.hash_len(h)
+        var th: [48]u8 = @splat(0)
+        self.transcript.digest(h, &th[0..hl])
+        var hs_secret = self.keys.master
+        defer @secureZero(&hs_secret)
+        ks.derive_secret(h, hs_secret[0..hl], "c hs traffic", th[0..hl], &self.keys.client_hs[0..hl])
+        ks.derive_secret(h, hs_secret[0..hl], "s hs traffic", th[0..hl], &self.keys.server_hs[0..hl])
+        ks.master_secret(h, hs_secret[0..hl], &self.keys.master[0..hl])
+        self.read = record.Protection.init(self.suite, self.keys.server_hs[0..hl])
+        self.write = record.Protection.init(self.suite, self.keys.client_hs[0..hl])
+    }
+
+    fn certificate_request(inout self: Client, a: Allocator, body: []u8) !void {
+        // u8 context length, context; u16 extensions length, extensions.
+        if (@len(body) < 1 or @len(body) < 1 + @as(i64, body[0]) + 2) {
+            return error.DecodeError
+        }
+        const n = @as(i64, body[0])
+        try check_extensions(body, 1 + n)
+        a.append_str(&self.cert_context, body[1..1 + n])
+        self.cert_requested = true
+    }
+
+    // The server's Finished, whole: checked, and answered with ours.
+    fn server_finished(inout self: Client, a: Allocator, msg: []u8) !void {
+        const h = record.suite_hash(self.suite)
+        const hl = ks.hash_len(h)
+        if (@len(msg) != 4 + hl) {
+            return error.DecodeError
+        }
+        var th: [48]u8 = @splat(0)
+        self.transcript.digest(h, &th[0..hl])
+        var want: [48]u8 = @splat(0)
+        defer @secureZero(&want)
+        ks.verify_data(h, self.keys.server_hs[0..hl], th[0..hl], &want[0..hl])
+        if (!same(want[0..hl], msg[4..])) {
+            return error.BadFinished
+        }
+        self.transcript.update(msg)
+        // The application traffic secrets hash the handshake up to here.
+        self.transcript.digest(h, &th[0..hl])
+        ks.derive_secret(h, self.keys.master[0..hl], "c ap traffic", th[0..hl], &self.keys.client_ap[0..hl])
+        ks.derive_secret(h, self.keys.master[0..hl], "s ap traffic", th[0..hl], &self.keys.server_ap[0..hl])
+        self.read = record.Protection.init(self.suite, self.keys.server_ap[0..hl])
+        var out: Buf(u8) = .empty
+        defer a.free(out)
+        if (self.cert_requested) {
+            // An empty Certificate: we have none.
+            a.push(&out, 11)
+            put24(a, &out, 1 + @len(self.cert_context) + 3)
+            a.push(&out, @as(u8, @len(self.cert_context)))
+            a.append_str(&out, self.cert_context)
+            put24(a, &out, 0)
+            self.transcript.update(out[0..])
+            self.seal_record(a, HANDSHAKE, out[0..])
+            a.resize(&out, 0, 0)
+        }
+        self.transcript.digest(h, &th[0..hl])
+        var verify: [48]u8 = @splat(0)
+        defer @secureZero(&verify)
+        ks.verify_data(h, self.keys.client_hs[0..hl], th[0..hl], &verify[0..hl])
+        a.push(&out, 20)
+        put24(a, &out, hl)
+        a.append_str(&out, verify[0..hl])
+        self.transcript.update(out[0..])
+        self.seal_record(a, HANDSHAKE, out[0..])
+        self.write = record.Protection.init(self.suite, self.keys.client_ap[0..hl])
+        @secureZero(&self.keys.client_hs)
+        @secureZero(&self.keys.server_hs)
+        @secureZero(&self.keys.master)
+        self.established = true
+        self.state = .connected
+    }
+
+    // KeyUpdate: the server's next records use its next traffic secret, and
+    // if it asks, ours do too, after a KeyUpdate of our own.
+    fn key_update(inout self: Client, a: Allocator, body: []u8) !void {
+        if (@len(body) != 1 or body[0] > 1) {
+            return error.DecodeError
+        }
+        // It must end its record: the next record has the new key.
+        if (@len(self.hs) != 0) {
+            return error.UnexpectedMessage
+        }
+        const h = record.suite_hash(self.suite)
+        const hl = ks.hash_len(h)
+        next_secret(h, &self.keys.server_ap[0..hl])
+        self.read = record.Protection.init(self.suite, self.keys.server_ap[0..hl])
+        if (body[0] == 1) {
+            const msg = [5]u8{ 24, 0, 0, 1, 0 }
+            self.seal_record(a, HANDSHAKE, msg[0..])
+            next_secret(h, &self.keys.client_ap[0..hl])
+            self.write = record.Protection.init(self.suite, self.keys.client_ap[0..hl])
+        }
+    }
+
+    // An encrypted record of content type kind into the outbox.
+    fn seal_record(inout self: Client, a: Allocator, kind: u8, data: []u8) void {
+        const start = @len(self.outbox)
+        const n = @len(data) + 1 + 16
+        const header = [5]u8{ APPLICATION_DATA, 3, 3, @as(u8, n >> 8), @as(u8, n & 0xFF) }
+        a.append_str(&self.outbox, header[0..])
+        a.append_str(&self.outbox, data)
+        a.push(&self.outbox, kind)
+        a.resize(&self.outbox, start + 5 + n, 0)
+        self.write.seal(header[0..], &self.outbox[start + 5..])
+    }
+}
+
+// The ClientHello message, with its handshake header, into out.
+fn client_hello(a: Allocator, inout out: Buf(u8), random: [32]u8, public: [32]u8, host: []u8) !void {
+    if (@len(host) > 255) {
+        return error.HostTooLong
+    }
+    a.push(&out, 1)
+    put24(a, &out, 0)
+    put16(a, &out, 0x0303)
+    a.append_str(&out, random[0..])
+    a.push(&out, 0)
+    // Cipher suites, in order of preference.
+    put16(a, &out, 6)
+    put16(a, &out, record.suite_code(.chacha20_poly1305_sha256))
+    put16(a, &out, record.suite_code(.aes_128_gcm_sha256))
+    put16(a, &out, record.suite_code(.aes_256_gcm_sha384))
+    // Compression: none.
+    a.push(&out, 1)
+    a.push(&out, 0)
+    const ext_at = @len(out)
+    put16(a, &out, 0)
+    if (@len(host) > 0 and !is_ip(host)) {
+        // server_name: a list of one host_name.
+        put16(a, &out, 0)
+        put16(a, &out, @len(host) + 5)
+        put16(a, &out, @len(host) + 3)
+        a.push(&out, 0)
+        put16(a, &out, @len(host))
+        a.append_str(&out, host)
+    }
+    // supported_groups: X25519.
+    put16(a, &out, 10)
+    put16(a, &out, 4)
+    put16(a, &out, 2)
+    put16(a, &out, 0x001D)
+    // signature_algorithms: what step 5 checks. ECDSA P-256 and P-384,
+    // RSA-PSS, Ed25519, and RSA PKCS #1 v1.5 (for certificates).
+    const schemes = [9]i64{ 0x0403, 0x0503, 0x0804, 0x0805, 0x0806, 0x0807, 0x0401, 0x0501, 0x0601 }
+    put16(a, &out, 13)
+    put16(a, &out, 2 + 2 * 9)
+    put16(a, &out, 2 * 9)
+    var i = 0
+    while (i < 9) {
+        put16(a, &out, schemes[i])
+        i = i + 1
+    }
+    // supported_versions: TLS 1.3.
+    put16(a, &out, 43)
+    put16(a, &out, 3)
+    a.push(&out, 2)
+    put16(a, &out, 0x0304)
+    // key_share: X25519.
+    put16(a, &out, 51)
+    put16(a, &out, 2 + 4 + 32)
+    put16(a, &out, 4 + 32)
+    put16(a, &out, 0x001D)
+    put16(a, &out, 32)
+    a.append_str(&out, public[0..])
+    const ext_len = @len(out) - ext_at - 2
+    out[ext_at] = @as(u8, ext_len >> 8)
+    out[ext_at + 1] = @as(u8, ext_len & 0xFF)
+    const n = @len(out) - 4
+    out[1] = @as(u8, n >> 16)
+    out[2] = @as(u8, (n >> 8) & 0xFF)
+    out[3] = @as(u8, n & 0xFF)
+}
+
+// An IP address, which server_name may not carry: digits and dots, or a
+// colon (IPv6).
+fn is_ip(host: []u8) bool {
+    var digits_and_dots = true
+    for (host) |c| {
+        if (c == ':') {
+            return true
+        }
+        if (c != '.' and (c < '0' or c > '9')) {
+            digits_and_dots = false
+        }
+    }
+    return digits_and_dots
+}
+
+// Checks that body[at..] is a u16-length list of extensions, each
+// { u16 type; u16 length; data }, that fills it, with no type twice.
+fn check_extensions(body: []u8, at: i64) !void {
+    if (@len(body) < at + 2 or be16(body, at) != @len(body) - at - 2) {
+        return error.DecodeError
+    }
+    var i = at + 2
+    while (i < @len(body)) {
+        if (@len(body) - i < 4 or be16(body, i + 2) > @len(body) - i - 4) {
+            return error.DecodeError
+        }
+        var j = at + 2
+        while (j < i) {
+            if (be16(body, j) == be16(body, i)) {
+                return error.IllegalParameter
+            }
+            j = j + 4 + be16(body, j + 2)
+        }
+        i = i + 4 + be16(body, i + 2)
+    }
+}
+
+// A Certificate message's body: u8 context length (0 from a server),
+// context; a u24-length list of { u24 length, cert; u16 length, extensions },
+// not empty. The certificates themselves are checked in step 5.
+fn check_certificate(body: []u8) !void {
+    if (@len(body) < 4 or body[0] != 0 or be24(body, 1) != @len(body) - 4) {
+        return error.DecodeError
+    }
+    if (@len(body) == 4) {
+        return error.CertificateRequired
+    }
+    var at = 4
+    while (at < @len(body)) {
+        if (@len(body) - at < 3) {
+            return error.DecodeError
+        }
+        const n = be24(body, at)
+        if (n == 0 or @len(body) - at - 3 < n + 2) {
+            return error.DecodeError
+        }
+        at = at + 3 + n
+        const e = be16(body, at)
+        if (@len(body) - at - 2 < e) {
+            return error.DecodeError
+        }
+        at = at + 2 + e
+    }
+}
+
+// The next application traffic secret (RFC 8446, 7.2), in place.
+fn next_secret(h: ks.HashKind, inout secret: []u8) void {
+    var old: [48]u8 = @splat(0)
+    defer @secureZero(&old)
+    const hl = ks.hash_len(h)
+    var i = 0
+    while (i < hl) {
+        old[i] = secret[i]
+        i = i + 1
+    }
+    ks.expand_label(h, old[0..hl], "traffic upd", "", &secret[0..hl])
+}
+
+// Equal, in time that depends only on the lengths.
+fn same(x: []u8, y: []u8) bool {
+    if (@len(x) != @len(y)) {
+        return false
+    }
+    var d: u8 = 0
+    var i = 0
+    while (i < @len(x)) {
+        d = d | (x[i] ^ y[i])
+        i = i + 1
+    }
+    return d == 0
+}
+
+fn be16(b: []u8, at: i64) i64 {
+    return @as(i64, b[at]) << 8 | @as(i64, b[at + 1])
+}
+
+fn be24(b: []u8, at: i64) i64 {
+    return @as(i64, b[at]) << 16 | @as(i64, b[at + 1]) << 8 | @as(i64, b[at + 2])
+}
+
+fn put16(a: Allocator, inout b: Buf(u8), x: i64) void {
+    a.push(&b, @as(u8, x >> 8))
+    a.push(&b, @as(u8, x & 0xFF))
+}
+
+fn put24(a: Allocator, inout b: Buf(u8), x: i64) void {
+    a.push(&b, @as(u8, x >> 16))
+    a.push(&b, @as(u8, (x >> 8) & 0xFF))
+    a.push(&b, @as(u8, x & 0xFF))
+}
+
+// Removes the first n bytes of b.
+fn drop_front(a: Allocator, inout b: Buf(u8), n: i64) void {
+    if (n == 0) {
+        return
+    }
+    const rest = @len(b) - n
+    var i = 0
+    while (i < rest) {
+        b[i] = b[n + i]
+        i = i + 1
+    }
+    a.resize(&b, rest, 0)
+}

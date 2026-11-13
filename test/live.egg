@@ -1,0 +1,89 @@
+// The client against a real TLS 1.3 server: test/live.sh starts
+// `openssl s_server -www` once per cipher suite and runs this with
+// EGG_TLS_PORT and EGG_TLS_SUITE set. Without them it does nothing, so
+// plain `clutch test` passes without openssl. With EGG_TLS_SIZE too, the
+// server is `s_server -HTTP`, which sends the file big.bin as it is, and
+// all its bytes must arrive.
+uses io, alloc, args, net, rand
+
+const tls = @import("tls")
+const record = @import("tls/record")
+
+fn main(io: Io, a: Allocator, args: Args, net: Net, rng: Random) !void {
+    const port_text = args.env("EGG_TLS_PORT") orelse return
+    const want = args.env("EGG_TLS_SUITE") orelse return
+    const port = number(port_text)
+    const size_text = args.env("EGG_TLS_SIZE") orelse ""
+    const conn = try net.tcp_connect("127.0.0.1", port)
+    var c = try tls.client_unverified(a, rng, conn, "localhost")
+    defer c.close(a)
+    const got = suite_name(c.suite())
+    if (@len(size_text) > 0) {
+        try c.write(a, "GET /big.bin HTTP/1.0\r\n\r\n")
+    } else {
+        try c.write(a, "GET / HTTP/1.0\r\n\r\n")
+    }
+    var response: Buf(u8) = .empty
+    defer a.free(response)
+    var buf: Buf(u8) = .empty
+    defer a.free(buf)
+    while (try c.read(a, &buf, 65536) > 0) {
+        a.append_str(&response, buf)
+    }
+    io.print("suite ", got, ", ", @len(response), " bytes")
+    if (!(got == want)) {
+        io.print("FAIL wanted ", want)
+        return error.Failed
+    }
+    if (@len(size_text) > 0) {
+        // -HTTP sends the file as it is, as the whole response.
+        if (@len(response) != number(size_text)) {
+            io.print("FAIL wanted ", size_text, " bytes")
+            return error.Failed
+        }
+        return
+    }
+    // s_server -www answers with a page about the connection.
+    if (!starts_with(response[0..], "HTTP/1.0 200 ok") or !contains(response[0..], want)) {
+        io.print("FAIL response:")
+        io.print(response)
+        return error.Failed
+    }
+}
+
+fn number(text: str) i64 {
+    var n = 0
+    for (text) |ch| {
+        n = n * 10 + @as(i64, ch - '0')
+    }
+    return n
+}
+
+fn suite_name(s: record.Suite) str {
+    switch (s) {
+        .chacha20_poly1305_sha256 => {
+            return "TLS_CHACHA20_POLY1305_SHA256"
+        }
+        .aes_128_gcm_sha256 => {
+            return "TLS_AES_128_GCM_SHA256"
+        }
+        .aes_256_gcm_sha384 => {
+            return "TLS_AES_256_GCM_SHA384"
+        }
+    }
+}
+
+fn starts_with(s: []u8, p: str) bool {
+    return @len(s) >= @len(p) and s[0..@len(p)] == p
+}
+
+fn contains(s: []u8, p: str) bool {
+    var i = 0
+    while (i + @len(p) <= @len(s)) {
+        if (s[i..i + @len(p)] == p) {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
