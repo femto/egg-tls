@@ -9,8 +9,8 @@
 // roots is a CertList too (tls/roots reads the system's). verify walks
 // the chain in the order the server sent it: each certificate must be
 // issued by the next, until one is a root or is issued by one. It checks
-// each signature (ECDSA on P-256 and P-384, RSA PKCS #1 v1.5, with
-// SHA-256, -384 or -512), validity at now, that issuers are CAs
+// each signature (ECDSA on P-256 and P-384, RSA PKCS #1 v1.5 and RSA-PSS,
+// with SHA-256, -384 or -512), validity at now, that issuers are CAs
 // (basicConstraints, and keyCertSign if keyUsage is there) within their
 // pathLenConstraint, serverAuth wherever extKeyUsage is, and that the
 // leaf names host in its subjectAltName: a DNS name, with * only as the
@@ -22,7 +22,7 @@
 // error.NotYetValid, error.NotCA, error.PathLenExceeded,
 // error.BadKeyUsage, error.BadExtKeyUsage, error.UnknownCriticalExtension,
 // error.HostMismatch, error.ChainTooLong, error.UnsupportedAlgorithm
-// (RSA-PSS or Ed25519 in a certificate, for now), error.BadDer.
+// (Ed25519, or RSA-PSS with parameters other than those taken), error.BadDer.
 uses alloc
 
 const der = @import("der.egg")
@@ -34,7 +34,7 @@ const sha512 = @import("sha512.egg")
 
 const KeyKind = enum { p256, p384, rsa, other }
 
-const SigAlg = enum { ecdsa_sha256, ecdsa_sha384, ecdsa_sha512, rsa_sha256, rsa_sha384, rsa_sha512, other }
+const SigAlg = enum { ecdsa_sha256, ecdsa_sha384, ecdsa_sha512, rsa_sha256, rsa_sha384, rsa_sha512, pss_sha256, pss_sha384, pss_sha512, other }
 
 // A parsed certificate: positions in the bytes it was parsed from.
 const Cert = struct {
@@ -199,7 +199,116 @@ fn sig_alg_of(b: []u8, alg: der.Tlv) !SigAlg {
     if (der.oid_is(b, oid, "\x2a\x86\x48\x86\xf7\x0d\x01\x01\x0d")) {
         return .rsa_sha512
     }
+    if (der.oid_is(b, oid, "\x2a\x86\x48\x86\xf7\x0d\x01\x01\x0a")) {
+        return try pss_params(b, alg, oid)
+    }
     return .other
+}
+
+// RSASSA-PSS-params (RFC 4055): SEQUENCE { [0] hash, [1] MGF, [2] salt
+// length, [3] trailer }, each with a default (SHA-1, MGF1 with SHA-1, 20,
+// 1). Taken, as Go takes them: SHA-256, -384 or -512, MGF1 with the same
+// hash, a salt as long as the hash, the trailer 1. Another combination is
+// .other (a signature that cannot be checked); a structure that does not
+// parse is BadDer.
+fn pss_params(b: []u8, alg: der.Tlv, oid: der.Tlv) !SigAlg {
+    if (oid.end == alg.end) {
+        return .other
+    }
+    const seq = try der.expect(b, oid.end, alg.end, der.SEQUENCE)
+    if (seq.end != alg.end) {
+        return error.BadDer
+    }
+    var hash = 20
+    var mgf_hash = 20
+    var salt = 20
+    var p = seq.start
+    if (p < seq.end and b[p] == 0xA0) {
+        const t = try der.read(b, p, seq.end)
+        const id = try der.expect(b, t.start, t.end, der.SEQUENCE)
+        if (id.end != t.end) {
+            return error.BadDer
+        }
+        hash = try hash_id(b, id)
+        p = t.end
+    }
+    if (p < seq.end and b[p] == 0xA1) {
+        // MGF1, whose parameter is the hash's AlgorithmIdentifier.
+        const t = try der.read(b, p, seq.end)
+        const id = try der.expect(b, t.start, t.end, der.SEQUENCE)
+        const mgf = try der.oid(b, id.start, id.end)
+        if (id.end != t.end) {
+            return error.BadDer
+        }
+        if (!der.oid_is(b, mgf, "\x2a\x86\x48\x86\xf7\x0d\x01\x01\x08")) {
+            return .other
+        }
+        const inner = try der.expect(b, mgf.end, id.end, der.SEQUENCE)
+        if (inner.end != id.end) {
+            return error.BadDer
+        }
+        mgf_hash = try hash_id(b, inner)
+        p = t.end
+    }
+    if (p < seq.end and b[p] == 0xA2) {
+        const t = try der.read(b, p, seq.end)
+        const n = try der.expect(b, t.start, t.end, der.INTEGER)
+        if (n.end != t.end) {
+            return error.BadDer
+        }
+        salt = try der.small_int(b, n)
+        p = t.end
+    }
+    if (p < seq.end and b[p] == 0xA3) {
+        const t = try der.read(b, p, seq.end)
+        const n = try der.expect(b, t.start, t.end, der.INTEGER)
+        if (n.end != t.end or try der.small_int(b, n) != 1) {
+            return error.BadDer
+        }
+        p = t.end
+    }
+    if (p != seq.end) {
+        return error.BadDer
+    }
+    if (mgf_hash != hash or salt != hash) {
+        return .other
+    }
+    if (hash == 32) {
+        return .pss_sha256
+    }
+    if (hash == 48) {
+        return .pss_sha384
+    }
+    if (hash == 64) {
+        return .pss_sha512
+    }
+    return .other
+}
+
+// A hash's AlgorithmIdentifier: its digest length (20 for SHA-1, 32, 48
+// or 64 for SHA-256, -384, -512), or 0 for another hash or parameters
+// other than absent or NULL.
+fn hash_id(b: []u8, id: der.Tlv) !i64 {
+    const oid = try der.oid(b, id.start, id.end)
+    if (oid.end != id.end) {
+        const nul = try der.read(b, oid.end, id.end)
+        if (nul.tag != der.NULL or nul.start != nul.end or nul.end != id.end) {
+            return 0
+        }
+    }
+    if (der.oid_is(b, oid, "\x60\x86\x48\x01\x65\x03\x04\x02\x01")) {
+        return 32
+    }
+    if (der.oid_is(b, oid, "\x60\x86\x48\x01\x65\x03\x04\x02\x02")) {
+        return 48
+    }
+    if (der.oid_is(b, oid, "\x60\x86\x48\x01\x65\x03\x04\x02\x03")) {
+        return 64
+    }
+    if (der.oid_is(b, oid, "\x2b\x0e\x03\x02\x1a")) {
+        return 20
+    }
+    return 0
 }
 
 // SubjectPublicKeyInfo: an EC key on P-256 or P-384, an RSA key, or a
@@ -529,17 +638,17 @@ fn check_signature(cb: []u8, c: Cert, pb: []u8, p: Cert) !void {
     var digest: [64]u8 = @splat(0)
     var dl = 0
     switch (c.sig_alg) {
-        .ecdsa_sha256, .rsa_sha256 => {
+        .ecdsa_sha256, .rsa_sha256, .pss_sha256 => {
             const d = sha256.sum(tbs)
             copy(&digest[0..32], d[0..])
             dl = 32
         }
-        .ecdsa_sha384, .rsa_sha384 => {
+        .ecdsa_sha384, .rsa_sha384, .pss_sha384 => {
             const d = sha512.sum384(tbs)
             copy(&digest[0..48], d[0..])
             dl = 48
         }
-        .ecdsa_sha512, .rsa_sha512 => {
+        .ecdsa_sha512, .rsa_sha512, .pss_sha512 => {
             const d = sha512.sum512(tbs)
             copy(&digest[0..64], d[0..])
             dl = 64
@@ -573,6 +682,12 @@ fn check_signature(cb: []u8, c: Cert, pb: []u8, p: Cert) !void {
     }
     const k = try rsa.public_key(key, pb[p.exp_at..p.exp_end])
     const h: rsa.Hash = if (dl == 32) .sha256 else if (dl == 48) .sha384 else .sha512
+    const is_pss = c.sig_alg == .pss_sha256 or c.sig_alg == .pss_sha384 or c.sig_alg == .pss_sha512
+    if (is_pss) {
+        // MGF1 over the same hash, a salt as long as it (pss_params).
+        try rsa.verify_pss(k, h, digest[0..dl], sig, dl)
+        return
+    }
     try rsa.verify_pkcs1(k, h, digest[0..dl], sig)
 }
 
