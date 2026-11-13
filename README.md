@@ -195,17 +195,29 @@ const ec = @import("tls/ec")
 const ecdsa = @import("tls/ecdsa")
 
 fn main(io: Io, rng: Random) !void {
-    const c = ec.p256()                              // or ec.p384()
-    var mine: [32]u8 = @splat(0)                     // c.size bytes
+    const c = ec.p384()                              // or ec.p256()
+    var mine: [48]u8 = @splat(0)                     // room for either curve
     defer @secureZero(&mine)
-    rng.fill(&mine[0..])                             // error.BadScalar if not
-    var ours: [65]u8 = @splat(0)                     // below the order (about
-    try ec.public_key(c, mine[0..], &ours[0..])      // one in 2^32: draw again)
-    var shared: [32]u8 = @splat(0)
+    rng.fill(&mine[0..c.size])                       // c.size bytes: 32 or 48
+    // A secret must be below the group's order: draw again if not
+    // (about one value in 2^32 on P-256; public_key would say BadScalar).
+    while (!usable(c, mine[0..c.size])) {
+        rng.fill(&mine[0..c.size])
+    }
+    var ours: [97]u8 = @splat(0)                     // 1 + 2 * c.size bytes
+    try ec.public_key(c, mine[0..c.size], &ours[0..1 + 2 * c.size])
+    var shared: [48]u8 = @splat(0)                   // c.size bytes
     defer @secureZero(&shared)
-    try ec.shared(c, mine[0..], ours[0..], &shared[0..])   // with its own key, for show
+    try ec.shared(c, mine[0..c.size], ours[0..1 + 2 * c.size], &shared[0..c.size])   // with its own key, for show
     // ecdsa.verify_der(c, public_key, digest, der_signature): error.BadSignature
-    io.print(ours[0], " ", @len(shared))
+    io.print(ours[0], " ", c.size)
+}
+
+fn usable(c: ec.Curve, k: []u8) bool {
+    ec.check_scalar(c, k) catch {
+        return false
+    }
+    return true
 }
 ```
 
@@ -229,7 +241,7 @@ the operation ends: X25519's scalar, ladder and inversion, HMAC's padded
 keys, Poly1305's one-time key, each chunk of AEAD key stream, the tag
 mask E(K, J0), GHASH's state (with its key H = E(K, 0)), AES's key
 schedule, HKDF's intermediate keys, a hash's state copied to finish it,
-and the client's X25519 secret (once used), its handshake secrets (once
+and the client's X25519 and P-256 secrets (once used), its handshake secrets (once
 the handshake is over), and the rest of its keys and the application data
 it holds when it is closed. Two things are not:
 
