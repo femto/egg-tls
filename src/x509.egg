@@ -233,12 +233,22 @@ fn public_key_info(b: []u8, spki: der.Tlv, inout c: Cert) !void {
 
 // Extensions: SEQUENCE OF { OID, critical BOOLEAN DEFAULT FALSE, OCTET
 // STRING holding the value's DER }.
+// At most this many extensions (real certificates have about ten), so
+// checking each against the earlier ones stays small whatever a peer
+// sends.
+const MAX_EXTENSIONS: i64 = 64
+
 fn extensions(b: []u8, list: der.Tlv, inout c: Cert) !void {
     var p = list.start
     if (p == list.end) {
         return error.BadDer
     }
+    var count = 0
     while (p < list.end) {
+        count = count + 1
+        if (count > MAX_EXTENSIONS) {
+            return error.BadDer
+        }
         const ext = try der.expect(b, p, list.end, der.SEQUENCE)
         const oid = try der.oid(b, ext.start, ext.end)
         // RFC 5280 4.2: one of each. A second would override the first
@@ -335,22 +345,49 @@ fn key_usage(b: []u8, v: der.Tlv, inout c: Cert) !void {
 }
 
 // certificatePolicies: SEQUENCE OF PolicyInformation { OID, qualifiers
-// SEQUENCE OPTIONAL }, not empty.
+// SEQUENCE OF PolicyQualifierInfo OPTIONAL }, not empty, at most
+// MAX_EXTENSIONS of them, each policy once (RFC 5280 4.2.1.4); a
+// qualifier is SEQUENCE { OID, one element }, and a list of them is not
+// empty.
 fn policies(b: []u8, v: der.Tlv) !void {
     const seq = try der.expect(b, v.start, v.end, der.SEQUENCE)
     if (seq.end != v.end or seq.start == seq.end) {
         return error.BadDer
     }
     var p = seq.start
+    var count = 0
     while (p < seq.end) {
+        count = count + 1
+        if (count > MAX_EXTENSIONS) {
+            return error.BadDer
+        }
         const info = try der.expect(b, p, seq.end, der.SEQUENCE)
         const oid = try der.oid(b, info.start, info.end)
-        var end = oid.end
-        if (end < info.end) {
-            end = (try der.expect(b, end, info.end, der.SEQUENCE)).end
+        // Each policy once: compared with the ones before it.
+        var q = seq.start
+        while (q < p) {
+            const prev = try der.expect(b, q, p, der.SEQUENCE)
+            const prev_oid = try der.oid(b, prev.start, prev.end)
+            if (b[prev_oid.start..prev_oid.end] == b[oid.start..oid.end]) {
+                return error.BadDer
+            }
+            q = prev.end
         }
-        if (end != info.end) {
-            return error.BadDer
+        if (oid.end < info.end) {
+            const quals = try der.expect(b, oid.end, info.end, der.SEQUENCE)
+            if (quals.end != info.end or quals.start == quals.end) {
+                return error.BadDer
+            }
+            var r = quals.start
+            while (r < quals.end) {
+                const qual = try der.expect(b, r, quals.end, der.SEQUENCE)
+                const id = try der.oid(b, qual.start, qual.end)
+                const value = try der.read(b, id.end, qual.end)
+                if (value.end != qual.end) {
+                    return error.BadDer
+                }
+                r = qual.end
+            }
         }
         p = info.end
     }

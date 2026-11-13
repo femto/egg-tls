@@ -129,12 +129,25 @@ bad["bad_ku_too_long"] = forge(c["leaf"], inter_key) { |_, e| e[1] = ext("keyUsa
 bad["bad_oid"] = forge(c["leaf"], inter_key) { |_, e| e << tlv(0x30, "\x06\x03\x80\x01\x02".b + tlv(0x04, "\x05\x00".b)) }
 bad["bad_policies"] = forge(c["leaf"], inter_key) { |_, e| e << ext("certificatePolicies", tlv(0x30, tlv(0x30, "\x02\x01\x01".b))) }
 bad["bad_ext_wrapper"] = forge(c["leaf"], inter_key) { |p, e| p[7] = tlv(0xA3, tlv(0x30, e.join) + "\x05\x00".b).freeze }
+pol = ->(oid, quals = nil) { tlv(0x30, OpenSSL::ASN1::ObjectId(oid).to_der + (quals ? tlv(0x30, quals) : "".b)) }
+cps = tlv(0x30, OpenSSL::ASN1::ObjectId("1.3.6.1.5.5.7.2.1").to_der + tlv(0x16, "https://example.com/cps"))
+bad["bad_many_extensions"] = forge(c["leaf"], inter_key) { |_, e| 60.times { |i| e << ext("1.3.6.1.4.1.99999.2.#{i}", "\x05\x00".b) } }
+bad["bad_policy_twice"] = forge(c["leaf"], inter_key) { |_, e| e << ext("certificatePolicies", tlv(0x30, pol.("2.23.140.1.2.1") + pol.("2.23.140.1.2.1"))) }
+bad["bad_policy_qualifier"] = forge(c["leaf"], inter_key) { |_, e| e << ext("certificatePolicies", tlv(0x30, pol.("2.23.140.1.2.1", tlv(0x30, "\x02\x01\x01".b)))) }
+bad["bad_policy_no_qualifiers"] = forge(c["leaf"], inter_key) { |_, e| e << ext("certificatePolicies", tlv(0x30, pol.("2.23.140.1.2.1", "".b))) }
+ok_policies = forge(c["leaf"], inter_key) { |_, e| e << ext("certificatePolicies", tlv(0x30, pol.("2.23.140.1.2.1") + pol.("1.3.6.1.4.1.44947.1.1.1", cps))) }
+
 # The Trustwave ECC roots' keyUsage: unused bits zero, but a trailing
 # zero byte DER would drop. Taken.
 ok_ku = forge(c["leaf"], inter_key) { |_, e| e[1] = ext("keyUsage", "\x03\x03\x07\x80\x00".b, critical: true) }
 
 # [name, chain, roots, host, now, answer, how OpenSSL compares]
 cases = [
+  ["certificatePolicies with a CPS qualifier", %w[ok_policies inter], %w[root_rsa], "example.com", NOW, "ok"],
+  ["more than 64 extensions", %w[bad_many_extensions inter], %w[root_rsa], "example.com", NOW, "BadDer", "OpenSSL has no limit; a limit keeps the check for repeats small"],
+  ["a policy twice", %w[bad_policy_twice inter], %w[root_rsa], "example.com", NOW, "BadDer", "OpenSSL does not parse policies it is not asked about"],
+  ["a policy qualifier without its OID", %w[bad_policy_qualifier inter], %w[root_rsa], "example.com", NOW, "BadDer", "OpenSSL does not parse policies it is not asked about"],
+  ["an empty list of policy qualifiers", %w[bad_policy_no_qualifiers inter], %w[root_rsa], "example.com", NOW, "BadDer", "OpenSSL does not parse policies it is not asked about"],
   ["keyUsage with a trailing zero byte", %w[ok_ku inter], %w[root_rsa], "example.com", NOW, "ok"],
   ["an element with tag 0 (end-of-contents) in subjectAltName", %w[bad_tag0 inter], %w[root_rsa], "example.com", NOW, "BadDer", "OpenSSL takes a SAN entry it does not know"],
   ["GeneralizedTime before 2050", %w[bad_gentime inter], %w[root_rsa], "example.com", NOW, "BadDer", "OpenSSL takes either kind of time for any year"],
@@ -197,6 +210,7 @@ cases = [
 
 bad.each { |n, der| c[n] = der }
 c["ok_ku"] = ok_ku
+c["ok_policies"] = ok_policies
 
 # OpenSSL's verify errors that mean each answer: the oracle must fail for
 # the same reason, not only fail.
