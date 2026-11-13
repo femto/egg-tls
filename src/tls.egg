@@ -88,7 +88,11 @@ const TlsConn = owned struct {
         if (got == 0) {
             return error.Truncated
         }
-        try self.c.feed(a, chunk[0..])
+        self.c.feed(a, chunk[0..]) catch |e| {
+            // The alert saying why goes out before the error does.
+            self.flush(a) catch {}
+            return e
+        }
         try self.flush(a)
     }
 

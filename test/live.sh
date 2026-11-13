@@ -5,7 +5,8 @@
 # and RSA-2048 keys, so the handshake is signed with each of ECDSA P-256,
 # ECDSA P-384 and RSA-PSS. Once per cipher suite; then with the P-256
 # key share, for a 1 MiB response, and twice where the client must
-# refuse (the wrong host, and a CA it does not trust). And through two
+# refuse (the wrong host, and a CA it does not trust), where the server
+# must log the client's alert (bad_certificate, unknown_ca). And through two
 # HelloRetryRequests, one for P-384 and one with a cookie (s_server
 # -stateless). Needs OpenSSL 1.1.1 or
 # later.
@@ -42,7 +43,7 @@ wait_port() {
 serve() {
     cert=$1
     shift
-    (cd "$dir" && exec openssl s_server -quiet -tls1_3 -accept "$PORT" -cert "$cert.pem" \
+    (cd "$dir" && exec openssl s_server -tls1_3 -accept "$PORT" -cert "$cert.pem" \
         -key "$cert.key" "$@" >server.log 2>&1) &
     pid=$!
     wait_port
@@ -109,11 +110,28 @@ printf 'HelloRetryRequest with a cookie (-stateless): '
 run env EGG_TLS_SUITE=TLS_CHACHA20_POLY1305_SHA256
 stop
 serve leaf256 -www
+# server_alert N: the server logged receiving alert N from the client.
+# It may log a little after the client exits: up to 2 s.
+server_alert() {
+    i=0
+    until grep -q "SSL alert number $1\$" "$dir/server.log"; do
+        i=$((i + 1))
+        if [ "$i" -gt 20 ]; then
+            echo "FAIL the server did not get alert $1:" >&2
+            cat "$dir/server.log" >&2
+            exit 1
+        fi
+        sleep 0.1
+    done
+    echo "  the server got alert $1"
+}
 printf 'the wrong host: '
 run env EGG_TLS_SUITE=TLS_CHACHA20_POLY1305_SHA256 EGG_TLS_HOST=example.com EGG_TLS_EXPECT=HostMismatch
+server_alert 42
 printf 'a CA not trusted: '
 EGG_TLS_PORT=$PORT EGG_TLS_CA="$dir/other.pem" EGG_TLS_SUITE=TLS_CHACHA20_POLY1305_SHA256 \
     EGG_TLS_EXPECT=UnknownIssuer ./build/test/live
+server_alert 48
 stop
 # A file of 1 MiB: 64 full records and more, through s_server -HTTP.
 head -c 1048576 /dev/urandom >"$dir/big.bin"

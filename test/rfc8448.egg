@@ -13,6 +13,7 @@ const ks = @import("tls/key_schedule")
 const record = @import("tls/record")
 const client = @import("tls/client")
 const x25519 = @import("tls/x25519")
+const x509 = @import("tls/x509")
 const support = @import("support/check.egg")
 
 fn main(io: Io, a: Allocator) !void {
@@ -31,6 +32,7 @@ fn main(io: Io, a: Allocator) !void {
     try closing(io, a, &t)
     try all_at_once(io, a, &t)
     try key_update(io, a, &t)
+    try alerts(io, a, &t)
     try t.done(io)
 }
 
@@ -330,6 +332,105 @@ fn shares() !client.Shares {
     var p384: [48]u8 = @splat(0)
     p384[47] = 7
     return client.Shares{ .x25519 = try support.bytes32(CPRIV), .p256 = try support.bytes32(P256_SECRET), .p384 = p384 }
+}
+
+// The alerts the client sends when it fails: in plaintext before the
+// ServerHello, under its handshake key after; none for the server's own
+// alert, and nothing after one.
+fn alerts(io: Io, a: Allocator, inout t: support.Tally) !void {
+    // A suite not offered: illegal_parameter (47), in plaintext.
+    var c1 = try fresh(a)
+    defer c1.deinit(a)
+    c1.feed(a, (try hold(a, REC_BADSUITE))[0..]) catch {}
+    try sent(io, a, &t, &c1, "1503030002022f", "illegal_parameter in plaintext", "alerts")
+    t.check(io, c1.alert_sent() == 47, "alert_sent is 47")
+    // A changed record: bad_record_mac (20), encrypted.
+    var c2 = try fresh(a)
+    defer c2.deinit(a)
+    try give(a, &c2, REC_SH, false)
+    var flight = try support.unhex(a, REC_SFLIGHT)
+    defer a.free(flight)
+    flight[100] = flight[100] ^ 1
+    c2.feed(a, flight[0..]) catch {}
+    try encrypted_alert(io, a, &t, &c2, 20, "bad_record_mac, under the handshake key")
+    // Checking the server: the RFC's certificate names no host (no
+    // subjectAltName), so HostMismatch, and bad_certificate (42).
+    var c3 = try fresh(a)
+    defer c3.deinit(a)
+    c3.trust(a, x509.CertList.empty(), 1700000000)
+    try give(a, &c3, REC_SH, false)
+    var got: anyerror = error.None
+    give(a, &c3, REC_SFLIGHT, false) catch |e| {
+        got = e
+    }
+    t.check(io, got == error.HostMismatch, "the RFC's certificate: HostMismatch")
+    if (got != error.HostMismatch) {
+        io.print("  got ", @errorName(got), ", sent ", c3.alert_sent())
+    }
+    try encrypted_alert(io, a, &t, &c3, 42, "bad_certificate")
+    // The server's alert: none back.
+    var c4 = try fresh(a)
+    defer c4.deinit(a)
+    c4.feed(a, (try hold(a, "15030300020228"))[0..]) catch {}
+    try sent(io, a, &t, &c4, "", "no alert for the server's", "alerts")
+    // After a fatal alert, close_notify sends nothing.
+    c1.close_notify(a)
+    try sent(io, a, &t, &c1, "", "nothing after a fatal alert", "alerts")
+    // Connected, then the server's fatal alert (handshake_failure, under
+    // its application key): no close_notify back.
+    var c5 = try fresh(a)
+    defer c5.deinit(a)
+    try give(a, &c5, REC_SH, false)
+    try give(a, &c5, REC_SFLIGHT, false)
+    a.free(c5.take_outbox())
+    const sap = try support.bytes32(SAP)
+    var server = record.Protection.init(.aes_128_gcm_sha256, sap[0..])
+    var alert = [24]u8{ 23, 3, 3, 0, 19, 2, 40, 21, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }
+    const hdr = [5]u8{ 23, 3, 3, 0, 19 }
+    server.seal(hdr[0..], &alert[5..])
+    var got5: anyerror = error.None
+    c5.feed(a, alert[0..]) catch |e| {
+        got5 = e
+    }
+    c5.close_notify(a)
+    t.check(io, got5 == error.AlertReceived and c5.alert() == 40, "the server's fatal alert, connected")
+    try sent(io, a, &t, &c5, "", "no close_notify after the server's fatal alert", "alerts")
+}
+
+// A client that has sent the RFC's ClientHello (taken out of its outbox).
+fn fresh(a: Allocator) !client.Client {
+    const ch = try support.unhex(a, CH)
+    defer a.free(ch)
+    var c = client.Client.start_with(a, try shares(), ch[0..])
+    a.free(c.take_outbox())
+    return c
+}
+
+// The hex bytes, kept for the rest of the test (a test's leak).
+fn hold(a: Allocator, h: str) !str {
+    const b = try support.unhex(a, h)
+    defer a.free(b)
+    return a.leak(b)
+}
+
+// The outbox is one alert record under the client's handshake key (its
+// first record), describing desc.
+fn encrypted_alert(io: Io, a: Allocator, inout t: support.Tally, inout c: client.Client, desc: i64, name: str) !void {
+    var out = c.take_outbox()
+    defer a.free(out)
+    if (@len(out) != 5 + 3 + 16) {
+        t.check(io, false, name)
+        io.print("  ", @len(out), " bytes out")
+        return
+    }
+    const chs = try support.bytes32(CHS)
+    var p = record.Protection.init(.aes_128_gcm_sha256, chs[0..])
+    const hdr = [5]u8{ out[0], out[1], out[2], out[3], out[4] }
+    var opened = true
+    p.open(hdr[0..], &out[5..]) catch {
+        opened = false
+    }
+    t.check(io, opened and out[5] == 2 and @as(i64, out[6]) == desc and out[7] == 21 and c.alert_sent() == desc, name)
 }
 
 fn i_copy(inout to: []u8, from: []u8) void {
