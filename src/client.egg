@@ -5,17 +5,24 @@
 //
 //     var c = try Client.start(a, x25519_secret, p256_secret, random, "example.com")
 //     defer c.deinit(a)
+//     c.trust(a, roots, now)         // check the server's certificates
 //     // send c.take_outbox(a), the ClientHello, then until c.connected():
 //     try c.feed(a, received)        // and send c.take_outbox(a) again
 //     try c.send(a, "GET / HTTP/1.1\r\n...")
 //
 // It offers the three TLS 1.3 cipher suites (ChaCha20-Poly1305 first) and
 // two key shares, X25519 and P-256, so that a server that takes only
-// P-256 needs no HelloRetryRequest, and takes no PSK or early data. **It does not
-// check the server's certificate yet** (step 5 of the plan): it reads the
-// Certificate and CertificateVerify messages without checking them, so
-// anyone on the path can pretend to be the server. Only
-// tls.client_unverified uses it, for tests against a server of one's own.
+// P-256 needs no HelloRetryRequest, and takes no PSK or early data.
+//
+// After trust, it checks the server: the certificate chain against the
+// roots, for the host, at now (tls/x509), and the CertificateVerify
+// signature by the leaf's key over the handshake so far (ECDSA on P-256
+// or P-384, RSA-PSS with SHA-256, -384 or -512). A failure is x509's
+// error (UnknownIssuer, HostMismatch, ...), or BadSignature, or
+// IllegalParameter for a signature scheme that does not fit the key.
+// **Without trust it checks neither**, and anyone on the path can be the
+// server: tls.client_unverified, for tests against a server of one's
+// own (and RFC 8448's recorded handshake, whose key is 1024-bit RSA).
 //
 // A HelloRetryRequest fails with error.HelloRetryUnsupported, whatever it
 // asks for: a group other than X25519 and P-256, or a cookie to send
@@ -32,6 +39,11 @@ const ks = @import("key_schedule.egg")
 const record = @import("record.egg")
 const x25519 = @import("x25519.egg")
 const ec = @import("ec.egg")
+const ecdsa = @import("ecdsa.egg")
+const rsa = @import("rsa.egg")
+const sha256 = @import("sha256.egg")
+const sha512 = @import("sha512.egg")
+const x509 = @import("x509.egg")
 
 const State = enum { server_hello, encrypted_extensions, certificate, certificate_verify, finished, connected, closed }
 
@@ -87,6 +99,13 @@ const Client = owned struct {
     outbox: Buf(u8)
     // Application data received, not yet taken.
     plain: Buf(u8)
+    // What checks the server: on after trust.
+    verify: bool
+    roots: x509.CertList
+    host: Buf(u8)
+    now: i64
+    // The server's certificates, leaf first.
+    chain: x509.CertList
 
     // A client whose ClientHello, for host, is in the outbox. secret is a
     // fresh X25519 secret, p256_secret a fresh P-256 one (from 1 to the
@@ -99,7 +118,9 @@ const Client = owned struct {
         var hello: Buf(u8) = .empty
         defer a.free(hello)
         try client_hello(a, &hello, random, x25519.public_key(secret), p256_public, host)
-        return Client.start_with(a, secret, p256_secret, hello[0..])
+        var c = Client.start_with(a, secret, p256_secret, hello[0..])
+        a.append_str(&c.host, host)
+        return c
     }
 
     // A client that sends hello, a whole ClientHello message, which offers
@@ -124,6 +145,11 @@ const Client = owned struct {
             .hs = .empty,
             .outbox = .empty,
             .plain = .empty,
+            .verify = false,
+            .roots = x509.CertList.empty(),
+            .host = .empty,
+            .now = 0,
+            .chain = x509.CertList.empty(),
         }
         c.transcript.update(hello)
         // A plaintext record; its version is 0x0301 for old middleboxes.
@@ -132,6 +158,14 @@ const Client = owned struct {
         put16(a, &c.outbox, @len(hello))
         a.append_str(&c.outbox, hello)
         return c
+    }
+
+    // From now on the server must prove it is host, with a chain to one of
+    // roots valid at now (seconds since 1970). Call it right after start.
+    fn trust(inout self: Client, a: Allocator, sink roots: x509.CertList, now: i64) void {
+        a.free(@replace(&self.roots, roots))
+        self.now = now
+        self.verify = true
     }
 
     fn deinit(sink self: Client, a: Allocator) void {
@@ -148,6 +182,9 @@ const Client = owned struct {
         a.free(c.outbox)
         @secureZero(&c.plain[0..])
         a.free(c.plain)
+        a.free(c.roots)
+        a.free(c.host)
+        a.free(c.chain)
         @forget(c)
     }
 
@@ -381,6 +418,10 @@ const Client = owned struct {
                     self.transcript.update(msg)
                 } else if (kind == 11) {
                     try check_certificate(body)
+                    if (self.verify) {
+                        try self.certificates(a, body)
+                        try x509.verify(self.chain, self.roots, self.host[0..], self.now)
+                    }
                     self.transcript.update(msg)
                     self.state = .certificate_verify
                 } else {
@@ -391,9 +432,12 @@ const Client = owned struct {
                 if (kind != 15) {
                     return error.UnexpectedMessage
                 }
-                // { u16 scheme; u16 length; signature }: checked in step 5.
+                // { u16 scheme; u16 length; signature }.
                 if (@len(body) < 4 or be16(body, 2) != @len(body) - 4) {
                     return error.DecodeError
+                }
+                if (self.verify) {
+                    try self.certificate_verify(be16(body, 0), body[4..])
                 }
                 self.transcript.update(msg)
                 self.state = .finished
@@ -421,6 +465,63 @@ const Client = owned struct {
             .closed => {
                 return error.UnexpectedMessage
             }
+        }
+    }
+
+    // The certificates of a Certificate message (check_certificate has
+    // checked its framing) into chain, leaf first.
+    fn certificates(inout self: Client, a: Allocator, body: []u8) !void {
+        var at = 4
+        while (at < @len(body)) {
+            const n = be24(body, at)
+            try self.chain.add(a, body[at + 3..at + 3 + n])
+            at = at + 3 + n
+            at = at + 2 + be16(body, at)
+        }
+    }
+
+    // The server's CertificateVerify (RFC 8446, 4.4.3): signature by the
+    // leaf's key, with scheme, over 64 spaces, the context string, a 0 and
+    // the transcript hash up to the Certificate.
+    fn certificate_verify(self: Client, scheme: i64, signature: []u8) !void {
+        const h = record.suite_hash(self.suite)
+        const hl = ks.hash_len(h)
+        var content: [146]u8 = @splat(0x20)
+        const context = "TLS 1.3, server CertificateVerify"
+        var i = 0
+        while (i < @len(context)) {
+            content[64 + i] = context[i]
+            i = i + 1
+        }
+        content[64 + @len(context)] = 0
+        const at = 64 + @len(context) + 1
+        self.transcript.digest(h, &content[at..at + hl])
+        const message = content[0..at + hl]
+        const leaf = self.chain.certs[0]
+        const key = self.chain.bytes[leaf.key_at..leaf.key_end]
+        if (scheme == 0x0403 and leaf.key_kind == .p256) {
+            const d = sha256.sum(message)
+            try ecdsa.verify_der(ec.p256(), key, d[0..], signature)
+        } else if (scheme == 0x0503 and leaf.key_kind == .p384) {
+            const d = sha512.sum384(message)
+            try ecdsa.verify_der(ec.p384(), key, d[0..], signature)
+        } else if ((scheme == 0x0804 or scheme == 0x0805 or scheme == 0x0806) and leaf.key_kind == .rsa) {
+            // RSA-PSS with MGF1 over the same hash, salt as long as it.
+            const k = try rsa.public_key(key, self.chain.bytes[leaf.exp_at..leaf.exp_end])
+            if (scheme == 0x0804) {
+                const d = sha256.sum(message)
+                try rsa.verify_pss(k, .sha256, d[0..], signature, 32)
+            } else if (scheme == 0x0805) {
+                const d = sha512.sum384(message)
+                try rsa.verify_pss(k, .sha384, d[0..], signature, 48)
+            } else {
+                const d = sha512.sum512(message)
+                try rsa.verify_pss(k, .sha512, d[0..], signature, 64)
+            }
+        } else {
+            // A scheme not offered, or not for this key (PKCS #1 v1.5 is
+            // for certificates only in TLS 1.3).
+            return error.IllegalParameter
         }
     }
 

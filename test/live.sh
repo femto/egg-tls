@@ -1,7 +1,12 @@
 #!/bin/sh
-# Runs test/live.egg against `openssl s_server`, once for each TLS 1.3
-# cipher suite, on a throwaway self-signed certificate (the client does
-# not check certificates yet). Needs OpenSSL 1.1.1 or later.
+# Runs test/live.egg against `openssl s_server`, checking the server as
+# tls.client does, on a test PKI made here: a P-256 root, a P-384
+# intermediate, and leaves for localhost and 127.0.0.1 with P-256, P-384
+# and RSA-2048 keys, so the handshake is signed with each of ECDSA P-256,
+# ECDSA P-384 and RSA-PSS. Once per cipher suite, with the P-256 key
+# share, for a 1 MiB response, and twice where the client must refuse:
+# the wrong host, and a CA it does not trust. Needs OpenSSL 1.1.1 or
+# later.
 #
 #     sh test/live.sh                 # clutch from PATH
 #     CLUTCH=../egg/bin/clutch sh test/live.sh
@@ -30,34 +35,74 @@ wait_port() {
         sleep 0.1
     done
 }
-"$CLUTCH" test live >/dev/null    # builds it; without the variables it only returns
-openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
-    -keyout "$dir/key.pem" -out "$dir/cert.pem" -subj /CN=localhost -days 1 2>/dev/null
-for suite in TLS_CHACHA20_POLY1305_SHA256 TLS_AES_128_GCM_SHA256 TLS_AES_256_GCM_SHA384; do
-    openssl s_server -quiet -www -tls1_3 -accept "$PORT" -cert "$dir/cert.pem" \
-        -key "$dir/key.pem" -ciphersuites "$suite" -groups X25519 >"$dir/server.log" 2>&1 &
+# serve CERT [s_server options...]: a TLS 1.3 server with CERT (and its
+# key), in the background.
+serve() {
+    cert=$1
+    shift
+    (cd "$dir" && exec openssl s_server -quiet -tls1_3 -accept "$PORT" -cert "$cert.pem" \
+        -key "$cert.key" "$@" >server.log 2>&1) &
     pid=$!
     wait_port
-    EGG_TLS_PORT=$PORT EGG_TLS_SUITE=$suite ./build/test/live
+}
+stop() {
     kill "$pid"
     wait "$pid" 2>/dev/null || true
     pid=
+}
+run() {
+    EGG_TLS_PORT=$PORT EGG_TLS_CA="$dir/ca.pem" "$@" ./build/test/live
+}
+
+"$CLUTCH" test live >/dev/null    # builds it; without the variables it only returns
+
+printf 'basicConstraints=critical,CA:TRUE,pathlen:0\nkeyUsage=critical,keyCertSign,cRLSign\n' >"$dir/ca.ext"
+printf 'subjectAltName=DNS:localhost,IP:127.0.0.1\nextendedKeyUsage=serverAuth\nkeyUsage=critical,digitalSignature\n' >"$dir/leaf.ext"
+root() {
+    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout "$dir/$1.key" \
+        -out "$dir/$1.pem" -subj "/CN=egg-tls $1" -days 2 \
+        -addext basicConstraints=critical,CA:TRUE -addext keyUsage=critical,keyCertSign,cRLSign 2>/dev/null
+}
+# issue NAME ISSUER EXTENSIONS KEY-OPTIONS...
+issue() {
+    name=$1 issuer=$2 ext=$3
+    shift 3
+    openssl req -new "$@" -nodes -keyout "$dir/$name.key" -out "$dir/$name.csr" -subj "/CN=$name" 2>/dev/null
+    openssl x509 -req -in "$dir/$name.csr" -CA "$dir/$issuer.pem" -CAkey "$dir/$issuer.key" \
+        -CAcreateserial -out "$dir/$name.pem" -days 2 -extfile "$dir/$ext" 2>/dev/null
+}
+root ca
+root other
+issue inter ca ca.ext -newkey ec -pkeyopt ec_paramgen_curve:P-384
+issue leaf256 ca leaf.ext -newkey ec -pkeyopt ec_paramgen_curve:P-256
+issue leaf384 ca leaf.ext -newkey ec -pkeyopt ec_paramgen_curve:P-384
+issue leafrsa inter leaf.ext -newkey rsa:2048
+
+for suite in TLS_CHACHA20_POLY1305_SHA256 TLS_AES_128_GCM_SHA256 TLS_AES_256_GCM_SHA384; do
+    serve leaf256 -www -ciphersuites "$suite" -groups X25519
+    run env EGG_TLS_SUITE=$suite
+    stop
 done
-# A server that takes only P-256: the client's second key share.
-openssl s_server -quiet -www -tls1_3 -accept "$PORT" -cert "$dir/cert.pem" \
-    -key "$dir/key.pem" -groups P-256 >"$dir/server.log" 2>&1 &
-pid=$!
-wait_port
-printf 'P-256 key share: '
-EGG_TLS_PORT=$PORT EGG_TLS_SUITE=TLS_CHACHA20_POLY1305_SHA256 ./build/test/live
-kill "$pid"
-wait "$pid" 2>/dev/null || true
-pid=
+serve leaf384 -www
+printf 'P-384 certificate: '
+run env EGG_TLS_SUITE=TLS_CHACHA20_POLY1305_SHA256
+stop
+serve leafrsa -www -cert_chain inter.pem
+printf 'RSA certificate under a P-384 intermediate: '
+run env EGG_TLS_SUITE=TLS_CHACHA20_POLY1305_SHA256
+stop
+serve leaf256 -www -groups P-256
+printf 'P-256 key share, host 127.0.0.1: '
+run env EGG_TLS_SUITE=TLS_CHACHA20_POLY1305_SHA256 EGG_TLS_HOST=127.0.0.1
+printf 'the wrong host: '
+run env EGG_TLS_SUITE=TLS_CHACHA20_POLY1305_SHA256 EGG_TLS_HOST=example.com EGG_TLS_EXPECT=HostMismatch
+printf 'a CA not trusted: '
+EGG_TLS_PORT=$PORT EGG_TLS_CA="$dir/other.pem" EGG_TLS_SUITE=TLS_CHACHA20_POLY1305_SHA256 \
+    EGG_TLS_EXPECT=UnknownIssuer ./build/test/live
+stop
 # A file of 1 MiB: 64 full records and more, through s_server -HTTP.
 head -c 1048576 /dev/urandom >"$dir/big.bin"
-(cd "$dir" && exec openssl s_server -quiet -HTTP -tls1_3 -accept "$PORT" -cert cert.pem \
-    -key key.pem >server.log 2>&1) &
-pid=$!
-wait_port
-EGG_TLS_PORT=$PORT EGG_TLS_SUITE=TLS_CHACHA20_POLY1305_SHA256 \
-    EGG_TLS_SHA256=$(openssl dgst -sha256 -r "$dir/big.bin" | cut -d' ' -f1) ./build/test/live
+serve leaf256 -HTTP
+run env EGG_TLS_SUITE=TLS_CHACHA20_POLY1305_SHA256 \
+    EGG_TLS_SHA256="$(openssl dgst -sha256 -r "$dir/big.bin" | cut -d' ' -f1)"
+stop

@@ -4,17 +4,16 @@ TLS 1.3 for [Egg](https://github.com/femto/egg), written in Egg: the
 hashes, ciphers, key exchange and certificate checks too, with no C
 library, the way Zig's `std.crypto.tls` is written in Zig.
 
-**Work in progress**: not usable yet. The plan, bottom up, each part
-checked against its RFC's test vectors:
+A TLS 1.3 client that checks the server's certificates, tested against
+OpenSSL and real sites. Built bottom up, each part checked against its
+RFC's test vectors:
 
 1. hashes: SHA-256, SHA-384/512, HMAC, HKDF (done)
 2. AEADs: ChaCha20-Poly1305, AES-128/256-GCM (done)
 3. key exchange: X25519 (done); P-256 (done, with step 5a)
-4. a TLS 1.3 client: record layer, key schedule, handshake (done, but
-   without checking the server's certificate)
-5. certificates: ECDSA on P-256 and P-384 (done: 5a), RSA (done: 5b); DER,
-   X.509, the system's CA bundle, host names (done: 5c); checked in the
-   handshake (5d). Ed25519 later
+4. a TLS 1.3 client: record layer, key schedule, handshake (done)
+5. certificates: ECDSA on P-256 and P-384, RSA, DER, X.509, the system's
+   CA bundle, host names, checked in the handshake (done). Ed25519 later
 
 It needs an eggc from after [egg #116](https://github.com/femto/egg/pull/116)
 (wrapping arithmetic `+%`, `rng.fill` into an array, `@secureZero`,
@@ -142,28 +141,36 @@ rounds) and against the RFC's algorithm in Ruby's big integers.
 
 ## The client
 
-Until step 5 checks certificates, `tls.client` fails with
-`error.Unsupported`. `tls.client_unverified` connects **without checking
-who answers**: anyone on the path can read and change everything. It is
-for tests against a server of your own.
+`tls.client` connects to a host and checks it: a certificate chain to
+one of the roots you give, valid now, naming the host, and the server's
+signature over the handshake with that certificate's key.
 
 ```egg
-uses io, alloc, net, rand
+uses io, alloc, net, rand, fs, time
 
 const tls = @import("tls")
+const roots = @import("tls/roots")
 
-fn main(io: Io, a: Allocator, net: Net, rng: Random) !void {
-    const conn = try net.tcp_connect("127.0.0.1", 4433)
-    var c = try tls.client_unverified(a, rng, conn, "localhost")
-    defer c.close(a)                       // close_notify, then the socket
-    try c.write(a, "GET / HTTP/1.0\r\n\r\n")
+fn main(io: Io, a: Allocator, net: Net, rng: Random, files: Fs, clock: Clock) !void {
+    const trusted = try roots.system(a, files)    // once, for every connection
+    defer a.free(trusted)
+    const conn = try net.tcp_connect("example.com", 443)
+    var c = try tls.client(a, rng, clock, trusted, conn, "example.com")
+    defer c.close(a)                               // close_notify, then the socket
+    try c.write(a, "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n")
     var buf: Buf(u8) = .empty
     defer a.free(buf)
-    while (try c.read(a, &buf, 65536) > 0) {   // 0 after close_notify
+    while (try c.read(a, &buf, 65536) > 0) {       // 0 after close_notify
         io.print(buf)
     }
 }
 ```
+
+A failure is the check's error: `UnknownIssuer`, `HostMismatch`,
+`Expired`, `BadSignature` and the rest of tls/x509's, or the
+handshake's. `tls.client_unverified(a, rng, conn, host)` connects
+**without checking who answers** (anyone on the path can read and change
+everything), for tests against a server of your own.
 
 It offers ChaCha20-Poly1305, AES-128-GCM and AES-256-GCM (in that order)
 and two key shares, X25519 and P-256 (so a server that takes only P-256
@@ -180,8 +187,13 @@ close_notify is `error.Truncated`.
 what it sends in an outbox. `clutch test` replays RFC 8448's handshake
 through it, whole and a byte at a time, and checks every secret and every
 record the client sends against the RFC's, byte for byte.
-`sh test/live.sh` runs it against `openssl s_server`, once per cipher
-suite, and for a 1 MiB response.
+`sh test/live.sh` runs it against `openssl s_server` on a test PKI made
+there: once per cipher suite, with P-256, P-384 and RSA certificates (so
+the handshake is signed with ECDSA P-256, ECDSA P-384 and RSA-PSS), the
+P-256 key share, an IP address as the host, a 1 MiB response, and the
+wrong host and an untrusted CA, which it must refuse.
+`EGG_TLS_REAL=example.com,github.com clutch test real` connects to real
+sites with the system's roots.
 
 ## P-256 and P-384
 
