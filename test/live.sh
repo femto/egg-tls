@@ -3,10 +3,11 @@
 # tls.client does, on a test PKI made here: a P-256 root, a P-384
 # intermediate, and leaves for localhost and 127.0.0.1 with P-256, P-384
 # and RSA-2048 keys, so the handshake is signed with each of ECDSA P-256,
-# ECDSA P-384 and RSA-PSS. Once per cipher suite, with the P-256 key
-# share, through HelloRetryRequests (for P-384, and with a cookie), for a
-# 1 MiB response, and twice where the client must refuse:
-# the wrong host, and a CA it does not trust. Needs OpenSSL 1.1.1 or
+# ECDSA P-384 and RSA-PSS. Once per cipher suite; then with the P-256
+# key share, for a 1 MiB response, and twice where the client must
+# refuse (the wrong host, and a CA it does not trust). And through two
+# HelloRetryRequests, one for P-384 and one with a cookie (s_server
+# -stateless). Needs OpenSSL 1.1.1 or
 # later.
 #
 #     sh test/live.sh                 # clutch from PATH

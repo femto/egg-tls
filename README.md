@@ -186,8 +186,8 @@ close_notify is `error.Truncated`.
 `tls/client` is the same client with no socket, fed bytes and leaving
 what it sends in an outbox. `clutch test` replays RFC 8448's handshakes
 through it (the simple one, and the one with a HelloRetryRequest), whole
-and a byte at a time, and checks every secret and every record the
-client sends against the RFC's, byte for byte.
+and a byte at a time, and checks every record the client sends against
+the RFC's, byte for byte, and for the simple one every secret too.
 `sh test/live.sh` runs it against `openssl s_server` on a test PKI made
 there: once per cipher suite, with P-256, P-384 and RSA certificates (so
 the handshake is signed with ECDSA P-256, ECDSA P-384 and RSA-PSS), the

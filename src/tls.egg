@@ -123,7 +123,7 @@ fn connect(a: Allocator, rng: Random, sink conn: TcpConn, host: []u8, verify: bo
     defer @secureZero(&shares)
     rng.fill(&shares.x25519[0..])
     // P-256 and P-384 secrets are below their group's order, as all but
-    // about one random value in 2^32 (P-256) or 2^190 (P-384) are.
+    // about one random value in 2^32 (P-256) or 2^194 (P-384) are.
     rng.fill(&shares.p256[0..])
     while (!scalar_ok(ec.p256(), shares.p256[0..])) {
         rng.fill(&shares.p256[0..])

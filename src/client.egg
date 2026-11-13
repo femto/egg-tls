@@ -145,11 +145,12 @@ const Client = owned struct {
     // The server's certificates, leaf first.
     chain: x509.CertList
 
-    // A client whose ClientHello, for host, is in the outbox. secret is a
-    // fresh X25519 secret, p256_secret a fresh P-256 one (from 1 to the
-    // order less one: error.BadScalar otherwise), and random 32 fresh
-    // random bytes; host is a DNS
-    // name, sent as server_name (an IP address is not: RFC 6066), or empty.
+    // A client whose ClientHello, for host, is in the outbox. shares holds
+    // fresh secrets for X25519 and P-256, whose shares it carries, and
+    // for P-384, sent only if a HelloRetryRequest asks for it (the P-256
+    // and P-384 ones from 1 to their order less one: error.BadScalar
+    // otherwise); random is 32 fresh random bytes; host is a DNS name,
+    // sent as server_name (an IP address is not: RFC 6066), or empty.
     fn start(a: Allocator, shares: Shares, random: [32]u8, host: []u8) !Client {
         var hello: Buf(u8) = .empty
         defer a.free(hello)
@@ -350,8 +351,9 @@ const Client = owned struct {
             return error.UnexpectedMessage
         }
         if (self.state == .server_hello) {
-            if (kind == CHANGE_CIPHER_SPEC and self.retried and @len(rec) == 1 and rec[0] == 1) {
-                // Sent for middleboxes after a HelloRetryRequest (D.4).
+            if (kind == CHANGE_CIPHER_SPEC and @len(rec) == 1 and rec[0] == 1) {
+                // Sent for middleboxes; RFC 8446, 5: dropped at any time
+                // after the first ClientHello, before the server's Finished.
                 return
             }
             if (kind == ALERT) {
@@ -607,6 +609,7 @@ const Client = owned struct {
         }
         try check_extensions(body, 38)
         var version_ok = false
+        var has_group = false
         var group = 0
         var at = 40
         while (at < @len(body)) {
@@ -623,6 +626,7 @@ const Client = owned struct {
                 if (n != 2) {
                     return error.DecodeError
                 }
+                has_group = true
                 group = be16(data, 0)
             } else if (ext == 44) {
                 // cookie: u16 length, at least one byte, sent back as it is.
@@ -638,12 +642,12 @@ const Client = owned struct {
         if (!version_ok) {
             return error.ProtocolVersion
         }
-        // It must change something: a group offered but not shared, or a
-        // cookie.
-        if (group != 0 and (group_bit(group) == 0 or group_bit(group) & self.offered != 0)) {
+        // It must change something: a group offered but not shared (any
+        // group it names, 0 included, must be one), or a cookie.
+        if (has_group and (group_bit(group) == 0 or group_bit(group) & self.offered != 0)) {
             return error.IllegalParameter
         }
-        if (group == 0 and @len(self.cookie) == 0) {
+        if (!has_group and @len(self.cookie) == 0) {
             return error.IllegalParameter
         }
         self.retried = true

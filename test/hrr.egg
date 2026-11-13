@@ -18,10 +18,12 @@ fn main(io: Io, a: Allocator) !void {
     try replay(io, a, &t, false, false)
     try replay(io, a, &t, true, false)
     try replay(io, a, &t, false, true)
+    try ccs_first(io, a, &t)
     try built(io, a, &t, HRR_P384, REC_OUR_CH2, "our second ClientHello: P-384 and a cookie")
     try built(io, a, &t, HRR_COOKIE_ONLY, REC_OUR_CH2_COOKIE, "our second ClientHello: a cookie alone")
     try refused(io, a, &t, HRR_OFFERED, "", error.IllegalParameter, "a group already shared")
     try refused(io, a, &t, HRR_UNKNOWN_GROUP, "", error.IllegalParameter, "a group not offered")
+    try refused(io, a, &t, HRR_GROUP0_COOKIE, "", error.IllegalParameter, "group 0, with a cookie")
     try refused(io, a, &t, HRR_NO_CHANGE, "", error.IllegalParameter, "nothing to change")
     try refused(io, a, &t, HRR_NO_VERSION, "", error.ProtocolVersion, "no supported_versions")
     try refused(io, a, &t, HRR_BAD_SUITE, "", error.IllegalParameter, "a suite not offered")
@@ -70,6 +72,22 @@ fn replay(io: Io, a: Allocator, inout t: support.Tally, bytewise: bool, ccs: boo
     try sent(io, a, &t, &c, REC_CALERT, "close_notify record", name)
     try give(a, &c, REC_SALERT, bytewise)
     t.check_of(io, c.closed() and c.alert() == 0, "closed by close_notify:", name)
+}
+
+// A ChangeCipherSpec before the HelloRetryRequest is dropped too (RFC
+// 8446, 5: at any time after the first ClientHello).
+fn ccs_first(io: Io, a: Allocator, inout t: support.Tally) !void {
+    const ch1 = try support.unhex(a, CH1)
+    defer a.free(ch1)
+    var c = client.Client.start_with(a, try rfc_shares(), ch1[0..])
+    defer c.deinit(a)
+    a.free(c.take_outbox())
+    const ch2 = try support.unhex(a, CH2)
+    defer a.free(ch2)
+    c.replay_retry(a, ch2[0..])
+    try give(a, &c, "140303000101", false)
+    try give(a, &c, REC_HRR, false)
+    try sent(io, a, &t, &c, REC_CH2, "second ClientHello record", "a ChangeCipherSpec before the HelloRetryRequest")
 }
 
 // Our client, then a HelloRetryRequest: the second ClientHello it sends.
@@ -178,6 +196,7 @@ const HRR_COOKIE_ONLY = "160303003e0200003a0303cf21ad74e59a6111be1d8c021e65b891c
 const REC_OUR_CH2_COOKIE = "16030300eb010000e70303000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f000006130313011302010000b800000010000e00000b6578616d706c652e636f6d000a00080006001d00170018000d0012001004030503080408050806040105010601002b0003020304002c00080006636f6f6b69650033006b0069001d002099381de560e4bd43d23d8e435a7dbafeb3c06e51c13cae4d5413691e529aaf2c001700410460fed4ba255a9d31c961eb74c6356d68c049b8923b61fa6ce669622e60f29fb67903fe1008b8bc99a41ae9e95628bc64f2f1b20c2d7e9f5177a3c294d4462299"
 const HRR_OFFERED = "1603030038020000340303cf21ad74e59a6111be1d8c021e65b891c2a211167abb8c5e079e09e2c8a8339c00130100000c002b0002030400330002001d"
 const HRR_UNKNOWN_GROUP = "1603030038020000340303cf21ad74e59a6111be1d8c021e65b891c2a211167abb8c5e079e09e2c8a8339c00130100000c002b00020304003300020019"
+const HRR_GROUP0_COOKIE = "1603030044020000400303cf21ad74e59a6111be1d8c021e65b891c2a211167abb8c5e079e09e2c8a8339c001301000018002b00020304003300020000002c00080006636f6f6b6965"
 const HRR_NO_CHANGE = "16030300320200002e0303cf21ad74e59a6111be1d8c021e65b891c2a211167abb8c5e079e09e2c8a8339c001301000006002b00020304"
 const HRR_NO_VERSION = "16030300320200002e0303cf21ad74e59a6111be1d8c021e65b891c2a211167abb8c5e079e09e2c8a8339c001301000006003300020018"
 const HRR_BAD_SUITE = "1603030038020000340303cf21ad74e59a6111be1d8c021e65b891c2a211167abb8c5e079e09e2c8a8339c00130400000c002b00020304003300020018"

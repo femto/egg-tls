@@ -108,6 +108,7 @@ v[:rec_our_ch2_cookie] = record("16", "0303", our_hello([[0x1d, X_PUB3], [0x17, 
 # Must be refused.
 v[:hrr_offered] = hrr(VERSIONS + ext(51, "001d"))
 v[:hrr_unknown_group] = hrr(VERSIONS + ext(51, "0019"))
+v[:hrr_group0_cookie] = hrr(VERSIONS + ext(51, "0000") + ext(44, u16(6) + cookie))
 v[:hrr_no_change] = hrr(VERSIONS)
 v[:hrr_no_version] = hrr(ext(51, "0018"))
 v[:hrr_bad_suite] = hrr(VERSIONS + ext(51, "0018"), "1304")
