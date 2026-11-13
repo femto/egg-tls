@@ -1,0 +1,186 @@
+// HelloRetryRequest. RFC 8448 section 5 replayed: the client sends the
+// RFC's first ClientHello and, after the server's HelloRetryRequest (for
+// P-256, with a cookie), the RFC's second one; every record it sends after
+// that (Finished, close_notify) must be the RFC's, byte for byte, which
+// needs the transcript restarted as message_hash. Whole and a byte at a
+// time, and with a ChangeCipherSpec after the HelloRetryRequest. Then the
+// second ClientHello tls/client builds itself, for P-384 with a cookie and
+// for a cookie alone, against ones built by hand; and HelloRetryRequests
+// and ServerHellos it must refuse. test/vectors/rfc8448.rb made the
+// vectors.
+uses io, alloc
+
+const client = @import("tls/client")
+const support = @import("support/check.egg")
+
+fn main(io: Io, a: Allocator) !void {
+    var t = support.tally()
+    try replay(io, a, &t, false, false)
+    try replay(io, a, &t, true, false)
+    try replay(io, a, &t, false, true)
+    try built(io, a, &t, HRR_P384, REC_OUR_CH2, "our second ClientHello: P-384 and a cookie")
+    try built(io, a, &t, HRR_COOKIE_ONLY, REC_OUR_CH2_COOKIE, "our second ClientHello: a cookie alone")
+    try refused(io, a, &t, HRR_OFFERED, "", error.IllegalParameter, "a group already shared")
+    try refused(io, a, &t, HRR_UNKNOWN_GROUP, "", error.IllegalParameter, "a group not offered")
+    try refused(io, a, &t, HRR_NO_CHANGE, "", error.IllegalParameter, "nothing to change")
+    try refused(io, a, &t, HRR_NO_VERSION, "", error.ProtocolVersion, "no supported_versions")
+    try refused(io, a, &t, HRR_BAD_SUITE, "", error.IllegalParameter, "a suite not offered")
+    try refused(io, a, &t, HRR_UNKNOWN_EXT, "", error.UnsupportedExtension, "an extension not offered")
+    try refused(io, a, &t, HRR_P384, HRR_P384, error.UnexpectedMessage, "a second HelloRetryRequest")
+    try after_retry(io, a, &t, REC_SH_OTHER_SUITE, "ServerHello: another suite than the HelloRetryRequest's")
+    try after_retry(io, a, &t, REC_SH_X25519, "ServerHello: a share the second ClientHello did not carry")
+    try t.done(io)
+}
+
+// RFC 8448's secrets: X25519 for the first ClientHello, P-256 for the
+// second; P-384 unused.
+fn rfc_shares() !client.Shares {
+    var p384: [48]u8 = @splat(0)
+    p384[47] = 7
+    return client.Shares{ .x25519 = try support.bytes32(X_PRIV), .p256 = try support.bytes32(P_PRIV), .p384 = p384 }
+}
+
+// The shares tls/client's own ClientHellos are built with (see the script).
+fn our_shares() !client.Shares {
+    var p384: [48]u8 = @splat(0)
+    p384[47] = 7
+    return client.Shares{ .x25519 = try support.bytes32(X_PRIV3), .p256 = try support.bytes32(P256_PRIV), .p384 = p384 }
+}
+
+fn replay(io: Io, a: Allocator, inout t: support.Tally, bytewise: bool, ccs: bool) !void {
+    const name = if (bytewise) "a byte at a time" else if (ccs) "a ChangeCipherSpec after the HelloRetryRequest" else "whole records"
+    const ch1 = try support.unhex(a, CH1)
+    defer a.free(ch1)
+    var c = client.Client.start_with(a, try rfc_shares(), ch1[0..])
+    defer c.deinit(a)
+    try sent(io, a, &t, &c, REC_CH1, "first ClientHello", name)
+    const ch2 = try support.unhex(a, CH2)
+    defer a.free(ch2)
+    c.replay_retry(a, ch2[0..])
+    try give(a, &c, REC_HRR, bytewise)
+    try sent(io, a, &t, &c, REC_CH2, "second ClientHello record", name)
+    if (ccs) {
+        try give(a, &c, "140303000101", false)
+    }
+    try give(a, &c, REC_SH, bytewise)
+    try give(a, &c, REC_FLIGHT, bytewise)
+    t.check_of(io, c.connected(), "connected:", name)
+    try sent(io, a, &t, &c, REC_CFIN, "client Finished record", name)
+    c.close_notify(a)
+    try sent(io, a, &t, &c, REC_CALERT, "close_notify record", name)
+    try give(a, &c, REC_SALERT, bytewise)
+    t.check_of(io, c.closed() and c.alert() == 0, "closed by close_notify:", name)
+}
+
+// Our client, then a HelloRetryRequest: the second ClientHello it sends.
+fn built(io: Io, a: Allocator, inout t: support.Tally, hrr: str, want: str, name: str) !void {
+    var c = try ours(a)
+    defer c.deinit(a)
+    try sent(io, a, &t, &c, REC_OUR_CH, "first ClientHello:", name)
+    try give(a, &c, hrr, false)
+    try sent(io, a, &t, &c, want, "second ClientHello:", name)
+}
+
+fn ours(a: Allocator) !client.Client {
+    var random: [32]u8 = @splat(0)
+    var i = 0
+    while (i < 32) {
+        random[i] = @as(u8, i)
+        i = i + 1
+    }
+    return client.Client.start(a, try our_shares(), random, "example.com")
+}
+
+// Our client, given first then (if not empty) second: refused with want.
+fn refused(io: Io, a: Allocator, inout t: support.Tally, first: str, second: str, want: anyerror, name: str) !void {
+    var c = try ours(a)
+    defer c.deinit(a)
+    a.free(c.take_outbox())
+    var got: anyerror = error.None
+    give(a, &c, first, false) catch |e| {
+        got = e
+    }
+    if (got == error.None and @len(second) > 0) {
+        give(a, &c, second, false) catch |e| {
+            got = e
+        }
+    }
+    t.check(io, got == want, name)
+    if (got != want) {
+        io.print("  got ", @errorName(got))
+    }
+}
+
+// The RFC's handshake up to its HelloRetryRequest, then sh: refused.
+fn after_retry(io: Io, a: Allocator, inout t: support.Tally, sh: str, name: str) !void {
+    const ch1 = try support.unhex(a, CH1)
+    defer a.free(ch1)
+    var c = client.Client.start_with(a, try rfc_shares(), ch1[0..])
+    defer c.deinit(a)
+    const ch2 = try support.unhex(a, CH2)
+    defer a.free(ch2)
+    c.replay_retry(a, ch2[0..])
+    try give(a, &c, REC_HRR, false)
+    var got: anyerror = error.None
+    give(a, &c, sh, false) catch |e| {
+        got = e
+    }
+    t.check(io, got == error.IllegalParameter, name)
+    if (got != error.IllegalParameter) {
+        io.print("  got ", @errorName(got))
+    }
+}
+
+// The client's outbox is the hex want (taken out of it).
+fn sent(io: Io, a: Allocator, inout t: support.Tally, inout c: client.Client, want: str, what: str, name: str) !void {
+    const out = c.take_outbox()
+    defer a.free(out)
+    t.check_of(io, support.same(a, out[0..], want), what, name)
+}
+
+// The hex records to the client, whole or a byte at a time.
+fn give(a: Allocator, inout c: client.Client, rec: str, bytewise: bool) !void {
+    const bytes = try support.unhex(a, rec)
+    defer a.free(bytes)
+    if (!bytewise) {
+        try c.feed(a, bytes[0..])
+        return
+    }
+    var i = 0
+    while (i < @len(bytes)) {
+        try c.feed(a, bytes[i..i + 1])
+        i = i + 1
+    }
+}
+
+// Made by test/vectors/rfc8448.rb; do not edit below.
+
+const X_PRIV = "0ed02f8e8117efc75ca7ac32aa7e34eda64cdc0ddad154a5e85289f959f63204"
+const P_PRIV = "ab5473467e19346ceb0a0414e41da21d4d2445bc3025afe97c4e8dc8d513da39"
+const P_PUB = "04a6da7392ec591e17abfd535964b99894d13befb221b3def2ebe3830eac8f0151812677c4d6d2237e85cf01d6910cfb83954e76ba7352830534159897e8065780"
+const CH1 = "010000b00303b0b1c5a5aa37c5919f2ed1d5c6fff7fcb7849716945a2b8cee9258a346677b6f000006130113031302010000810000000b0009000006736572766572ff01000100000a00080006001d00170018003300260024001d0020e8e8e3f3b93a25ed97a14a7dcacb8a272c6288e585c6484d05262fcad062ad1f002b0003020304000d0020001e040305030603020308040805080604010501060102010402050206020202002d00020101001c00024001"
+const REC_CH1 = "16030100b4010000b00303b0b1c5a5aa37c5919f2ed1d5c6fff7fcb7849716945a2b8cee9258a346677b6f000006130113031302010000810000000b0009000006736572766572ff01000100000a00080006001d00170018003300260024001d0020e8e8e3f3b93a25ed97a14a7dcacb8a272c6288e585c6484d05262fcad062ad1f002b0003020304000d0020001e040305030603020308040805080604010501060102010402050206020202002d00020101001c00024001"
+const HRR = "020000ac0303cf21ad74e59a6111be1d8c021e65b891c2a211167abb8c5e079e09e2c8a8339c001301000084003300020017002c0074007271dcd04bb88bc3189119398a00000000eefafc76c146b823b096f8aacad365dd0030953f4edf625636e5f21bb2e23fcc654b1b5b40318d10d137abcbb87574e36e8a1f025f7dfa5d6e50781b5eda4aa15b0c8be778257d16aa3030e9e7841dd9e4c0342267e8ca0caf571fb2b7cff0f934b0002b00020304"
+const REC_HRR = "16030300b0020000ac0303cf21ad74e59a6111be1d8c021e65b891c2a211167abb8c5e079e09e2c8a8339c001301000084003300020017002c0074007271dcd04bb88bc3189119398a00000000eefafc76c146b823b096f8aacad365dd0030953f4edf625636e5f21bb2e23fcc654b1b5b40318d10d137abcbb87574e36e8a1f025f7dfa5d6e50781b5eda4aa15b0c8be778257d16aa3030e9e7841dd9e4c0342267e8ca0caf571fb2b7cff0f934b0002b00020304"
+const CH2 = "010001fc0303b0b1c5a5aa37c5919f2ed1d5c6fff7fcb7849716945a2b8cee9258a346677b6f000006130113031302010001cd0000000b0009000006736572766572ff01000100000a00080006001d001700180033004700450017004104a6da7392ec591e17abfd535964b99894d13befb221b3def2ebe3830eac8f0151812677c4d6d2237e85cf01d6910cfb83954e76ba7352830534159897e8065780002b0003020304000d0020001e040305030603020308040805080604010501060102010402050206020202002c0074007271dcd04bb88bc3189119398a00000000eefafc76c146b823b096f8aacad365dd0030953f4edf625636e5f21bb2e23fcc654b1b5b40318d10d137abcbb87574e36e8a1f025f7dfa5d6e50781b5eda4aa15b0c8be778257d16aa3030e9e7841dd9e4c0342267e8ca0caf571fb2b7cff0f934b0002d00020101001c00024001001500af00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+const REC_CH2 = "1603030200010001fc0303b0b1c5a5aa37c5919f2ed1d5c6fff7fcb7849716945a2b8cee9258a346677b6f000006130113031302010001cd0000000b0009000006736572766572ff01000100000a00080006001d001700180033004700450017004104a6da7392ec591e17abfd535964b99894d13befb221b3def2ebe3830eac8f0151812677c4d6d2237e85cf01d6910cfb83954e76ba7352830534159897e8065780002b0003020304000d0020001e040305030603020308040805080604010501060102010402050206020202002c0074007271dcd04bb88bc3189119398a00000000eefafc76c146b823b096f8aacad365dd0030953f4edf625636e5f21bb2e23fcc654b1b5b40318d10d137abcbb87574e36e8a1f025f7dfa5d6e50781b5eda4aa15b0c8be778257d16aa3030e9e7841dd9e4c0342267e8ca0caf571fb2b7cff0f934b0002d00020101001c00024001001500af00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+const REC_SH = "160303007b020000770303bb341d847fd789c47c387172dc0c9bf147fccacb5043d86ca4c598d3ff571b9800130100004f003300450017004104583e054b7a66672ae020ad9d2686fcc85b5ad41a134a0f03ee72b893052bd85b4c8de6776f5b04ac07d83540eab3e3d9c547bc6528c4317d294686093a6cad7d002b00020304"
+const REC_FLIGHT = "170303029699bee20baf5b7fc727bfab6223928a381e6d0cf9c4da653f9d2a7b23f7de11cce842d5cf75631763450ffb8b0cc1d238e658af7a12adc86243114ab14a1da2fae42621ce483fb6242eabfaad52566b02b31d2eddedefeb80e66a9900d5f973b40c4fdf74719ecf1b68d7f9c3b6ceb903ca13dd1bb8f8187ae33417e1d152522c5822a1a03ad52c838c55953d610222874cce8e1790b229a2aa0b53c8d377ee720182951dc6181dc5d90bd1f0105ed1e84aa5f75957c6661897079e5ea5007449e3197bdc7c9beeedddeafdd844afa5c315ecfe65e576afe909812880620ec7048b42d7f5c78d76f299d6d82534bdd8f512febc0ed3814aca470cd8000d3e1cb9962b052fbb950df683a52c2ba77ed3713b122937a6e5170964e2ab7969dcd980b3db9b458da7603124d6dc005e4d6e04b4d0c4baf3275db827dbba0a6db09672171fc057b3851d7e026841e2978fbd2346bbefdd0376bb1108fe9acc92189f5650aa5e85d8e8c7b67ac510dba003d3d7e16350bb66d45013efd44c9b607c0d318c4c7d1a1f5cbc57e20611804e3787d7b4a4b5f08ed8fd70bdaeade02260b12ab842ef690b4a3ee7911e841b374ecd5ebbbc2a54d047b600336dd7d0c88b4bc10e58ee6cb656de7247fa20d8e91deb84628608cf80615b62e96c1491c7ac3755eb6901405d3474fe1ac79d106a0cee56c2577fc88480f96cb6b8c681b7b68b53c146093908f350888175bdfb0b1e31ad61e30ba0adfe6d223aa03c0783b5001a57587c328a9afcfcfb978d1cd4328f7d9d60530e630befd96c0c816ee20b0100768ae2a6df51fc68f172740a79af11398ee3be1252491fa9c693479e877f94ab7c5f8cad480203e6ab7b87dd71e8a0729113df17f5eee86ce108d1d72007ec1cd13c85a6c149621e77b7d78d805a30f0be030c315e54"
+const REC_CFIN = "1703030035d74f1923c662fd34137c6f502f3dd2b93d951d1b3bc97e42afe23c31abea92fe91b474999e85e3b791ce252fe8c3e9f939a4120cb2"
+const REC_CALERT = "17030300132ea6cdf749196023e2b3a49491695536426047"
+const REC_SALERT = "1703030013519fc5075cb0884349759ff9ef6f011bb4c6f2"
+const X_PRIV3 = "49af42ba7f7994852d713ef2784bcbcaa7911de26adc5642cb634540e7ea5005"
+const P256_PRIV = "c9afa9d845ba75166b5c215767b1d6934e50c3db36e89b127b8a622b120f6721"
+const REC_OUR_CH = "16030100df010000db0303000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f000006130313011302010000ac00000010000e00000b6578616d706c652e636f6d000a00080006001d00170018000d0012001004030503080408050806040105010601002b00030203040033006b0069001d002099381de560e4bd43d23d8e435a7dbafeb3c06e51c13cae4d5413691e529aaf2c001700410460fed4ba255a9d31c961eb74c6356d68c049b8923b61fa6ce669622e60f29fb67903fe1008b8bc99a41ae9e95628bc64f2f1b20c2d7e9f5177a3c294d4462299"
+const HRR_P384 = "16030300410200003d0303cf21ad74e59a6111be1d8c021e65b891c2a211167abb8c5e079e09e2c8a8339c001301000015002b00020304003300020018002c00050003636f6f"
+const REC_OUR_CH2 = "16030300e4010000e00303000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f000006130313011302010000b100000010000e00000b6578616d706c652e636f6d000a00080006001d00170018000d0012001004030503080408050806040105010601002b0003020304002c00050003636f6f0033006700650018006104283c1d7365ce4788f29f8ebf234edffead6fe997fbea5ffa2d58cc9dfa7b1c508b05526f55b9ebb2040f05b48fb6d0e19475c99061e41b88ba52efdb8c1690471a61d867ed799729d9c92cd01dbd225630d84ede32a78f9e64664cdac512ef8c"
+const HRR_COOKIE_ONLY = "160303003e0200003a0303cf21ad74e59a6111be1d8c021e65b891c2a211167abb8c5e079e09e2c8a8339c001301000012002b00020304002c00080006636f6f6b6965"
+const REC_OUR_CH2_COOKIE = "16030300eb010000e70303000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f000006130313011302010000b800000010000e00000b6578616d706c652e636f6d000a00080006001d00170018000d0012001004030503080408050806040105010601002b0003020304002c00080006636f6f6b69650033006b0069001d002099381de560e4bd43d23d8e435a7dbafeb3c06e51c13cae4d5413691e529aaf2c001700410460fed4ba255a9d31c961eb74c6356d68c049b8923b61fa6ce669622e60f29fb67903fe1008b8bc99a41ae9e95628bc64f2f1b20c2d7e9f5177a3c294d4462299"
+const HRR_OFFERED = "1603030038020000340303cf21ad74e59a6111be1d8c021e65b891c2a211167abb8c5e079e09e2c8a8339c00130100000c002b0002030400330002001d"
+const HRR_UNKNOWN_GROUP = "1603030038020000340303cf21ad74e59a6111be1d8c021e65b891c2a211167abb8c5e079e09e2c8a8339c00130100000c002b00020304003300020019"
+const HRR_NO_CHANGE = "16030300320200002e0303cf21ad74e59a6111be1d8c021e65b891c2a211167abb8c5e079e09e2c8a8339c001301000006002b00020304"
+const HRR_NO_VERSION = "16030300320200002e0303cf21ad74e59a6111be1d8c021e65b891c2a211167abb8c5e079e09e2c8a8339c001301000006003300020018"
+const HRR_BAD_SUITE = "1603030038020000340303cf21ad74e59a6111be1d8c021e65b891c2a211167abb8c5e079e09e2c8a8339c00130400000c002b00020304003300020018"
+const HRR_UNKNOWN_EXT = "160303003d020000390303cf21ad74e59a6111be1d8c021e65b891c2a211167abb8c5e079e09e2c8a8339c001301000011002b00020304003300020018000f000101"
+const REC_SH_OTHER_SUITE = "160303007b020000770303bb341d847fd789c47c387172dc0c9bf147fccacb5043d86ca4c598d3ff571b9800130200004f003300450017004104583e054b7a66672ae020ad9d2686fcc85b5ad41a134a0f03ee72b893052bd85b4c8de6776f5b04ac07d83540eab3e3d9c547bc6528c4317d294686093a6cad7d002b00020304"
+const REC_SH_X25519 = "160303005a020000560303bb341d847fd789c47c387172dc0c9bf147fccacb5043d86ca4c598d3ff571b9800130100002e002b0002030400330024001d00201111111111111111111111111111111111111111111111111111111111111111"

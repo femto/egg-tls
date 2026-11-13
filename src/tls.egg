@@ -119,20 +119,22 @@ fn client_unverified(a: Allocator, rng: Random, sink conn: TcpConn, host: []u8) 
 }
 
 fn connect(a: Allocator, rng: Random, sink conn: TcpConn, host: []u8, verify: bool, roots: x509.CertList, now: i64) !TlsConn {
-    var secret: [32]u8 = @splat(0)
-    defer @secureZero(&secret)
-    rng.fill(&secret[0..])
-    // A P-256 secret is below the group's order, as all but about one in
-    // 2^32 random values are.
-    var p256_secret: [32]u8 = @splat(0)
-    defer @secureZero(&p256_secret)
-    rng.fill(&p256_secret[0..])
-    while (!p256_ok(p256_secret)) {
-        rng.fill(&p256_secret[0..])
+    var shares = tls_client.Shares{ .x25519 = @splat(0), .p256 = @splat(0), .p384 = @splat(0) }
+    defer @secureZero(&shares)
+    rng.fill(&shares.x25519[0..])
+    // P-256 and P-384 secrets are below their group's order, as all but
+    // about one random value in 2^32 (P-256) or 2^190 (P-384) are.
+    rng.fill(&shares.p256[0..])
+    while (!scalar_ok(ec.p256(), shares.p256[0..])) {
+        rng.fill(&shares.p256[0..])
+    }
+    rng.fill(&shares.p384[0..])
+    while (!scalar_ok(ec.p384(), shares.p384[0..])) {
+        rng.fill(&shares.p384[0..])
     }
     var random: [32]u8 = @splat(0)
     rng.fill(&random[0..])
-    var c = tls_client.Client.start(a, secret, p256_secret, random, host) catch |e| {
+    var c = tls_client.Client.start(a, shares, random, host) catch |e| {
         conn.close()
         return e
     }
@@ -159,8 +161,8 @@ fn connect(a: Allocator, rng: Random, sink conn: TcpConn, host: []u8, verify: bo
     return t
 }
 
-fn p256_ok(k: [32]u8) bool {
-    ec.check_scalar(ec.p256(), k[0..]) catch {
+fn scalar_ok(c: ec.Curve, k: []u8) bool {
+    ec.check_scalar(c, k) catch {
         return false
     }
     return true

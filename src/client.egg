@@ -3,16 +3,19 @@
 // collects in an outbox. tls.client runs one over a TcpConn; tests run
 // one over recorded handshakes.
 //
-//     var c = try Client.start(a, x25519_secret, p256_secret, random, "example.com")
+//     var c = try Client.start(a, shares, random, "example.com")
 //     defer c.deinit(a)
 //     c.trust(a, roots, now)         // check the server's certificates
 //     // send c.take_outbox(a), the ClientHello, then until c.connected():
 //     try c.feed(a, received)        // and send c.take_outbox(a) again
 //     try c.send(a, "GET / HTTP/1.1\r\n...")
 //
-// It offers the three TLS 1.3 cipher suites (ChaCha20-Poly1305 first) and
-// two key shares, X25519 and P-256, so that a server that takes only
-// P-256 needs no HelloRetryRequest, and takes no PSK or early data.
+// It offers the three TLS 1.3 cipher suites (ChaCha20-Poly1305 first),
+// the groups X25519, P-256 and P-384, and key shares for the first two,
+// so that a server that takes only P-256 needs no HelloRetryRequest. A
+// HelloRetryRequest for P-384, or with a cookie, is answered with a
+// second ClientHello (RFC 8446, 4.1.4); a second one, or one that would
+// change nothing, fails. It takes no PSK or early data.
 //
 // After trust, it checks the server: the certificate chain against the
 // roots, for the host, at now (tls/x509), and the CertificateVerify
@@ -24,9 +27,7 @@
 // server: tls.client_unverified, for tests against a server of one's
 // own (and RFC 8448's recorded handshake, whose key is 1024-bit RSA).
 //
-// A HelloRetryRequest fails with error.HelloRetryUnsupported, whatever it
-// asks for: a group other than X25519 and P-256, or a cookie to send
-// back. Other failures: error.DecodeError (a message that does
+// Failures: error.DecodeError (a message that does
 // not parse), error.UnexpectedMessage (one out of order), error.IllegalParameter
 // (a value the client did not offer), error.ProtocolVersion (a server
 // without TLS 1.3), error.AuthFailed (a record that does not decrypt),
@@ -44,6 +45,33 @@ const rsa = @import("rsa.egg")
 const sha256 = @import("sha256.egg")
 const sha512 = @import("sha512.egg")
 const x509 = @import("x509.egg")
+
+// The secrets of the key shares a client may send: X25519 and P-256 in
+// its first ClientHello, P-384 if a HelloRetryRequest asks for it. Each
+// fresh and random; the P-256 and P-384 ones below their group's order.
+const Shares = struct {
+    x25519: [32]u8
+    p256: [32]u8
+    p384: [48]u8
+}
+
+// The groups, as bits of a set: which shares a ClientHello carries.
+const X25519: i64 = 1
+const P256: i64 = 2
+const P384: i64 = 4
+
+fn group_bit(code: i64) i64 {
+    if (code == 0x001D) {
+        return X25519
+    }
+    if (code == 0x0017) {
+        return P256
+    }
+    if (code == 0x0018) {
+        return P384
+    }
+    return 0
+}
 
 const State = enum { server_hello, encrypted_extensions, certificate, certificate_verify, finished, connected, closed }
 
@@ -75,10 +103,20 @@ const Secrets = struct {
 const Client = owned struct {
     state: State
     suite: record.Suite
-    // Our X25519 and P-256 secrets, zeroed once the shared secret is
-    // computed.
-    secret: [32]u8
-    p256_secret: [32]u8
+    // Our key share secrets, zeroed once the shared secret is computed.
+    shares: Shares
+    // The groups whose shares the last ClientHello carried.
+    offered: i64
+    // For a second ClientHello: its random, and what the
+    // HelloRetryRequest asked for (a suite, a group or 0, a cookie).
+    random: [32]u8
+    retried: bool
+    retry_suite: record.Suite
+    retry_group: i64
+    cookie: Buf(u8)
+    // A second ClientHello to send as it is, for tests that replay a
+    // recorded handshake.
+    retry_hello: Buf(u8)
     transcript: ks.Transcript
     keys: Secrets
     read: record.Protection
@@ -112,26 +150,31 @@ const Client = owned struct {
     // order less one: error.BadScalar otherwise), and random 32 fresh
     // random bytes; host is a DNS
     // name, sent as server_name (an IP address is not: RFC 6066), or empty.
-    fn start(a: Allocator, secret: [32]u8, p256_secret: [32]u8, random: [32]u8, host: []u8) !Client {
-        var p256_public: [65]u8 = @splat(0)
-        try ec.public_key(ec.p256(), p256_secret[0..], &p256_public[0..])
+    fn start(a: Allocator, shares: Shares, random: [32]u8, host: []u8) !Client {
         var hello: Buf(u8) = .empty
         defer a.free(hello)
-        try client_hello(a, &hello, random, x25519.public_key(secret), p256_public, host)
-        var c = Client.start_with(a, secret, p256_secret, hello[0..])
+        try client_hello(a, &hello, random, host, shares, X25519 | P256, "")
+        var c = Client.start_with(a, shares, hello[0..])
+        c.random = random
         a.append_str(&c.host, host)
         return c
     }
 
-    // A client that sends hello, a whole ClientHello message, which offers
-    // the public keys of secret (X25519) and p256_secret (P-256): for tests
-    // that replay a recorded handshake.
-    fn start_with(a: Allocator, secret: [32]u8, p256_secret: [32]u8, hello: []u8) Client {
+    // A client that sends hello, a whole ClientHello message whose key
+    // shares are the public keys of shares: for tests that replay a
+    // recorded handshake.
+    fn start_with(a: Allocator, shares: Shares, hello: []u8) Client {
         var c = Client{
             .state = .server_hello,
             .suite = .aes_128_gcm_sha256,
-            .secret = secret,
-            .p256_secret = p256_secret,
+            .shares = shares,
+            .offered = shares_in(hello),
+            .random = @splat(0),
+            .retried = false,
+            .retry_suite = .aes_128_gcm_sha256,
+            .retry_group = 0,
+            .cookie = .empty,
+            .retry_hello = .empty,
             .transcript = ks.Transcript.init(),
             .keys = Secrets{ .client_hs = @splat(0), .server_hs = @splat(0), .master = @splat(0), .client_ap = @splat(0), .server_ap = @splat(0) },
             .read = record.Protection.none(),
@@ -160,6 +203,12 @@ const Client = owned struct {
         return c
     }
 
+    // The second ClientHello to send if a HelloRetryRequest comes, as it
+    // is: for tests that replay a recorded handshake.
+    fn replay_retry(inout self: Client, a: Allocator, hello: []u8) void {
+        a.append_str(&self.retry_hello, hello)
+    }
+
     // From now on the server must prove it is host, with a chain to one of
     // roots valid at now (seconds since 1970). Call it right after start.
     fn trust(inout self: Client, a: Allocator, sink roots: x509.CertList, now: i64) void {
@@ -170,8 +219,9 @@ const Client = owned struct {
 
     fn deinit(sink self: Client, a: Allocator) void {
         var c = self
-        @secureZero(&c.secret)
-        @secureZero(&c.p256_secret)
+        @secureZero(&c.shares)
+        a.free(c.cookie)
+        a.free(c.retry_hello)
         @secureZero(&c.keys)
         @secureZero(&c.read)
         @secureZero(&c.write)
@@ -300,6 +350,10 @@ const Client = owned struct {
             return error.UnexpectedMessage
         }
         if (self.state == .server_hello) {
+            if (kind == CHANGE_CIPHER_SPEC and self.retried and @len(rec) == 1 and rec[0] == 1) {
+                // Sent for middleboxes after a HelloRetryRequest (D.4).
+                return
+            }
             if (kind == ALERT) {
                 // A plaintext alert: the server refused the ClientHello.
                 // After the ServerHello, alerts are encrypted.
@@ -393,6 +447,14 @@ const Client = owned struct {
             .server_hello => {
                 if (kind != 2) {
                     return error.UnexpectedMessage
+                }
+                if (@len(body) >= 34 and is_retry(body)) {
+                    try self.hello_retry(a, msg)
+                    // It must end its record, like a ServerHello.
+                    if (@len(self.hs) != 0) {
+                        return error.UnexpectedMessage
+                    }
+                    return
                 }
                 try self.server_hello(body)
                 self.transcript.update(msg)
@@ -525,6 +587,95 @@ const Client = owned struct {
         }
     }
 
+    // A HelloRetryRequest (RFC 8446, 4.1.4), whole: what it asks for, the
+    // transcript restarted from the first ClientHello's hash, and a second
+    // ClientHello in the outbox.
+    fn hello_retry(inout self: Client, a: Allocator, msg: []u8) !void {
+        if (self.retried) {
+            return error.UnexpectedMessage
+        }
+        const body = msg[4..]
+        if (be16(body, 0) != 0x0303) {
+            return error.ProtocolVersion
+        }
+        if (@len(body) < 35 + 2 + 1 + 2 or body[34] != 0) {
+            return error.IllegalParameter
+        }
+        const suite = record.suite_of(be16(body, 35)) orelse return error.IllegalParameter
+        if (body[37] != 0) {
+            return error.IllegalParameter
+        }
+        try check_extensions(body, 38)
+        var version_ok = false
+        var group = 0
+        var at = 40
+        while (at < @len(body)) {
+            const ext = be16(body, at)
+            const n = be16(body, at + 2)
+            const data = body[at + 4..at + 4 + n]
+            if (ext == 43) {
+                if (n != 2 or be16(data, 0) != 0x0304) {
+                    return error.IllegalParameter
+                }
+                version_ok = true
+            } else if (ext == 51) {
+                // key_share: only the group wanted.
+                if (n != 2) {
+                    return error.DecodeError
+                }
+                group = be16(data, 0)
+            } else if (ext == 44) {
+                // cookie: u16 length, at least one byte, sent back as it is.
+                if (n < 3 or be16(data, 0) != n - 2) {
+                    return error.DecodeError
+                }
+                a.append_str(&self.cookie, data[2..])
+            } else {
+                return error.UnsupportedExtension
+            }
+            at = at + 4 + n
+        }
+        if (!version_ok) {
+            return error.ProtocolVersion
+        }
+        // It must change something: a group offered but not shared, or a
+        // cookie.
+        if (group != 0 and (group_bit(group) == 0 or group_bit(group) & self.offered != 0)) {
+            return error.IllegalParameter
+        }
+        if (group == 0 and @len(self.cookie) == 0) {
+            return error.IllegalParameter
+        }
+        self.retried = true
+        self.retry_suite = suite
+        self.retry_group = group
+        // The transcript: message_hash (254) with the first ClientHello's
+        // hash, then this message (4.4.1).
+        const h = record.suite_hash(suite)
+        const hl = ks.hash_len(h)
+        var first: [48]u8 = @splat(0)
+        self.transcript.digest(h, &first[0..hl])
+        self.transcript = ks.Transcript.init()
+        const header = [4]u8{ 254, 0, 0, @as(u8, hl) }
+        self.transcript.update(header[0..])
+        self.transcript.update(first[0..hl])
+        self.transcript.update(msg)
+        // The second ClientHello: the first, with the share asked for (or
+        // the same shares) and the cookie.
+        const which = if (group != 0) group_bit(group) else self.offered
+        var hello = @take(&self.retry_hello)
+        defer a.free(hello)
+        if (@len(hello) == 0) {
+            try client_hello(a, &hello, self.random, self.host[0..], self.shares, which, self.cookie[0..])
+        }
+        self.offered = which
+        self.transcript.update(hello[0..])
+        a.push(&self.outbox, HANDSHAKE)
+        put16(a, &self.outbox, 0x0303)
+        put16(a, &self.outbox, @len(hello))
+        a.append_str(&self.outbox, hello)
+    }
+
     fn server_hello(inout self: Client, body: []u8) !void {
         // u16 version; random[32]; u8 session id length, id; u16 suite;
         // u8 compression; u16 extensions length, extensions.
@@ -534,15 +685,6 @@ const Client = owned struct {
         if (be16(body, 0) != 0x0303) {
             return error.ProtocolVersion
         }
-        // The random of a ServerHello that is a HelloRetryRequest: SHA-256
-        // of "HelloRetryRequest".
-        const hello_retry = [32]u8{
-            0xCF, 0x21, 0xAD, 0x74, 0xE5, 0x9A, 0x61, 0x11, 0xBE, 0x1D, 0x8C, 0x02, 0x1E, 0x65, 0xB8, 0x91,
-            0xC2, 0xA2, 0x11, 0x16, 0x7A, 0xBB, 0x8C, 0x5E, 0x07, 0x9E, 0x09, 0xE2, 0xC8, 0xA8, 0x33, 0x9C,
-        }
-        if (body[2..34] == hello_retry[0..]) {
-            return error.HelloRetryUnsupported
-        }
         // We send an empty session id; the echo must be empty too.
         if (body[34] != 0) {
             return error.IllegalParameter
@@ -551,13 +693,14 @@ const Client = owned struct {
             return error.DecodeError
         }
         const suite = record.suite_of(be16(body, 35)) orelse return error.IllegalParameter
-        if (body[37] != 0) {
+        // After a HelloRetryRequest, the suite it chose.
+        if (body[37] != 0 or (self.retried and suite != self.retry_suite)) {
             return error.IllegalParameter
         }
         try check_extensions(body, 38)
         var version_ok = false
         var group = 0
-        var peer: [65]u8 = @splat(0)
+        var peer: [97]u8 = @splat(0)
         var at = 40
         while (at < @len(body)) {
             const ext = be16(body, at)
@@ -570,13 +713,17 @@ const Client = owned struct {
                 }
                 version_ok = true
             } else if (ext == 51) {
-                // key_share: u16 group; u16 length; key. X25519's key is
-                // 32 bytes, P-256's an uncompressed point of 65.
+                // key_share: u16 group; u16 length; key, for a group whose
+                // share was offered. X25519's key is 32 bytes, P-256's an
+                // uncompressed point of 65, P-384's of 97.
                 if (n < 4 or be16(data, 2) != n - 4) {
                     return error.DecodeError
                 }
                 group = be16(data, 0)
-                if (!(group == 0x001D and n == 4 + 32) and !(group == 0x0017 and n == 4 + 65)) {
+                if (group_bit(group) & self.offered == 0) {
+                    return error.IllegalParameter
+                }
+                if (!(group == 0x001D and n == 4 + 32) and !(group == 0x0017 and n == 4 + 65) and !(group == 0x0018 and n == 4 + 97)) {
                     return error.IllegalParameter
                 }
                 var i = 0
@@ -596,8 +743,10 @@ const Client = owned struct {
         if (group == 0) {
             return error.MissingExtension
         }
-        var shared: [32]u8 = @splat(0)
+        // The shared secret: 32 bytes, or 48 for P-384.
+        var shared: [48]u8 = @splat(0)
         defer @secureZero(&shared)
+        var sl = 32
         if (group == 0x001D) {
             var x: [32]u8 = @splat(0)
             var i = 0
@@ -605,12 +754,20 @@ const Client = owned struct {
                 x[i] = peer[i]
                 i = i + 1
             }
-            shared = try x25519.shared(self.secret, x)
+            var out = try x25519.shared(self.shares.x25519, x)
+            defer @secureZero(&out)
+            i = 0
+            while (i < 32) {
+                shared[i] = out[i]
+                i = i + 1
+            }
+        } else if (group == 0x0017) {
+            try ec.shared(ec.p256(), self.shares.p256[0..], peer[0..65], &shared[0..32])
         } else {
-            try ec.shared(ec.p256(), self.p256_secret[0..], peer[0..], &shared[0..])
+            try ec.shared(ec.p384(), self.shares.p384[0..], peer[0..97], &shared[0..48])
+            sl = 48
         }
-        @secureZero(&self.secret)
-        @secureZero(&self.p256_secret)
+        @secureZero(&self.shares)
         self.suite = suite
         // The handshake secret goes into master until handshake_keys
         // replaces it with the master secret.
@@ -619,7 +776,7 @@ const Client = owned struct {
         var early: [48]u8 = @splat(0)
         defer @secureZero(&early)
         ks.early_secret(h, &early[0..hl])
-        ks.handshake_secret(h, early[0..hl], shared[0..], &self.keys.master[0..hl])
+        ks.handshake_secret(h, early[0..hl], shared[0..sl], &self.keys.master[0..hl])
     }
 
     // After the ServerHello is in the transcript: the handshake traffic
@@ -744,7 +901,9 @@ const Client = owned struct {
 }
 
 // The ClientHello message, with its handshake header, into out.
-fn client_hello(a: Allocator, inout out: Buf(u8), random: [32]u8, public: [32]u8, p256_public: [65]u8, host: []u8) !void {
+// The shares are those of which (bits of X25519, P256, P384); a cookie,
+// if not empty, is a HelloRetryRequest's, sent back.
+fn client_hello(a: Allocator, inout out: Buf(u8), random: [32]u8, host: []u8, shares: Shares, which: i64, cookie: []u8) !void {
     if (@len(host) > 255) {
         return error.HostTooLong
     }
@@ -772,12 +931,13 @@ fn client_hello(a: Allocator, inout out: Buf(u8), random: [32]u8, public: [32]u8
         put16(a, &out, @len(host))
         a.append_str(&out, host)
     }
-    // supported_groups: X25519, P-256.
+    // supported_groups: X25519, P-256, P-384.
     put16(a, &out, 10)
+    put16(a, &out, 8)
     put16(a, &out, 6)
-    put16(a, &out, 4)
     put16(a, &out, 0x001D)
     put16(a, &out, 0x0017)
+    put16(a, &out, 0x0018)
     // signature_algorithms: what step 5 checks. ECDSA P-256 and P-384,
     // RSA-PSS, and RSA PKCS #1 v1.5 (for certificates). Not Ed25519.
     const schemes = [8]i64{ 0x0403, 0x0503, 0x0804, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601 }
@@ -794,16 +954,46 @@ fn client_hello(a: Allocator, inout out: Buf(u8), random: [32]u8, public: [32]u8
     put16(a, &out, 3)
     a.push(&out, 2)
     put16(a, &out, 0x0304)
-    // key_share: X25519, P-256.
+    if (@len(cookie) > 0) {
+        put16(a, &out, 44)
+        put16(a, &out, @len(cookie) + 2)
+        put16(a, &out, @len(cookie))
+        a.append_str(&out, cookie)
+    }
+    // key_share: those of which, in this order.
+    var shares_len = 0
+    if (which & X25519 != 0) {
+        shares_len = shares_len + 4 + 32
+    }
+    if (which & P256 != 0) {
+        shares_len = shares_len + 4 + 65
+    }
+    if (which & P384 != 0) {
+        shares_len = shares_len + 4 + 97
+    }
     put16(a, &out, 51)
-    put16(a, &out, 2 + 4 + 32 + 4 + 65)
-    put16(a, &out, 4 + 32 + 4 + 65)
-    put16(a, &out, 0x001D)
-    put16(a, &out, 32)
-    a.append_str(&out, public[0..])
-    put16(a, &out, 0x0017)
-    put16(a, &out, 65)
-    a.append_str(&out, p256_public[0..])
+    put16(a, &out, 2 + shares_len)
+    put16(a, &out, shares_len)
+    if (which & X25519 != 0) {
+        put16(a, &out, 0x001D)
+        put16(a, &out, 32)
+        const pk = x25519.public_key(shares.x25519)
+        a.append_str(&out, pk[0..])
+    }
+    if (which & P256 != 0) {
+        var pk: [65]u8 = @splat(0)
+        try ec.public_key(ec.p256(), shares.p256[0..], &pk[0..])
+        put16(a, &out, 0x0017)
+        put16(a, &out, 65)
+        a.append_str(&out, pk[0..])
+    }
+    if (which & P384 != 0) {
+        var pk: [97]u8 = @splat(0)
+        try ec.public_key(ec.p384(), shares.p384[0..], &pk[0..])
+        put16(a, &out, 0x0018)
+        put16(a, &out, 97)
+        a.append_str(&out, pk[0..])
+    }
     const ext_len = @len(out) - ext_at - 2
     out[ext_at] = @as(u8, ext_len >> 8)
     out[ext_at + 1] = @as(u8, ext_len & 0xFF)
@@ -811,6 +1001,53 @@ fn client_hello(a: Allocator, inout out: Buf(u8), random: [32]u8, public: [32]u8
     out[1] = @as(u8, n >> 16)
     out[2] = @as(u8, (n >> 8) & 0xFF)
     out[3] = @as(u8, n & 0xFF)
+}
+
+// Is this ServerHello body a HelloRetryRequest? Its random is SHA-256 of
+// "HelloRetryRequest".
+fn is_retry(body: []u8) bool {
+    const magic = [32]u8{
+        0xCF, 0x21, 0xAD, 0x74, 0xE5, 0x9A, 0x61, 0x11, 0xBE, 0x1D, 0x8C, 0x02, 0x1E, 0x65, 0xB8, 0x91,
+        0xC2, 0xA2, 0x11, 0x16, 0x7A, 0xBB, 0x8C, 0x5E, 0x07, 0x9E, 0x09, 0xE2, 0xC8, 0xA8, 0x33, 0x9C,
+    }
+    return body[2..34] == magic[0..]
+}
+
+// The groups whose shares a ClientHello message carries, as bits; 0 if it
+// does not parse.
+fn shares_in(hello: []u8) i64 {
+    // Header, version, random; session id; suites; compression.
+    var at = 4 + 2 + 32
+    if (@len(hello) < at + 1) {
+        return 0
+    }
+    at = at + 1 + @as(i64, hello[at])
+    if (@len(hello) < at + 2) {
+        return 0
+    }
+    at = at + 2 + be16(hello, at)
+    if (@len(hello) < at + 1) {
+        return 0
+    }
+    at = at + 1 + @as(i64, hello[at])
+    if (@len(hello) < at + 2) {
+        return 0
+    }
+    at = at + 2
+    var bits = 0
+    while (at + 4 <= @len(hello)) {
+        const ext = be16(hello, at)
+        const n = be16(hello, at + 2)
+        if (ext == 51 and at + 6 <= @len(hello)) {
+            var p = at + 6
+            while (p + 4 <= at + 4 + n) {
+                bits = bits | group_bit(be16(hello, p))
+                p = p + 4 + be16(hello, p + 2)
+            }
+        }
+        at = at + 4 + n
+    }
+    return bits
 }
 
 // An IP address, which server_name may not carry: digits and dots, or a

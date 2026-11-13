@@ -172,26 +172,28 @@ handshake's. `tls.client_unverified(a, rng, conn, host)` connects
 **without checking who answers** (anyone on the path can read and change
 everything), for tests against a server of your own.
 
-It offers ChaCha20-Poly1305, AES-128-GCM and AES-256-GCM (in that order)
-and two key shares, X25519 and P-256 (so a server that takes only P-256
-needs no HelloRetryRequest), and answers a request for a client certificate
-with an empty one. It handles NewSessionTicket (by ignoring it: no
-resumption yet) and KeyUpdate, and sends a KeyUpdate of its own every 2^24
-records. Not yet: a HelloRetryRequest (`error.HelloRetryUnsupported`),
-whether it asks for a group other than those two or
-for a cookie to send back; PSK, early data, ALPN, and
-sending an alert when it gives up. A connection that ends without a
+It offers ChaCha20-Poly1305, AES-128-GCM and AES-256-GCM (in that order),
+the groups X25519, P-256 and P-384, and key shares for the first two (so
+a server that takes only P-256 needs no HelloRetryRequest). It answers a
+HelloRetryRequest, for P-384 or with a cookie, with a second ClientHello;
+one that changes nothing, or a second one, fails. It answers a request
+for a client certificate with an empty one, handles NewSessionTicket (by
+ignoring it: no resumption yet) and KeyUpdate, and sends a KeyUpdate of
+its own every 2^24 records. Not yet: PSK, early data, ALPN, and sending
+an alert when it gives up. A connection that ends without a
 close_notify is `error.Truncated`.
 
 `tls/client` is the same client with no socket, fed bytes and leaving
-what it sends in an outbox. `clutch test` replays RFC 8448's handshake
-through it, whole and a byte at a time, and checks every secret and every
-record the client sends against the RFC's, byte for byte.
+what it sends in an outbox. `clutch test` replays RFC 8448's handshakes
+through it (the simple one, and the one with a HelloRetryRequest), whole
+and a byte at a time, and checks every secret and every record the
+client sends against the RFC's, byte for byte.
 `sh test/live.sh` runs it against `openssl s_server` on a test PKI made
 there: once per cipher suite, with P-256, P-384 and RSA certificates (so
 the handshake is signed with ECDSA P-256, ECDSA P-384 and RSA-PSS), the
-P-256 key share, an IP address as the host, a 1 MiB response, and the
-wrong host and an untrusted CA, which it must refuse.
+P-256 key share, HelloRetryRequests (a server that takes only P-384, and
+a stateless one that wants a cookie), an IP address as the host, a 1 MiB
+response, and the wrong host and an untrusted CA, which it must refuse.
 `EGG_TLS_REAL=example.com,github.com clutch test real` connects to real
 sites with the system's roots.
 
