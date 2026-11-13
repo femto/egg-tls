@@ -3,9 +3,11 @@
 # tls.client does, on a test PKI made here: a P-256 root, a P-384
 # intermediate, and leaves for localhost and 127.0.0.1 with P-256, P-384
 # and RSA-2048 keys, so the handshake is signed with each of ECDSA P-256,
-# ECDSA P-384 and RSA-PSS. Once per cipher suite, with the P-256 key
-# share, for a 1 MiB response, and twice where the client must refuse:
-# the wrong host, and a CA it does not trust. Needs OpenSSL 1.1.1 or
+# ECDSA P-384 and RSA-PSS. Once per cipher suite; then with the P-256
+# key share, for a 1 MiB response, and twice where the client must
+# refuse (the wrong host, and a CA it does not trust). And through two
+# HelloRetryRequests, one for P-384 and one with a cookie (s_server
+# -stateless). Needs OpenSSL 1.1.1 or
 # later.
 #
 #     sh test/live.sh                 # clutch from PATH
@@ -94,6 +96,19 @@ stop
 serve leaf256 -www -groups P-256
 printf 'P-256 key share, host 127.0.0.1: '
 run env EGG_TLS_SUITE=TLS_CHACHA20_POLY1305_SHA256 EGG_TLS_HOST=127.0.0.1
+stop
+# HelloRetryRequests: a server that takes only P-384, which the first
+# ClientHello offers without a share; and a stateless one, which asks for
+# a cookie back.
+serve leaf256 -www -groups P-384
+printf 'HelloRetryRequest for P-384: '
+run env EGG_TLS_SUITE=TLS_CHACHA20_POLY1305_SHA256
+stop
+serve leaf256 -www -stateless
+printf 'HelloRetryRequest with a cookie (-stateless): '
+run env EGG_TLS_SUITE=TLS_CHACHA20_POLY1305_SHA256
+stop
+serve leaf256 -www
 printf 'the wrong host: '
 run env EGG_TLS_SUITE=TLS_CHACHA20_POLY1305_SHA256 EGG_TLS_HOST=example.com EGG_TLS_EXPECT=HostMismatch
 printf 'a CA not trusted: '

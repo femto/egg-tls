@@ -21,7 +21,7 @@ fn main(io: Io, a: Allocator) !void {
     try replay(io, a, &t, false)
     try replay(io, a, &t, true)
     try tampered(io, a, &t)
-    try refused(io, a, &t, REC_HRR, error.HelloRetryUnsupported, "HelloRetryRequest")
+    try refused(io, a, &t, REC_HRR, error.DecodeError, "a HelloRetryRequest with a whole key share")
     try refused(io, a, &t, REC_BADSUITE, error.IllegalParameter, "a suite not offered")
     try refused(io, a, &t, REC_NOVERSION, error.ProtocolVersion, "no supported_versions")
     try refused(io, a, &t, "15030300020228", error.AlertReceived, "a plaintext alert")
@@ -85,7 +85,7 @@ fn replay(io: Io, a: Allocator, inout t: support.Tally, bytewise: bool) !void {
     const name = if (bytewise) "a byte at a time" else "whole records"
     const ch = try support.unhex(a, CH)
     defer a.free(ch)
-    var c = client.Client.start_with(a, try support.bytes32(CPRIV), try support.bytes32(P256_SECRET), ch[0..])
+    var c = client.Client.start_with(a, try shares(), ch[0..])
     defer c.deinit(a)
     try sent(io, a, &t, &c, REC_CH, "ClientHello record", name)
     try give(a, &c, REC_SH, bytewise)
@@ -115,7 +115,7 @@ fn replay(io: Io, a: Allocator, inout t: support.Tally, bytewise: bool) !void {
 fn tampered(io: Io, a: Allocator, inout t: support.Tally) !void {
     const ch = try support.unhex(a, CH)
     defer a.free(ch)
-    var c = client.Client.start_with(a, try support.bytes32(CPRIV), try support.bytes32(P256_SECRET), ch[0..])
+    var c = client.Client.start_with(a, try shares(), ch[0..])
     defer c.deinit(a)
     try give(a, &c, REC_SH, false)
     var flight = try support.unhex(a, REC_SFLIGHT)
@@ -132,7 +132,7 @@ fn tampered(io: Io, a: Allocator, inout t: support.Tally) !void {
 fn refused(io: Io, a: Allocator, inout t: support.Tally, rec: str, want: anyerror, name: str) !void {
     const ch = try support.unhex(a, CH)
     defer a.free(ch)
-    var c = client.Client.start_with(a, try support.bytes32(CPRIV), try support.bytes32(P256_SECRET), ch[0..])
+    var c = client.Client.start_with(a, try shares(), ch[0..])
     defer c.deinit(a)
     const bytes = try support.unhex(a, rec)
     defer a.free(bytes)
@@ -151,7 +151,7 @@ fn refused(io: Io, a: Allocator, inout t: support.Tally, rec: str, want: anyerro
 fn after_hello(io: Io, a: Allocator, inout t: support.Tally) !void {
     const ch = try support.unhex(a, CH)
     defer a.free(ch)
-    var c = client.Client.start_with(a, try support.bytes32(CPRIV), try support.bytes32(P256_SECRET), ch[0..])
+    var c = client.Client.start_with(a, try shares(), ch[0..])
     defer c.deinit(a)
     try give(a, &c, REC_SH, false)
     const alert = try support.unhex(a, "15030300020100")
@@ -167,7 +167,7 @@ fn after_hello(io: Io, a: Allocator, inout t: support.Tally) !void {
 fn interleaved(io: Io, a: Allocator, inout t: support.Tally) !void {
     const ch = try support.unhex(a, CH)
     defer a.free(ch)
-    var c = client.Client.start_with(a, try support.bytes32(CPRIV), try support.bytes32(P256_SECRET), ch[0..])
+    var c = client.Client.start_with(a, try shares(), ch[0..])
     defer c.deinit(a)
     try give(a, &c, REC_SH, false)
     try give(a, &c, REC_SFLIGHT, false)
@@ -192,7 +192,7 @@ fn interleaved(io: Io, a: Allocator, inout t: support.Tally) !void {
 fn all_at_once(io: Io, a: Allocator, inout t: support.Tally) !void {
     const ch = try support.unhex(a, CH)
     defer a.free(ch)
-    var c = client.Client.start_with(a, try support.bytes32(CPRIV), try support.bytes32(P256_SECRET), ch[0..])
+    var c = client.Client.start_with(a, try shares(), ch[0..])
     defer c.deinit(a)
     var all: Buf(u8) = .empty
     defer a.free(all)
@@ -213,7 +213,7 @@ fn all_at_once(io: Io, a: Allocator, inout t: support.Tally) !void {
 fn closing(io: Io, a: Allocator, inout t: support.Tally) !void {
     const ch = try support.unhex(a, CH)
     defer a.free(ch)
-    var c = client.Client.start_with(a, try support.bytes32(CPRIV), try support.bytes32(P256_SECRET), ch[0..])
+    var c = client.Client.start_with(a, try shares(), ch[0..])
     defer c.deinit(a)
     try give(a, &c, REC_SH, false)
     try give(a, &c, REC_SFLIGHT, false)
@@ -238,13 +238,13 @@ fn our_hello(io: Io, a: Allocator, inout t: support.Tally) !void {
         random[i] = @as(u8, i)
         i = i + 1
     }
-    var c = try client.Client.start(a, try support.bytes32(CPRIV), try support.bytes32(P256_SECRET), random, "example.com")
+    var c = try client.Client.start(a, try shares(), random, "example.com")
     defer c.deinit(a)
     const out = c.take_outbox()
     defer a.free(out)
     t.check(io, support.same(a, out[0..], REC_OUR_CH), "our ClientHello")
     // An IP address is not sent as server_name.
-    var d = try client.Client.start(a, try support.bytes32(CPRIV), try support.bytes32(P256_SECRET), random, "127.0.0.1")
+    var d = try client.Client.start(a, try shares(), random, "127.0.0.1")
     defer d.deinit(a)
     const out2 = d.take_outbox()
     defer a.free(out2)
@@ -258,7 +258,7 @@ fn key_update(io: Io, a: Allocator, inout t: support.Tally) !void {
     const h = ks.HashKind.sha256
     const ch = try support.unhex(a, CH)
     defer a.free(ch)
-    var c = client.Client.start_with(a, try support.bytes32(CPRIV), try support.bytes32(P256_SECRET), ch[0..])
+    var c = client.Client.start_with(a, try shares(), ch[0..])
     defer c.deinit(a)
     try give(a, &c, REC_SH, false)
     try give(a, &c, REC_SFLIGHT, false)
@@ -324,6 +324,14 @@ fn key_update(io: Io, a: Allocator, inout t: support.Tally) !void {
     t.check(io, @len(got) == 2 and got[0] == 'o' and got[1] == 'k', "data under the next server key")
 }
 
+// The RFC's X25519 secret, RFC 6979's P-256 one, and a P-384 one never
+// used here.
+fn shares() !client.Shares {
+    var p384: [48]u8 = @splat(0)
+    p384[47] = 7
+    return client.Shares{ .x25519 = try support.bytes32(CPRIV), .p256 = try support.bytes32(P256_SECRET), .p384 = p384 }
+}
+
 fn i_copy(inout to: []u8, from: []u8) void {
     var i = 0
     while (i < @len(from)) {
@@ -386,5 +394,5 @@ const REC_SALERT = "1703030013b58fd67166ebf599d24720cfbe7efa7a8864a9"
 const REC_HRR = "160303005a020000560303cf21ad74e59a6111be1d8c021e65b891c2a211167abb8c5e079e09e2c8a8339c00130100002e00330024001d0020c9828876112095fe66762bdbf7c672e156d6cc253b833df1dd69b1b04e751f0f002b00020304"
 const REC_BADSUITE = "160303005a020000560303a6af06a4121860dc5e6e60249cd34c95930c8ac5cb1434dac155772ed3e2692800130400002e00330024001d0020c9828876112095fe66762bdbf7c672e156d6cc253b833df1dd69b1b04e751f0f002b00020304"
 const REC_NOVERSION = "1603030054020000500303a6af06a4121860dc5e6e60249cd34c95930c8ac5cb1434dac155772ed3e2692800130100002800330024001d0020c9828876112095fe66762bdbf7c672e156d6cc253b833df1dd69b1b04e751f0f"
-const REC_OUR_CH = "16030100dd010000d90303000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f000006130313011302010000aa00000010000e00000b6578616d706c652e636f6d000a00060004001d0017000d0012001004030503080408050806040105010601002b00030203040033006b0069001d002099381de560e4bd43d23d8e435a7dbafeb3c06e51c13cae4d5413691e529aaf2c001700410460fed4ba255a9d31c961eb74c6356d68c049b8923b61fa6ce669622e60f29fb67903fe1008b8bc99a41ae9e95628bc64f2f1b20c2d7e9f5177a3c294d4462299"
+const REC_OUR_CH = "16030100df010000db0303000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f000006130313011302010000ac00000010000e00000b6578616d706c652e636f6d000a00080006001d00170018000d0012001004030503080408050806040105010601002b00030203040033006b0069001d002099381de560e4bd43d23d8e435a7dbafeb3c06e51c13cae4d5413691e529aaf2c001700410460fed4ba255a9d31c961eb74c6356d68c049b8923b61fa6ce669622e60f29fb67903fe1008b8bc99a41ae9e95628bc64f2f1b20c2d7e9f5177a3c294d4462299"
 const P256_SECRET = "c9afa9d845ba75166b5c215767b1d6934e50c3db36e89b127b8a622b120f6721"
