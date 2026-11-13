@@ -1,0 +1,28 @@
+// limb: 64-bit limb arithmetic for tls/ec and tls/rsa: add with carry,
+// subtract with borrow, and multiply-accumulate into 128 bits.
+//
+// Carries and borrows come from the top bits of the operands and the
+// result, not from comparisons, so these never branch on a value: tls/ec
+// relies on that for its secrets.
+
+// a + b + c (c is 0 or 1) as [2]u64{ sum, carry out }.
+fn addc(a: u64, b: u64, c: u64) [2]u64 {
+    const s = a +% b +% c
+    // The carry out of the top bit: both top bits set, or one set and
+    // the sum's clear.
+    return [2]u64{ s, ((a & b) | ((a | b) & ~s)) >> 63 }
+}
+
+// a - b - c (c is 0 or 1) as [2]u64{ difference, borrow out }.
+fn subb(a: u64, b: u64, c: u64) [2]u64 {
+    const d = a -% b -% c
+    return [2]u64{ d, ((~a & b) | ((~a | b) & d)) >> 63 }
+}
+
+// x y + c + d, which fits in 128 bits, as [2]u64{ low, high }.
+fn mac(x: u64, y: u64, c: u64, d: u64) [2]u64 {
+    const w = @mulWide(x, y)
+    const s1 = addc(w[0], c, 0)
+    const s2 = addc(s1[0], d, 0)
+    return [2]u64{ s2[0], w[1] + s1[1] + s2[1] }
+}

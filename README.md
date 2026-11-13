@@ -16,9 +16,9 @@ checked against its RFC's test vectors:
    X.509, the system's CA bundle, host names (5c); checked in the
    handshake (5d). Ed25519 later
 
-It needs an eggc from after [egg #112](https://github.com/femto/egg/pull/112)
-(wrapping arithmetic `+%`, `rng.fill` into an array, `@secureZero`), which
-the next release will include.
+It needs an eggc from after [egg #116](https://github.com/femto/egg/pull/116)
+(wrapping arithmetic `+%`, `rng.fill` into an array, `@secureZero`,
+`@mulWide`), which the next release will include.
 
 ## The hashes
 
@@ -221,12 +221,12 @@ fn usable(c: ec.Curve, k: []u8) bool {
 }
 ```
 
-Numbers are 32-bit limbs in Montgomery form (Egg has no 128-bit product
-yet), points projective, added by Renes, Costello and Batina's complete
+Numbers are 64-bit limbs in Montgomery form (`@mulWide` gives each
+128-bit product), points projective, added by Renes, Costello and Batina's complete
 formulas, so that doubling, the point at infinity and every other case
 take one path, and a scalar multiplication doubles and adds for every
 bit. Public keys are checked to be on the curve. A scalar multiplication
-takes about 1.5 ms on P-256 and 4.3 ms on P-384 (`--release`);
+takes about 0.8 ms on P-256 and 2.4 ms on P-384 (`--release`);
 verification makes two. `clutch test` checks ECDH against RFC 5903 and
 OpenSSL, and verification against RFC 6979's signatures (SHA-1 to
 SHA-512) and OpenSSL's, with signatures, keys and encodings that must be
