@@ -20,10 +20,13 @@ fn Hmac(comptime H: type) type {
             // padded with zeros to one block (128 bytes holds every block).
             const bl = H.block_len()
             var k: [128]u8 = @splat(0)
+            defer @secureZero(&k)
             if (@len(key) > bl) {
                 var kh = H.init()
+                defer @secureZero(&kh)
                 kh.update(key)
-                const d = kh.final()
+                var d = kh.final()
+                defer @secureZero(&d)
                 var i = 0
                 while (i < @len(d)) {
                     k[i] = d[i]
@@ -37,7 +40,9 @@ fn Hmac(comptime H: type) type {
                 }
             }
             var ipad: [128]u8 = @splat(0)
+            defer @secureZero(&ipad)
             var opad: [128]u8 = @splat(0)
+            defer @secureZero(&opad)
             var i = 0
             while (i < bl) {
                 ipad[i] = k[i] ^ 0x36
@@ -56,10 +61,13 @@ fn Hmac(comptime H: type) type {
         }
 
         fn final(self: @This(), inout out: []u8) void {
-            const d = self.inner.final()
+            var d = self.inner.final()
+            defer @secureZero(&d)
             var o = self.outer
+            defer @secureZero(&o)
             o.update(d[0..])
-            const tag = o.final()
+            var tag = o.final()
+            defer @secureZero(&tag)
             var i = 0
             while (i < @len(tag)) {
                 out[i] = tag[i]

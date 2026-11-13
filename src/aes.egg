@@ -62,6 +62,7 @@ const Aes = struct {
     // One block.
     fn encrypt(self: Aes, block: [16]u8) [16]u8 {
         var four: [64]u8 = @splat(0)
+        defer @secureZero(&four)
         var i = 0
         while (i < 16) {
             four[i] = block[i]
@@ -83,6 +84,7 @@ const Aes = struct {
 fn schedule(key: []u8, nk: i64, rounds: i64) Aes {
     const rcon = [10]u32{ 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1B, 0x36 }
     var w: [60]u32 = @splat(0)
+    defer @secureZero(&w)
     var i = 0
     while (i < nk) {
         w[i] = @as(u32, le32(key, 4 * i))
@@ -90,6 +92,7 @@ fn schedule(key: []u8, nk: i64, rounds: i64) Aes {
     }
     const total = (rounds + 1) * 4
     var tmp = w[nk - 1]
+    defer @secureZero(&tmp)
     var j = 0
     var k = 0
     while (i < total) {
@@ -113,6 +116,7 @@ fn schedule(key: []u8, nk: i64, rounds: i64) Aes {
     while (r <= rounds) {
         const p = interleave_in(@as(u64, w[4 * r]), @as(u64, w[4 * r + 1]), @as(u64, w[4 * r + 2]), @as(u64, w[4 * r + 3]))
         var q: [8]u64 = @splat(0)
+        defer @secureZero(&q)
         q[0] = p[0]
         q[1] = p[0]
         q[2] = p[0]
@@ -135,6 +139,7 @@ fn schedule(key: []u8, nk: i64, rounds: i64) Aes {
 // The S-box on each byte of x, through the bitsliced circuit.
 fn sub_word(x: u32) u32 {
     var q: [8]u64 = @splat(0)
+    defer @secureZero(&q)
     q[0] = @as(u64, x)
     ortho(&q)
     sbox(&q)

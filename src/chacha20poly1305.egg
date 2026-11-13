@@ -19,11 +19,13 @@ const poly1305 = @import("poly1305.egg")
 fn seal(key: [32]u8, nonce: [12]u8, aad: []u8, inout buf: []u8) void {
     const n = @len(buf) - 16
     var m = start(key, nonce, aad)
+    defer @secureZero(&m)
     var counter: u32 = 1
     var at = 0
     while (at < n) {
         const end = if (n - at > 64) at + 64 else n
-        const ks = chacha20.block(key, counter, nonce)
+        var ks = chacha20.block(key, counter, nonce)
+        defer @secureZero(&ks)
         var i = at
         while (i < end) {
             buf[i] = buf[i] ^ ks[i - at]
@@ -49,12 +51,14 @@ fn open(key: [32]u8, nonce: [12]u8, aad: []u8, inout buf: []u8) !void {
     }
     const n = @len(buf) - 16
     var m = start(key, nonce, aad)
+    defer @secureZero(&m)
     var counter: u32 = 1
     var at = 0
     while (at < n) {
         const end = if (n - at > 64) at + 64 else n
         m.update(buf[at..end])
-        const ks = chacha20.block(key, counter, nonce)
+        var ks = chacha20.block(key, counter, nonce)
+        defer @secureZero(&ks)
         var i = at
         while (i < end) {
             buf[i] = buf[i] ^ ks[i - at]
@@ -65,7 +69,8 @@ fn open(key: [32]u8, nonce: [12]u8, aad: []u8, inout buf: []u8) !void {
             counter = counter + 1
         }
     }
-    const tag = finish(m, @len(aad), n)
+    var tag = finish(m, @len(aad), n)
+    defer @secureZero(&tag)
     // Every byte compared, the differences gathered: no early exit.
     var diff: u8 = 0
     var i = 0
@@ -86,8 +91,10 @@ fn open(key: [32]u8, nonce: [12]u8, aad: []u8, inout buf: []u8) !void {
 // Poly1305 keyed by the first 32 bytes of block 0, over the additional
 // data and its padding.
 fn start(key: [32]u8, nonce: [12]u8, aad: []u8) poly1305.Poly1305 {
-    const b0 = chacha20.block(key, 0, nonce)
+    var b0 = chacha20.block(key, 0, nonce)
+    defer @secureZero(&b0)
     var otk: [32]u8 = @splat(0)
+    defer @secureZero(&otk)
     var i = 0
     while (i < 32) {
         otk[i] = b0[i]
@@ -103,6 +110,7 @@ fn start(key: [32]u8, nonce: [12]u8, aad: []u8) poly1305.Poly1305 {
 // little-endian numbers.
 fn finish(m: poly1305.Poly1305, aad_len: i64, ct_len: i64) [16]u8 {
     var p = m
+    defer @secureZero(&p)
     p.pad16()
     var lens: [16]u8 = @splat(0)
     var i = 0

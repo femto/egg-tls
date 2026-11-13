@@ -35,13 +35,23 @@ fn shared(secret: [32]u8, peer: [32]u8) ![32]u8 {
 // The X25519 function: the scalar k (clamped) times the point u.
 fn scalarmult(k: [32]u8, u: [32]u8) [32]u8 {
     var z = k
+    defer @secureZero(&z)
     z[31] = (z[31] & 127) | 64
     z[0] = z[0] & 248
     const x = unpack(u)
+    // The ladder's state depends on the secret: zeroed when it ends.
     var a: Gf = @splat(0)
+    defer @secureZero(&a)
     var b = x
+    defer @secureZero(&b)
     var c: Gf = @splat(0)
+    defer @secureZero(&c)
     var d: Gf = @splat(0)
+    defer @secureZero(&d)
+    var e: Gf = @splat(0)
+    defer @secureZero(&e)
+    var f: Gf = @splat(0)
+    defer @secureZero(&f)
     a[0] = 1
     d[0] = 1
     var small: Gf = @splat(0)
@@ -52,12 +62,12 @@ fn scalarmult(k: [32]u8, u: [32]u8) [32]u8 {
         const r = @as(i64, (z[i >> 3] >> (i & 7)) & 1)
         swap_if(&a, &b, r)
         swap_if(&c, &d, r)
-        var e = add(a, c)
+        e = add(a, c)
         a = sub(a, c)
         c = add(b, d)
         b = sub(b, d)
         d = square(e)
-        const f = square(a)
+        f = square(a)
         a = mul(c, a)
         c = mul(b, e)
         e = add(a, c)
@@ -74,7 +84,11 @@ fn scalarmult(k: [32]u8, u: [32]u8) [32]u8 {
         swap_if(&c, &d, r)
         i = i - 1
     }
-    return pack(mul(a, invert(c)))
+    var inv = invert(c)
+    defer @secureZero(&inv)
+    var xz = mul(a, inv)
+    defer @secureZero(&xz)
+    return pack(xz)
 }
 
 // The 32 little-endian bytes as an element; the top bit is ignored.
@@ -92,10 +106,12 @@ fn unpack(n: [32]u8) Gf {
 // The element reduced mod 2^255 - 19, as 32 little-endian bytes.
 fn pack(n: Gf) [32]u8 {
     var t = carry(carry(carry(n)))
+    defer @secureZero(&t)
+    var m: Gf = @splat(0)
+    defer @secureZero(&m)
     var j = 0
     while (j < 2) {
         // m = t - p; keep t if that borrowed (t < p), else m.
-        var m: Gf = @splat(0)
         m[0] = t[0] - 0xFFED
         var i = 1
         while (i < 15) {
@@ -201,6 +217,7 @@ fn square(a: Gf) Gf {
 // a^(p - 2) = 1 / a: the exponent's bits are fixed, not secret.
 fn invert(a: Gf) Gf {
     var c = a
+    defer @secureZero(&c)
     var i = 253
     while (i >= 0) {
         c = square(c)
