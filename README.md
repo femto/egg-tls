@@ -15,9 +15,14 @@ RFC's test vectors:
 5. certificates: ECDSA on P-256 and P-384, RSA, DER, X.509, the system's
    CA bundle, host names, checked in the handshake (done). Ed25519 later
 
-It needs an eggc from after [egg #116](https://github.com/femto/egg/pull/116)
-(wrapping arithmetic `+%`, `rng.fill` into an array, `@secureZero`,
-`@mulWide`), which the next release will include.
+It needs [Egg](https://github.com/femto/egg) 0.2.0 or later (for
+wrapping arithmetic `+%`, `rng.fill` into an array, `@secureZero` and
+`@mulWide`). In a project's `clutch.toml`:
+
+```toml
+[dependencies]
+tls = "0.1"
+```
 
 ## The hashes
 
