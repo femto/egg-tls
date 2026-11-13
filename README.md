@@ -184,8 +184,13 @@ HelloRetryRequest, for P-384 or with a cookie, with a second ClientHello;
 one that changes nothing, or a second one, fails. It answers a request
 for a client certificate with an empty one, handles NewSessionTicket (by
 ignoring it: no resumption yet) and KeyUpdate, and sends a KeyUpdate of
-its own every 2^24 records. Not yet: PSK, early data, ALPN, and sending
-an alert when it gives up. A connection that ends without a
+its own every 2^24 records. When it gives up, it tells the server why
+with a fatal alert (RFC 8446, 6.2), in plaintext before the ServerHello
+and encrypted after: `unknown_ca`, `certificate_expired` or
+`bad_certificate` for a chain it refuses, `decrypt_error` for a
+signature or Finished that does not verify, `bad_record_mac`,
+`decode_error`, `illegal_parameter` and so on; never in answer to the
+server's own alert. Not yet: PSK, early data, ALPN. A connection that ends without a
 close_notify is `error.Truncated`.
 
 `tls/client` is the same client with no socket, fed bytes and leaving
@@ -198,7 +203,8 @@ there: once per cipher suite, with P-256, P-384 and RSA certificates (so
 the handshake is signed with ECDSA P-256, ECDSA P-384 and RSA-PSS), the
 P-256 key share, HelloRetryRequests (a server that takes only P-384, and
 a stateless one that wants a cookie), an IP address as the host, a 1 MiB
-response, and the wrong host and an untrusted CA, which it must refuse.
+response, and the wrong host and an untrusted CA, which it must refuse, sending
+`bad_certificate` and `unknown_ca` (the server's log must show them).
 `EGG_TLS_REAL=example.com,github.com clutch test real` connects to real
 sites with the system's roots.
 

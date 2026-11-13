@@ -129,6 +129,12 @@ const Client = owned struct {
     sent_close: bool
     cert_context: Buf(u8)
     alert_desc: i64
+    // The alert we sent, or -1; a more precise one than the error says,
+    // set where the error is known (a certificate's, a signature's).
+    sent_alert: i64
+    alert_hint: i64
+    // There are handshake (then application) keys to send with.
+    keys_set: bool
     // Bytes received that do not yet make a whole record.
     inbox: Buf(u8)
     // Handshake bytes that do not yet make a whole message.
@@ -185,6 +191,9 @@ const Client = owned struct {
             .sent_close = false,
             .cert_context = .empty,
             .alert_desc = -1,
+            .sent_alert = -1,
+            .alert_hint = -1,
+            .keys_set = false,
             .inbox = .empty,
             .hs = .empty,
             .outbox = .empty,
@@ -290,8 +299,42 @@ const Client = owned struct {
     }
 
     // Takes in bytes received, which may hold any part of any number of
-    // records: whole records are handled, the rest kept for later.
+    // records: whole records are handled, the rest kept for later. On a
+    // failure, a fatal alert saying why is in the outbox (unless the
+    // server's own alert was the failure), and the client is closed.
     fn feed(inout self: Client, a: Allocator, data: []u8) !void {
+        self.take_in(a, data) catch |e| {
+            self.fail(a, e)
+            return e
+        }
+    }
+
+    // The alert sent for the failure that closed the client, or -1.
+    fn alert_sent(self: Client) i64 {
+        return self.sent_alert
+    }
+
+    // A fatal alert for e (RFC 8446, 6.2) into the outbox: in plaintext
+    // before there are keys, encrypted after. Nothing is sent after it.
+    fn fail(inout self: Client, a: Allocator, e: anyerror) void {
+        if (e == error.AlertReceived or self.sent_close or self.sent_alert >= 0) {
+            self.state = .closed
+            return
+        }
+        const desc = if (self.alert_hint >= 0) self.alert_hint else alert_for(e)
+        const body = [2]u8{ 2, @as(u8, desc) }
+        if (self.keys_set) {
+            self.seal_record(a, ALERT, body[0..])
+        } else {
+            const rec = [7]u8{ ALERT, 3, 3, 0, 2, 2, @as(u8, desc) }
+            a.append_str(&self.outbox, rec[0..])
+        }
+        self.sent_alert = desc
+        self.sent_close = true
+        self.state = .closed
+    }
+
+    fn take_in(inout self: Client, a: Allocator, data: []u8) !void {
         a.append_str(&self.inbox, data)
         var at = 0
         var rec: Buf(u8) = .empty
@@ -484,7 +527,10 @@ const Client = owned struct {
                     try check_certificate(body)
                     if (self.verify) {
                         try self.certificates(a, body)
-                        try x509.verify(self.chain, self.roots, self.host[0..], self.now)
+                        x509.verify(self.chain, self.roots, self.host[0..], self.now) catch |e| {
+                            self.alert_hint = certificate_alert(e)
+                            return e
+                        }
                     }
                     self.transcript.update(msg)
                     self.state = .certificate_verify
@@ -501,7 +547,19 @@ const Client = owned struct {
                     return error.DecodeError
                 }
                 if (self.verify) {
-                    try self.certificate_verify(be16(body, 0), body[4..])
+                    self.certificate_verify(be16(body, 0), body[4..]) catch |e| {
+                        // The signature does not verify: decrypt_error. A
+                        // scheme that does not fit: illegal_parameter. A
+                        // key that will not do: bad_certificate.
+                        if (e == error.BadSignature or e == error.BadPoint) {
+                            self.alert_hint = 51
+                        } else if (e == error.IllegalParameter) {
+                            self.alert_hint = 47
+                        } else {
+                            self.alert_hint = 42
+                        }
+                        return e
+                    }
                 }
                 self.transcript.update(msg)
                 self.state = .finished
@@ -797,6 +855,7 @@ const Client = owned struct {
         ks.master_secret(h, hs_secret[0..hl], &self.keys.master[0..hl])
         self.read = record.Protection.init(self.suite, self.keys.server_hs[0..hl])
         self.write = record.Protection.init(self.suite, self.keys.client_hs[0..hl])
+        self.keys_set = true
     }
 
     fn certificate_request(inout self: Client, a: Allocator, body: []u8) !void {
@@ -1005,6 +1064,60 @@ fn client_hello(a: Allocator, inout out: Buf(u8), random: [32]u8, host: []u8, sh
     out[1] = @as(u8, n >> 16)
     out[2] = @as(u8, (n >> 8) & 0xFF)
     out[3] = @as(u8, n & 0xFF)
+}
+
+// The alert for a failure (RFC 8446, 6.2): which description says why.
+fn alert_for(e: anyerror) i64 {
+    switch (e) {
+        error.UnexpectedMessage, error.NotConnected => {
+            return 10
+        }
+        error.AuthFailed => {
+            return 20
+        }
+        error.RecordOverflow => {
+            return 22
+        }
+        error.IllegalParameter, error.WeakKey, error.BadPoint => {
+            return 47
+        }
+        error.DecodeError, error.CertificateRequired => {
+            return 50
+        }
+        error.BadFinished => {
+            return 51
+        }
+        error.ProtocolVersion => {
+            return 70
+        }
+        error.MissingExtension => {
+            return 109
+        }
+        error.UnsupportedExtension => {
+            return 110
+        }
+        else => {
+            return 80
+        }
+    }
+}
+
+// The alert for a chain tls/x509 refused.
+fn certificate_alert(e: anyerror) i64 {
+    switch (e) {
+        error.UnknownIssuer => {
+            return 48
+        }
+        error.Expired, error.NotYetValid => {
+            return 45
+        }
+        error.UnsupportedAlgorithm => {
+            return 43
+        }
+        else => {
+            return 42
+        }
+    }
 }
 
 // Is this ServerHello body a HelloRetryRequest? Its random is SHA-256 of
