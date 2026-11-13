@@ -23,6 +23,7 @@
 
 const sha256 = @import("sha256.egg")
 const sha512 = @import("sha512.egg")
+const limb = @import("limb.egg")
 
 // 8192 bits.
 const Big = [128]u64
@@ -333,7 +334,7 @@ fn add(k: PublicKey, a: Big, b: Big) Big {
     var carry: u64 = 0
     var i = 0
     while (i < k.limbs) {
-        const t = addc(a[i], b[i], carry)
+        const t = limb.addc(a[i], b[i], carry)
         s[i] = t[0]
         carry = t[1]
         i = i + 1
@@ -347,7 +348,7 @@ fn reduce_once(k: PublicKey, s: Big, carry: u64) Big {
     var borrow: u64 = 0
     var i = 0
     while (i < k.limbs) {
-        const t = subb(s[i], k.n[i], borrow)
+        const t = limb.subb(s[i], k.n[i], borrow)
         d[i] = t[0]
         borrow = t[1]
         i = i + 1
@@ -367,25 +368,25 @@ fn mul(k: PublicKey, a: Big, b: Big) Big {
         var carry: u64 = 0
         var j = 0
         while (j < n) {
-            const w = mac(a[j], b[i], t[j], carry)
+            const w = limb.mac(a[j], b[i], t[j], carry)
             t[j] = w[0]
             carry = w[1]
             j = j + 1
         }
-        var s = addc(t[n], carry, 0)
+        var s = limb.addc(t[n], carry, 0)
         t[n] = s[0]
         t[n + 1] = s[1]
         const u = t[0] *% k.n0inv
-        var w = mac(u, k.n[0], t[0], 0)
+        var w = limb.mac(u, k.n[0], t[0], 0)
         carry = w[1]
         j = 1
         while (j < n) {
-            w = mac(u, k.n[j], t[j], carry)
+            w = limb.mac(u, k.n[j], t[j], carry)
             t[j - 1] = w[0]
             carry = w[1]
             j = j + 1
         }
-        s = addc(t[n], carry, 0)
+        s = limb.addc(t[n], carry, 0)
         t[n - 1] = s[0]
         t[n] = t[n + 1] + s[1]
         i = i + 1
@@ -397,26 +398,6 @@ fn mul(k: PublicKey, a: Big, b: Big) Big {
         i = i + 1
     }
     return reduce_once(k, r, t[n])
-}
-
-// a + b + c (c is 0 or 1) as [2]u64{ sum, carry out }.
-fn addc(a: u64, b: u64, c: u64) [2]u64 {
-    const s = a +% b +% c
-    return [2]u64{ s, ((a & b) | ((a | b) & ~s)) >> 63 }
-}
-
-// a - b - c (c is 0 or 1) as [2]u64{ difference, borrow out }.
-fn subb(a: u64, b: u64, c: u64) [2]u64 {
-    const d = a -% b -% c
-    return [2]u64{ d, ((~a & b) | ((~a | b) & d)) >> 63 }
-}
-
-// x y + c + d, which fits in 128 bits, as [2]u64{ low, high }.
-fn mac(x: u64, y: u64, c: u64, d: u64) [2]u64 {
-    const w = @mulWide(x, y)
-    const s1 = addc(w[0], c, 0)
-    const s2 = addc(s1[0], d, 0)
-    return [2]u64{ s2[0], w[1] + s1[1] + s2[1] }
 }
 
 fn below(k: PublicKey, a: Big) bool {
