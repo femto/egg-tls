@@ -91,22 +91,10 @@ const Protection = struct {
         return p
     }
 
-    // The next record's nonce: the iv, its last 8 bytes xor the sequence
-    // number, big-endian.
-    fn nonce(self: Protection) [12]u8 {
-        var n = self.iv
-        var i = 0
-        while (i < 8) {
-            n[11 - i] = n[11 - i] ^ @as(u8, (self.seq >> @as(u64, 8 * i)) & 0xFF)
-            i = i + 1
-        }
-        return n
-    }
-
     // Encrypts the next record in place: buf holds the inner plaintext and
     // then 16 bytes for the tag; aad is the record header.
     fn seal(inout self: Protection, aad: []u8, inout buf: []u8) void {
-        const n = self.nonce()
+        const n = nonce(self.iv, self.seq)
         if (self.suite == .chacha20_poly1305_sha256) {
             cp.seal(self.chacha, n, aad, &buf[0..])
         } else {
@@ -117,7 +105,7 @@ const Protection = struct {
 
     // Decrypts the next record in place, or error.AuthFailed.
     fn open(inout self: Protection, aad: []u8, inout buf: []u8) !void {
-        const n = self.nonce()
+        const n = nonce(self.iv, self.seq)
         if (self.suite == .chacha20_poly1305_sha256) {
             try cp.open(self.chacha, n, aad, &buf[0..])
         } else {
@@ -125,4 +113,17 @@ const Protection = struct {
         }
         self.seq = self.seq + 1
     }
+}
+
+// A record's nonce: the iv, its last 8 bytes xor the sequence number,
+// big-endian. Not a method: a Protection passed by value would copy its
+// keys.
+fn nonce(iv: [12]u8, seq: u64) [12]u8 {
+    var n = iv
+    var i = 0
+    while (i < 8) {
+        n[11 - i] = n[11 - i] ^ @as(u8, (seq >> @as(u64, 8 * i)) & 0xFF)
+        i = i + 1
+    }
+    return n
 }

@@ -168,9 +168,10 @@ fn main(io: Io, a: Allocator, net: Net, rng: Random) !void {
 It offers ChaCha20-Poly1305, AES-128-GCM and AES-256-GCM (in that order)
 and an X25519 key share, and answers a request for a client certificate
 with an empty one. It handles NewSessionTicket (by ignoring it: no
-resumption yet) and KeyUpdate. Not yet: a HelloRetryRequest
-(`error.HelloRetryUnsupported`; the only one it could get asks for a group
-other than X25519, which comes with P-256), PSK, early data, ALPN, and
+resumption yet) and KeyUpdate, and sends a KeyUpdate of its own every 2^24
+records. Not yet: a HelloRetryRequest (`error.HelloRetryUnsupported`),
+whether it asks for a group other than X25519 (P-256 comes in step 5) or
+for a cookie to send back; PSK, early data, ALPN, and
 sending an alert when it gives up. A connection that ends without a
 close_notify is `error.Truncated`.
 

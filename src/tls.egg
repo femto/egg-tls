@@ -126,6 +126,10 @@ fn client_unverified(a: Allocator, rng: Random, sink conn: TcpConn, host: []u8) 
         return e
     }
     while (!t.c.connected()) {
+        if (t.c.closed()) {
+            t.close(a)
+            return error.HandshakeFailed
+        }
         t.pull(a, &chunk) catch |e| {
             t.close(a)
             return e

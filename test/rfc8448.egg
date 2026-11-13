@@ -25,6 +25,9 @@ fn main(io: Io, a: Allocator) !void {
     try refused(io, a, &t, REC_NOVERSION, error.ProtocolVersion, "no supported_versions")
     try refused(io, a, &t, "15030300020228", error.AlertReceived, "a plaintext alert")
     try our_hello(io, a, &t)
+    try after_hello(io, a, &t)
+    try interleaved(io, a, &t)
+    try closing(io, a, &t)
     try key_update(io, a, &t)
     try t.done(io)
 }
@@ -141,6 +144,68 @@ fn refused(io: Io, a: Allocator, inout t: support.Tally, rec: str, want: anyerro
     }
 }
 
+// After the ServerHello, alerts must be encrypted: a plaintext one is
+// refused unread.
+fn after_hello(io: Io, a: Allocator, inout t: support.Tally) !void {
+    const ch = try support.unhex(a, CH)
+    defer a.free(ch)
+    var c = client.Client.start_with(a, try support.bytes32(CPRIV), ch[0..])
+    defer c.deinit(a)
+    try give(a, &c, REC_SH, false)
+    const alert = try support.unhex(a, "15030300020100")
+    defer a.free(alert)
+    var got: anyerror = error.None
+    c.feed(a, alert[0..]) catch |e| {
+        got = e
+    }
+    t.check(io, got == error.UnexpectedMessage and c.alert() == -1, "a plaintext alert after the ServerHello")
+}
+
+// Application data between the parts of a handshake message: refused.
+fn interleaved(io: Io, a: Allocator, inout t: support.Tally) !void {
+    const ch = try support.unhex(a, CH)
+    defer a.free(ch)
+    var c = client.Client.start_with(a, try support.bytes32(CPRIV), ch[0..])
+    defer c.deinit(a)
+    try give(a, &c, REC_SH, false)
+    try give(a, &c, REC_SFLIGHT, false)
+    const sap = try support.bytes32(SAP)
+    var server = record.Protection.init(.aes_128_gcm_sha256, sap[0..])
+    // The first 2 bytes of a NewSessionTicket, then application data.
+    var part = [24]u8{ 23, 3, 3, 0, 19, 4, 0, 22, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }
+    const hdr = [5]u8{ 23, 3, 3, 0, 19 }
+    server.seal(hdr[0..], &part[5..])
+    try c.feed(a, part[0..])
+    var data = [24]u8{ 23, 3, 3, 0, 19, 'h', 'i', 23, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }
+    server.seal(hdr[0..], &data[5..])
+    var got: anyerror = error.None
+    c.feed(a, data[0..]) catch |e| {
+        got = e
+    }
+    t.check(io, got == error.UnexpectedMessage and !c.has_plain(), "application data inside a handshake message")
+}
+
+// After close_notify the client sends nothing more.
+fn closing(io: Io, a: Allocator, inout t: support.Tally) !void {
+    const ch = try support.unhex(a, CH)
+    defer a.free(ch)
+    var c = client.Client.start_with(a, try support.bytes32(CPRIV), ch[0..])
+    defer c.deinit(a)
+    try give(a, &c, REC_SH, false)
+    try give(a, &c, REC_SFLIGHT, false)
+    a.free(c.take_outbox())
+    c.close_notify(a)
+    a.free(c.take_outbox())
+    c.close_notify(a)
+    const again = c.take_outbox()
+    defer a.free(again)
+    var got: anyerror = error.None
+    c.send(a, "late") catch |e| {
+        got = e
+    }
+    t.check(io, @len(again) == 0 and got == error.Closed, "nothing sent after close_notify")
+}
+
 // Client.start's ClientHello, against one built by hand from RFC 8446.
 fn our_hello(io: Io, a: Allocator, inout t: support.Tally) !void {
     var random: [32]u8 = @splat(0)
@@ -196,8 +261,11 @@ fn key_update(io: Io, a: Allocator, inout t: support.Tally) !void {
     defer a.free(out)
     t.check(io, @len(out) == 5 + 6 + 16, "a KeyUpdate in answer")
     const ohdr = [5]u8{ out[0], out[1], out[2], out[3], out[4] }
-    mine.open(ohdr[0..], &out[5..]) catch {}
-    t.check(io, out[5] == 24 and out[8] == 1 and out[9] == 0 and out[10] == 22, "KeyUpdate(update_not_requested)")
+    var opened1 = true
+    mine.open(ohdr[0..], &out[5..]) catch {
+        opened1 = false
+    }
+    t.check(io, opened1 and out[5] == 24 and out[8] == 1 and out[9] == 0 and out[10] == 22, "KeyUpdate(update_not_requested)")
     // Data after it, under the client's next key.
     var next: [32]u8 = @splat(0)
     ks.expand_label(h, cap[0..], "traffic upd", "", &next[0..])
