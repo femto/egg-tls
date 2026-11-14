@@ -1,0 +1,36 @@
+// sysroots: the system's roots, everywhere but Windows: the first PEM
+// bundle found at the usual paths. roots.system says which.
+uses alloc, fs
+
+const x509 = @import("x509.egg")
+const roots = @import("roots.egg")
+
+fn system(a: Allocator, files: Fs) !x509.CertList {
+    const paths = [5]str{
+        "/etc/ssl/cert.pem",
+        "/etc/ssl/certs/ca-certificates.crt",
+        "/etc/pki/tls/certs/ca-bundle.crt",
+        "/etc/ssl/ca-bundle.pem",
+        "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",
+    }
+    for (paths) |path| {
+        // A missing file is the next path's turn; anything else (no
+        // permission, a read that fails) is an answer, not a fallback.
+        const text = files.read(a, path) catch |e| {
+            if (e == error.NotFound) {
+                continue
+            }
+            return e
+        }
+        defer a.free(text)
+        var list = x509.CertList.empty()
+        errdefer a.free(list)
+        _ = try roots.add_pem(a, &list, text)
+        if (list.len() > 0) {
+            return list
+        }
+        a.free(list)
+    }
+    return error.NoRoots
+}
+

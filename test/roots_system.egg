@@ -1,13 +1,15 @@
-// The system's root bundle, if there is one: it reads and parses.
-uses io, alloc, fs
+// The system's root bundle (or Windows's ROOT store), if there is one:
+// it reads and parses. With EGG_TLS_ROOTS_REQUIRED set (CI does), there
+// must be one.
+uses io, alloc, args, fs
 
 const roots = @import("tls/roots")
 
-fn main(io: Io, a: Allocator, files: Fs) !void {
+fn main(io: Io, a: Allocator, args: Args, files: Fs) !void {
     // Only a system without a bundle is skipped; a bundle that does not
     // read or parse fails the test.
     const list = roots.system(a, files) catch |e| {
-        if (e == error.NoRoots) {
+        if (e == error.NoRoots and args.env("EGG_TLS_ROOTS_REQUIRED") == null) {
             io.print("no system roots")
             return
         }

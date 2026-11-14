@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  # The oldest Egg this package supports (README): per-platform files
+  # came in 0.2.1.
+  EGG_REPO: femto/egg
+  EGG_REF: 5d032fb4b9ae32900f499cfc3d364b9558b5df59 # v0.2.1
+
+jobs:
+  test:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    env:
+      CC: ${{ matrix.os == 'windows-latest' && 'gcc' || 'cc' }}
+      EGG_TLS_ROOTS_REQUIRED: "1"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - run: git config --global core.autocrlf false
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          repository: ${{ env.EGG_REPO }}
+          ref: ${{ env.EGG_REF }}
+          path: .egg
+          persist-credentials: false
+      # Egg's eggc and clutch run on Ruby; on Windows, setup-ruby's MSYS2
+      # gcc compiles the C.
+      - uses: ruby/setup-ruby@7f797815d8adceb1c412e7abefdd1ab4abc47a5f # v1
+        with:
+          ruby-version: "3.3"
+      - name: clutch test
+        run: ruby .egg/bin/clutch test
+      # The system's roots against a real site: on Windows, the ROOT store.
+      # A server sometimes closes mid-handshake (see TODO): three tries.
+      - name: A real site with the system's roots
+        run: |
+          for i in 1 2 3; do
+            EGG_TLS_REAL=github.com ./build/test/real && exit 0
+            sleep 2
+          done
+          exit 1
+      - name: Against openssl s_server
+        if: matrix.os == 'ubuntu-latest'
+        run: CLUTCH="$PWD/.egg/bin/clutch" sh test/live.sh
