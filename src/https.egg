@@ -12,7 +12,8 @@
 // An http:// URL goes through std/http's own fetch_once, without TLS.
 // Redirects are followed as std/http's fetch follows them, across
 // schemes too, except from https:// to http://, which would send the
-// next request in the clear: that 3xx is returned as it is. A redirect to
+// next request in the clear, and to any other scheme (ftp:, ...): that
+// 3xx is returned as it is. A redirect to
 // another scheme, host or port goes without the caller's headers.
 //
 // A response whose body ends where the connection does (no
@@ -56,15 +57,38 @@ fn locate(a: Allocator, url: []u8, inout form: Buf(u8)) !Where {
     return Where{ .secure = secure, .u = u }
 }
 
+// Does reference start with a scheme (RFC 3986, 3.1: a letter, then
+// letters, digits, + - and ., then :)? A relative one cannot: a colon in
+// its first segment needs "./" before it (4.2).
+fn has_scheme(reference: []u8) bool {
+    var i = 0
+    while (i < @len(reference)) {
+        const c = reference[i]
+        if (c == ':') {
+            return i > 0
+        }
+        const letter = (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z')
+        if (!letter and (i == 0 or !((c >= '0' and c <= '9') or c == '+' or c == '-' or c == '.'))) {
+            return false
+        }
+        i = i + 1
+    }
+    return false
+}
+
 fn is_https(url: []u8) bool {
     return @len(url) >= 8 and http.same(url[0..8], "https://")
 }
 
 // Where a redirect from base (http:// or https://) to location goes, as
-// an absolute URL, or null if it cannot be told.
+// an absolute URL, or null if it cannot be told or is not http:// or
+// https:// (ftp:, mailto:, ...).
 fn resolve(a: Allocator, base: []u8, location: []u8) ?Buf(u8) {
     if (is_https(location) or (@len(location) >= 7 and http.same(location[0..7], "http://"))) {
         return a.concat(location, "")
+    }
+    if (has_scheme(location)) {
+        return null
     }
     if (text.starts_with(location, "//")) {
         return a.concat(if (is_https(base)) "https:" else "http:", location)
