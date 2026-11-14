@@ -1,0 +1,98 @@
+// tls/https against servers of test/live.sh's own: it runs this with
+// EGG_TLS_URL to fetch and EGG_TLS_CA, the PEM of its test CA, the only
+// root. Without them it does nothing, so plain `clutch test` needs no
+// network.
+//
+// EGG_TLS_METHOD (GET), EGG_TLS_BODY, EGG_TLS_REDIRECTS (0) and
+// EGG_TLS_HEADER (one header line, without \r\n) shape the request. Then
+// the response must have status EGG_TLS_WANT_STATUS, a body with
+// SHA-256 EGG_TLS_SHA256, holding EGG_TLS_HAS and not EGG_TLS_LACKS, as
+// far as each is set; or with EGG_TLS_EXPECT, fetch must fail with that
+// error.
+uses io, alloc, args, net, rand, fs, time
+
+const https = @import("tls/https")
+const roots = @import("tls/roots")
+const x509 = @import("tls/x509")
+const sha256 = @import("tls/sha256")
+const http = @import("std/http")
+const text = @import("std/text")
+
+fn main(io: Io, a: Allocator, args: Args, net: Net, rng: Random, files: Fs, clock: Clock) !void {
+    const url = args.env("EGG_TLS_URL") orelse return
+    const ca_path = args.env("EGG_TLS_CA") orelse return
+    var trusted = x509.CertList.empty()
+    defer a.free(trusted)
+    const pem = try files.read(a, ca_path)
+    defer a.free(pem)
+    _ = try roots.add_pem(a, &trusted, pem)
+    if (trusted.len() == 0) {
+        io.print("FAIL the CA in ", ca_path, " did not load")
+        return error.Failed
+    }
+    const header = args.env("EGG_TLS_HEADER") orelse ""
+    const headers = if (@len(header) > 0) a.concat(header, "\r\n") else a.concat("", "")
+    defer a.free(headers)
+    var opts = http.options()
+    opts.redirects = number(args.env("EGG_TLS_REDIRECTS") orelse "0")
+    const method = args.env("EGG_TLS_METHOD") orelse "GET"
+    const body = args.env("EGG_TLS_BODY") orelse ""
+    const expect = args.env("EGG_TLS_EXPECT") orelse ""
+    const r = https.fetch(net, a, rng, clock, trusted, method, url, headers[0..], body, opts) catch |e| {
+        if (@len(expect) > 0 and @errorName(e) == expect) {
+            io.print("refused: ", expect)
+            return
+        }
+        return e
+    }
+    defer r.deinit(a)
+    if (@len(expect) > 0) {
+        io.print("FAIL status ", r.status, "; wanted ", expect)
+        return error.Failed
+    }
+    io.print("status ", r.status, ", ", @len(r.body), " bytes")
+    var ok = true
+    const want_status = args.env("EGG_TLS_WANT_STATUS") orelse ""
+    if (@len(want_status) > 0 and r.status != number(want_status)) {
+        io.print("FAIL wanted status ", want_status)
+        ok = false
+    }
+    const want_sha = args.env("EGG_TLS_SHA256") orelse ""
+    if (@len(want_sha) > 0) {
+        const d = sha256.sum(r.body[0..])
+        var hex: Buf(u8) = .empty
+        defer a.free(hex)
+        const digits = "0123456789abcdef"
+        for (d) |x| {
+            a.push(&hex, digits[@as(i64, x >> 4)])
+            a.push(&hex, digits[@as(i64, x & 15)])
+        }
+        if (!(hex == want_sha)) {
+            io.print("FAIL got SHA-256 ", hex, ", wanted ", want_sha)
+            ok = false
+        }
+    }
+    const has = args.env("EGG_TLS_HAS") orelse ""
+    if (@len(has) > 0 and !text.contains(r.body[0..], has)) {
+        io.print("FAIL the body lacks ", has, ":")
+        io.print(r.body)
+        ok = false
+    }
+    const lacks = args.env("EGG_TLS_LACKS") orelse ""
+    if (@len(lacks) > 0 and text.contains(r.body[0..], lacks)) {
+        io.print("FAIL the body has ", lacks, ":")
+        io.print(r.body)
+        ok = false
+    }
+    if (!ok) {
+        return error.Failed
+    }
+}
+
+fn number(s: str) i64 {
+    var n = 0
+    for (s) |ch| {
+        n = n * 10 + @as(i64, ch - '0')
+    }
+    return n
+}

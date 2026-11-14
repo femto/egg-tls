@@ -2,10 +2,13 @@
 // roots: run with EGG_TLS_REAL set to a comma-separated list of hosts
 // (port 443). Without it, it does nothing, so clutch test needs no
 // network. Each host must verify and answer an HTTP request. It offers
-// ALPN http/1.1, which the host must choose or ignore.
+// ALPN http/1.1, which the host must choose or ignore. Then tls/https
+// fetches https://HOST/, following redirects, and must get a 2xx.
 uses io, alloc, args, net, rand, fs, time
 
 const tls = @import("tls")
+const https = @import("tls/https")
+const http = @import("std/http")
 const roots = @import("tls/roots")
 const record = @import("tls/record")
 const x509 = @import("tls/x509")
@@ -27,6 +30,10 @@ fn main(io: Io, a: Allocator, args: Args, net: Net, rng: Random, files: Fs, cloc
         const host = hosts[at..end]
         get(io, a, rng, clock, net, trusted, opts, host) catch |e| {
             io.print("FAIL ", host, ": ", @errorName(e))
+            failed = failed + 1
+        }
+        fetch(io, a, rng, clock, net, trusted, host) catch |e| {
+            io.print("FAIL https.fetch ", host, ": ", @errorName(e))
             failed = failed + 1
         }
         at = end + 1
@@ -70,6 +77,19 @@ fn get(io: Io, a: Allocator, rng: Random, clock: Clock, net: Net, trusted: x509.
     }
     const alpn = if (@len(c.alpn()) > 0) c.alpn() else "none"
     io.print(host, ": ", suite_name(c.suite()), ", ALPN ", alpn, ", connect ", connect_ms, " ms, handshake ", ms, " ms, ", buf[0..line])
+}
+
+fn fetch(io: Io, a: Allocator, rng: Random, clock: Clock, net: Net, trusted: x509.CertList, host: []u8) !void {
+    const url = a.concat("https://", host, "/")
+    defer a.free(url)
+    var opts = http.options()
+    opts.redirects = 5
+    const r = try https.fetch(net, a, rng, clock, trusted, "GET", url[0..], "", "", opts)
+    defer r.deinit(a)
+    io.print("  https.fetch ", url, ": ", r.status, ", ", @len(r.body), " bytes")
+    if (r.status < 200 or r.status > 299) {
+        return error.NoResponse
+    }
 }
 
 fn suite_name(s: record.Suite) str {

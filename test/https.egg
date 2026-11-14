@@ -1,0 +1,95 @@
+// tls/https without a network: https:// URLs and their ports, where
+// redirects go, which origins are one, and that https:// never leads to
+// http://. test/live.sh fetches through it from servers of its own.
+uses io, alloc
+
+const https = @import("tls/https")
+const http = @import("std/http")
+const support = @import("support/check.egg")
+
+fn main(io: Io, a: Allocator) !void {
+    var t = support.tally()
+    port(io, a, &t, "https://example.com/x", true, 443, "example.com", "/x")
+    port(io, a, &t, "https://example.com:8443", true, 8443, "example.com", "/")
+    port(io, a, &t, "HTTPS://example.com:443/?q", true, 443, "example.com", "/?q")
+    port(io, a, &t, "https://example.com?q", true, 443, "example.com", "?q")
+    port(io, a, &t, "https://[::1]/", true, 443, "::1", "/")
+    port(io, a, &t, "https://[::1]:4433/a", true, 4433, "::1", "/a")
+    port(io, a, &t, "http://example.com/", false, 80, "example.com", "/")
+    refused(io, a, &t, "ftp://example.com/")
+    refused(io, a, &t, "https://user@example.com/")
+    refused(io, a, &t, "https://")
+    refused(io, a, &t, "https://example.com:99999/")
+    goes(io, a, &t, "https://a.com/x/y?q", "/z", "https://a.com/z")
+    goes(io, a, &t, "https://a.com/x/y", "z", "https://a.com/x/z")
+    goes(io, a, &t, "https://a.com:8443/x", "?p", "https://a.com:8443/x?p")
+    goes(io, a, &t, "https://a.com/x", "//b.com/y", "https://b.com/y")
+    goes(io, a, &t, "http://a.com/x", "//b.com/y", "http://b.com/y")
+    goes(io, a, &t, "https://a.com/x", "http://b.com/", "http://b.com/")
+    goes(io, a, &t, "http://a.com/x", "https://b.com/", "https://b.com/")
+    goes(io, a, &t, "http://a.com/x/y", "z", "http://a.com/x/z")
+    stays(io, a, &t, "https://a.com/x/y", "ftp://b.com/z")
+    stays(io, a, &t, "http://a.com/x/y", "ftp://b.com/z")
+    stays(io, a, &t, "https://a.com/x", "mailto:me@a.com")
+    stays(io, a, &t, "https://a.com/x", "Web+cal.2:x")
+    goes(io, a, &t, "https://a.com/x/y", "./a:b", "https://a.com/x/./a:b")
+    goes(io, a, &t, "https://a.com/x/y", "/a:b", "https://a.com/a:b")
+    t.check(io, https.same_origin(a, "https://a.com/x", "https://A.com:443/y"), "same origin: the default port named")
+    t.check(io, !https.same_origin(a, "https://a.com/", "http://a.com/"), "another scheme is another origin")
+    t.check(io, !https.same_origin(a, "https://a.com/", "https://a.com:8443/"), "another port is another origin")
+    t.check(io, !https.same_origin(a, "https://a.com/", "https://b.com/"), "another host is another origin")
+    t.check(io, https.follows("https://a.com/", "https://b.com/"), "https:// to https:// is followed")
+    t.check(io, https.follows("http://a.com/", "https://a.com/"), "http:// to https:// is followed")
+    t.check(io, https.follows("http://a.com/", "http://b.com/"), "http:// to http:// is followed")
+    t.check(io, !https.follows("https://a.com/", "http://a.com/"), "https:// to http:// is not")
+    t.check(io, !https.follows("HTTPS://a.com/", "http://a.com/"), "HTTPS:// to http:// is not")
+    try t.done(io)
+}
+
+fn port(io: Io, a: Allocator, inout t: support.Tally, url: str, secure: bool, want: i64, host: str, target: str) void {
+    var form: Buf(u8) = .empty
+    defer a.free(form)
+    const w = https.locate(a, url, &form) catch |e| {
+        t.check(io, false, url)
+        io.print("  ", @errorName(e))
+        return
+    }
+    const ok = w.secure == secure and w.u.port == want and http.url_host(form[0..], w.u) == host and http.url_target(form[0..], w.u) == target
+    t.check(io, ok, url)
+    if (!ok) {
+        io.print("  ", w.u.port, " ", http.url_host(form[0..], w.u), " ", http.url_target(form[0..], w.u))
+    }
+}
+
+fn refused(io: Io, a: Allocator, inout t: support.Tally, url: str) void {
+    var form: Buf(u8) = .empty
+    defer a.free(form)
+    _ = https.locate(a, url, &form) catch |e| {
+        t.check_of(io, e == error.BadUrl, "refused:", url)
+        return
+    }
+    t.check_of(io, false, "refused:", url)
+}
+
+fn goes(io: Io, a: Allocator, inout t: support.Tally, base: str, location: str, want: str) void {
+    const got = https.resolve(a, base, location) orelse {
+        t.check_of(io, false, base, location)
+        return
+    }
+    defer a.free(got)
+    t.check_of(io, got == want, base, location)
+    if (!(got == want)) {
+        io.print("  got ", got)
+    }
+}
+
+// A Location with a scheme other than http or https: not followed.
+fn stays(io: Io, a: Allocator, inout t: support.Tally, base: str, location: str) void {
+    if (https.resolve(a, base, location)) |got| {
+        defer a.free(got)
+        t.check_of(io, false, "not followed:", location)
+        io.print("  got ", got)
+        return
+    }
+    t.check_of(io, true, "not followed:", location)
+}
