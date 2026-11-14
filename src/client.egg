@@ -4,6 +4,7 @@
 // one over recorded handshakes.
 //
 //     var c = try Client.start(a, shares, random, "example.com")
+//     // or Client.start_options(a, shares, random, host, opts), with ALPN
 //     defer c.deinit(a)
 //     c.trust(a, roots, now)         // check the server's certificates
 //     // send c.take_outbox(a), the ClientHello, then until c.connected():
@@ -15,7 +16,9 @@
 // so that a server that takes only P-256 needs no HelloRetryRequest. A
 // HelloRetryRequest for P-384, or with a cookie, is answered with a
 // second ClientHello (RFC 8446, 4.1.4); a second one, or one that would
-// change nothing, fails. It takes no PSK or early data.
+// change nothing, fails. It takes no PSK or early data. With Options, it
+// offers ALPN protocols (RFC 7301); the one the server chose, which must
+// be one of them, is alpn().
 //
 // After trust, it checks the server: the certificate chain against the
 // roots, for the host, at now (tls/x509), and the CertificateVerify
@@ -72,6 +75,40 @@ fn group_bit(code: i64) i64 {
     }
     return 0
 }
+
+// What a client offers beyond what it always does: so far, ALPN
+// protocols (RFC 7301), in order of preference.
+const Options = owned struct {
+    // As the extension carries them: each a u8 length, then the name.
+    // Owned, so that only add_alpn builds it.
+    alpn: Buf(u8)
+
+    fn empty() Options {
+        return Options{ .alpn = .empty }
+    }
+
+    // Offers protocol (such as "h2" or "http/1.1") after those already
+    // added: error.BadProtocolName if it is empty or longer than 255
+    // bytes, error.TooManyProtocols past 1 KiB in all.
+    fn add_alpn(inout self: Options, a: Allocator, protocol: []u8) !void {
+        if (@len(protocol) == 0 or @len(protocol) > 255) {
+            return error.BadProtocolName
+        }
+        if (@len(self.alpn) + 1 + @len(protocol) > MAX_ALPN) {
+            return error.TooManyProtocols
+        }
+        a.push(&self.alpn, @as(u8, @len(protocol)))
+        a.append_str(&self.alpn, protocol)
+    }
+    fn deinit(sink self: Options, a: Allocator) void {
+        const o = self
+        a.free(o.alpn)
+        @forget(o)
+    }
+}
+
+// The most of the ALPN list a ClientHello carries.
+const MAX_ALPN: i64 = 1024
 
 const State = enum { server_hello, encrypted_extensions, certificate, certificate_verify, finished, connected, closed }
 
@@ -150,6 +187,10 @@ const Client = owned struct {
     now: i64
     // The server's certificates, leaf first.
     chain: x509.CertList
+    // The ALPN protocols offered, as Options holds them, and the one the
+    // server chose (empty if none).
+    alpn_offered: Buf(u8)
+    alpn_chosen: Buf(u8)
 
     // A client whose ClientHello, for host, is in the outbox. shares holds
     // fresh secrets for X25519 and P-256, whose shares it carries, and
@@ -158,12 +199,20 @@ const Client = owned struct {
     // otherwise); random is 32 fresh random bytes; host is a DNS name,
     // sent as server_name (an IP address is not: RFC 6066), or empty.
     fn start(a: Allocator, shares: Shares, random: [32]u8, host: []u8) !Client {
+        const none = Options.empty()
+        defer a.free(none)
+        return Client.start_options(a, shares, random, host, none)
+    }
+
+    // start, offering what opts holds too.
+    fn start_options(a: Allocator, shares: Shares, random: [32]u8, host: []u8, opts: Options) !Client {
         var hello: Buf(u8) = .empty
         defer a.free(hello)
-        try client_hello(a, &hello, random, host, shares, X25519 | P256, "")
+        try client_hello(a, &hello, random, host, shares, X25519 | P256, "", opts.alpn[0..])
         var c = Client.start_with(a, shares, hello[0..])
         c.random = random
         a.append_str(&c.host, host)
+        a.append_str(&c.alpn_offered, opts.alpn)
         return c
     }
 
@@ -203,6 +252,8 @@ const Client = owned struct {
             .host = .empty,
             .now = 0,
             .chain = x509.CertList.empty(),
+            .alpn_offered = .empty,
+            .alpn_chosen = .empty,
         }
         c.transcript.update(hello)
         // A plaintext record; its version is 0x0301 for old middleboxes.
@@ -245,6 +296,8 @@ const Client = owned struct {
         a.free(c.roots)
         a.free(c.host)
         a.free(c.chain)
+        a.free(c.alpn_offered)
+        a.free(c.alpn_chosen)
         @forget(c)
     }
 
@@ -265,6 +318,12 @@ const Client = owned struct {
 
     fn cipher_suite(self: Client) record.Suite {
         return self.suite
+    }
+
+    // The ALPN protocol the server chose, or empty: it chose none, or none
+    // was offered.
+    fn alpn(self: Client) []u8 {
+        return self.alpn_chosen[0..]
     }
 
     // The description of the alert that ended the connection, or -1.
@@ -517,7 +576,7 @@ const Client = owned struct {
                 if (kind != 8) {
                     return error.UnexpectedMessage
                 }
-                try check_extensions(body, 0)
+                try self.encrypted_extensions(a, body)
                 self.transcript.update(msg)
                 self.state = .certificate
             }
@@ -589,6 +648,33 @@ const Client = owned struct {
             .closed => {
                 return error.UnexpectedMessage
             }
+        }
+    }
+
+    // EncryptedExtensions: the ALPN protocol chosen, if any. The rest
+    // (server_name's empty answer, supported_groups, ...) needs nothing.
+    fn encrypted_extensions(inout self: Client, a: Allocator, body: []u8) !void {
+        try check_extensions(body, 0)
+        var at = 2
+        while (at < @len(body)) {
+            const ext = be16(body, at)
+            const n = be16(body, at + 2)
+            const data = body[at + 4..at + 4 + n]
+            if (ext == 16) {
+                // A list of exactly one protocol (RFC 7301, 3.1), not
+                // empty, and one we offered.
+                if (n < 4 or be16(data, 0) != n - 2 or @as(i64, data[2]) != n - 3) {
+                    return error.DecodeError
+                }
+                if (@len(self.alpn_offered) == 0) {
+                    return error.UnsupportedExtension
+                }
+                if (!offered(self.alpn_offered[0..], data[3..])) {
+                    return error.IllegalParameter
+                }
+                a.append_str(&self.alpn_chosen, data[3..])
+            }
+            at = at + 4 + n
         }
     }
 
@@ -730,7 +816,7 @@ const Client = owned struct {
         var hello = @take(&self.retry_hello)
         defer a.free(hello)
         if (@len(hello) == 0) {
-            try client_hello(a, &hello, self.random, self.host[0..], self.shares, which, self.cookie[0..])
+            try client_hello(a, &hello, self.random, self.host[0..], self.shares, which, self.cookie[0..], self.alpn_offered[0..])
         }
         self.offered = which
         self.transcript.update(hello[0..])
@@ -967,8 +1053,9 @@ const Client = owned struct {
 
 // The ClientHello message, with its handshake header, into out.
 // The shares are those of which (bits of X25519, P256, P384); a cookie,
-// if not empty, is a HelloRetryRequest's, sent back.
-fn client_hello(a: Allocator, inout out: Buf(u8), random: [32]u8, host: []u8, shares: Shares, which: i64, cookie: []u8) !void {
+// if not empty, is a HelloRetryRequest's, sent back; alpn, if not empty,
+// the protocols to offer, as Options holds them.
+fn client_hello(a: Allocator, inout out: Buf(u8), random: [32]u8, host: []u8, shares: Shares, which: i64, cookie: []u8, alpn: []u8) !void {
     if (@len(host) > 255) {
         return error.HostTooLong
     }
@@ -995,6 +1082,13 @@ fn client_hello(a: Allocator, inout out: Buf(u8), random: [32]u8, host: []u8, sh
         a.push(&out, 0)
         put16(a, &out, @len(host))
         a.append_str(&out, host)
+    }
+    if (@len(alpn) > 0) {
+        // application_layer_protocol_negotiation: the list.
+        put16(a, &out, 16)
+        put16(a, &out, @len(alpn) + 2)
+        put16(a, &out, @len(alpn))
+        a.append_str(&out, alpn)
     }
     // supported_groups: X25519, P-256, P-384.
     put16(a, &out, 10)
@@ -1167,6 +1261,19 @@ fn shares_in(hello: []u8) i64 {
         at = at + 4 + n
     }
     return bits
+}
+
+// Is name one of list's, a list as Options holds them?
+fn offered(list: []u8, name: []u8) bool {
+    var at = 0
+    while (at < @len(list)) {
+        const n = @as(i64, list[at])
+        if (list[at + 1..at + 1 + n] == name) {
+            return true
+        }
+        at = at + 1 + n
+    }
+    return false
 }
 
 // An IP address, which server_name may not carry: digits and dots, or a

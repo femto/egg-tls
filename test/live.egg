@@ -7,7 +7,9 @@
 //
 // With EGG_TLS_CA, the PEM of the test CA, the client checks the server
 // (tls.client) for EGG_TLS_HOST (localhost by default); with
-// EGG_TLS_EXPECT too, connecting must fail with that error.
+// EGG_TLS_EXPECT too, connecting must fail with that error. With
+// EGG_TLS_ALPN, protocols separated by commas, it offers them, and the
+// server must choose EGG_TLS_WANT_ALPN (none if unset).
 uses io, alloc, args, net, rand, fs, time
 
 const tls = @import("tls")
@@ -35,10 +37,24 @@ fn main(io: Io, a: Allocator, args: Args, net: Net, rng: Random, files: Fs, cloc
             return error.Failed
         }
     }
+    const alpn = args.env("EGG_TLS_ALPN") orelse ""
+    var opts = tls.Options.empty()
+    defer a.free(opts)
+    var from = 0
+    var i = 0
+    while (i <= @len(alpn)) {
+        if (i == @len(alpn) or alpn[i] == ',') {
+            if (i > from) {
+                try opts.add_alpn(a, alpn[from..i])
+            }
+            from = i + 1
+        }
+        i = i + 1
+    }
     const conn = try net.tcp_connect("127.0.0.1", port)
     const host = args.env("EGG_TLS_HOST") orelse "localhost"
     const expect = args.env("EGG_TLS_EXPECT") orelse ""
-    var c = connect(a, rng, clock, trusted, conn, host, @len(ca_path) > 0) catch |e| {
+    var c = connect(a, rng, clock, trusted, conn, host, @len(ca_path) > 0, opts) catch |e| {
         if (@len(expect) > 0 and @errorName(e) == expect) {
             io.print("refused: ", expect)
             return
@@ -51,6 +67,11 @@ fn main(io: Io, a: Allocator, args: Args, net: Net, rng: Random, files: Fs, cloc
         return error.Failed
     }
     const got = suite_name(c.suite())
+    const want_alpn = args.env("EGG_TLS_WANT_ALPN") orelse ""
+    if (!(c.alpn() == want_alpn)) {
+        io.print("FAIL ALPN chose \"", c.alpn(), "\", wanted \"", want_alpn, "\"")
+        return error.Failed
+    }
     if (@len(want_sha) > 0) {
         try c.write(a, "GET /big.bin HTTP/1.0\r\n\r\n")
     } else {
@@ -63,7 +84,11 @@ fn main(io: Io, a: Allocator, args: Args, net: Net, rng: Random, files: Fs, cloc
     while (try c.read(a, &buf, 65536) > 0) {
         a.append_str(&response, buf)
     }
-    io.print("suite ", got, ", ", @len(response), " bytes")
+    if (@len(alpn) > 0) {
+        io.print("suite ", got, ", ", @len(response), " bytes, ALPN \"", c.alpn(), "\"")
+    } else {
+        io.print("suite ", got, ", ", @len(response), " bytes")
+    }
     if (!(got == want)) {
         io.print("FAIL wanted ", want)
         return error.Failed
@@ -92,9 +117,9 @@ fn main(io: Io, a: Allocator, args: Args, net: Net, rng: Random, files: Fs, cloc
     }
 }
 
-fn connect(a: Allocator, rng: Random, clock: Clock, trusted: x509.CertList, sink conn: TcpConn, host: []u8, verify: bool) !tls.TlsConn {
+fn connect(a: Allocator, rng: Random, clock: Clock, trusted: x509.CertList, sink conn: TcpConn, host: []u8, verify: bool, opts: tls.Options) !tls.TlsConn {
     if (verify) {
-        return tls.client(a, rng, clock, trusted, conn, host)
+        return tls.client_with(a, rng, clock, trusted, conn, host, opts)
     }
     return tls.client_unverified(a, rng, conn, host)
 }
