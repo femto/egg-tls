@@ -12,7 +12,7 @@ env:
   # Egg with per-platform files (m_windows.egg / m_unix.egg), which
   # src/sysroots needs: femto/egg#118, until a release has it.
   EGG_REPO: femto/egg
-  EGG_REF: 5939ae2eb28622b23077f890725cfb23b3901cb1
+  EGG_REF: 6a1fb9f5f1d753feff55bab45c8370393d9d04cd
 
 jobs:
   test:
