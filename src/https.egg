@@ -1,0 +1,198 @@
+// https: std/http's fetch for https:// URLs too, over tls.client. The
+// request and the response are std/http's (append_request, Response);
+// what this adds is the connection, which checks the server's
+// certificate against roots, and https:// URLs and redirects.
+//
+//     const trusted = try roots.system(a, files)    // once, for every request
+//     defer a.free(trusted)
+//     const r = try https.fetch(net, a, rng, clock, trusted, "GET", "https://example.com/", "", "", http.options())
+//     defer r.deinit(a)
+//     io.print(r.status, " ", r.body)
+//
+// An http:// URL goes through std/http's own fetch_once, without TLS.
+// Redirects are followed as std/http's fetch follows them, across
+// schemes too, except from https:// to http://, which would send the
+// next request in the clear: that 3xx is returned as it is. A redirect to
+// another scheme, host or port goes without the caller's headers.
+//
+// A response whose body ends where the connection does (no
+// Content-Length, not chunked) must end with the server's close_notify:
+// a TCP connection that just ends is error.Truncated, since anyone on the
+// path can end one.
+uses alloc, net, rand, time
+
+const tls = @import("tls.egg")
+const x509 = @import("x509.egg")
+const http = @import("std/http")
+const text = @import("std/text")
+
+// Where the parts of a URL are, in its http:// form (http.parse_url's
+// offsets, into form below), whether it is https://, and the port to
+// connect to (443 if an https:// URL names none).
+const Where = struct {
+    secure: bool
+    u: http.Url
+}
+
+// url's http:// form into form (url itself for http://), and where its
+// parts are in it. error.BadUrl as http.parse_url says it, and for any
+// other scheme.
+fn locate(a: Allocator, url: []u8, inout form: Buf(u8)) !Where {
+    a.resize(&form, 0, 0)
+    var secure = false
+    if (@len(url) >= 8 and http.same(url[0..8], "https://")) {
+        a.append_str(&form, "http://")
+        a.append_str(&form, url[8..])
+        secure = true
+    } else {
+        a.append_str(&form, url)
+    }
+    var u = try http.parse_url(form[0..])
+    // parse_url says 80 for a URL without a port: whether it named one is
+    // whether a colon follows the host (or its ]).
+    if (secure and !text.contains(form[u.host_hi..u.authority_hi], ":")) {
+        u.port = 443
+    }
+    return Where{ .secure = secure, .u = u }
+}
+
+fn is_https(url: []u8) bool {
+    return @len(url) >= 8 and http.same(url[0..8], "https://")
+}
+
+// Where a redirect from base (http:// or https://) to location goes, as
+// an absolute URL, or null if it cannot be told.
+fn resolve(a: Allocator, base: []u8, location: []u8) ?Buf(u8) {
+    if (is_https(location) or (@len(location) >= 7 and http.same(location[0..7], "http://"))) {
+        return a.concat(location, "")
+    }
+    if (text.starts_with(location, "//")) {
+        return a.concat(if (is_https(base)) "https:" else "http:", location)
+    }
+    if (!is_https(base)) {
+        return http.resolve(a, base, location)
+    }
+    // Relative to an https:// base: resolved in its http:// form, which
+    // the result then starts with, and given back its scheme.
+    var form: Buf(u8) = .empty
+    defer a.free(form)
+    a.append_str(&form, "http://")
+    a.append_str(&form, base[8..])
+    const r = http.resolve(a, form[0..], location) orelse { return null }
+    defer a.free(r)
+    return a.concat("https://", r[7..])
+}
+
+// Do x and y have one scheme, host and port?
+fn same_origin(a: Allocator, x: []u8, y: []u8) bool {
+    var fx: Buf(u8) = .empty
+    defer a.free(fx)
+    var fy: Buf(u8) = .empty
+    defer a.free(fy)
+    const wx = locate(a, x, &fx) catch { return false }
+    const wy = locate(a, y, &fy) catch { return false }
+    return wx.secure == wy.secure and wx.u.port == wy.u.port and http.same(http.url_host(fx[0..], wx.u), http.url_host(fy[0..], wy.u))
+}
+
+// Is a redirect from current to next one fetch follows? Not from https://
+// to http://.
+fn follows(current: []u8, next: []u8) bool {
+    return !is_https(current) or is_https(next)
+}
+
+// One request to an https:// URL on a connection of its own, closed after
+// the response.
+fn fetch_tls(net: Net, a: Allocator, rng: Random, clock: Clock, roots: x509.CertList, method: []u8, form: []u8, w: Where, headers: []u8, body: []u8, opts: http.Options) !http.Response {
+    const host = http.url_host(form, w.u)
+    // The timeout bounds the handshake's reads and writes too.
+    const conn = try net.tcp_connect(host, w.u.port)
+    conn.set_timeout(opts.timeout_ms) catch |e| {
+        conn.close()
+        return e
+    }
+    var o = tls.Options.empty()
+    defer a.free(o)
+    o.add_alpn(a, "http/1.1") catch |e| {
+        conn.close()
+        return e
+    }
+    var c = try tls.client_with(a, rng, clock, roots, conn, host, o)
+    defer c.close(a)
+    const all = a.concat(headers, "Connection: close\r\n")
+    defer a.free(all)
+    const target = http.url_target(form, w.u)
+    const slash = if (text.starts_with(target, "?")) "/" else ""
+    const line_target = a.concat(slash, target)
+    defer a.free(line_target)
+    var out: Buf(u8) = .empty
+    defer a.free(out)
+    http.append_request(a, &out, method, line_target, form[w.u.authority_lo..w.u.authority_hi], all, body)
+    try c.write(a, out[0..])
+    var inbox: Buf(u8) = .empty
+    defer a.free(inbox)
+    var chunk: Buf(u8) = .empty
+    defer a.free(chunk)
+    var ended = false
+    while (true) {
+        if (try http.parse_response(a, &inbox, opts.max_body, method == "HEAD", ended)) |resp| {
+            return resp
+        }
+        if (ended) {
+            return error.BadResponse
+        }
+        if (try c.read(a, &chunk, 65536) == 0) {
+            ended = true
+        } else {
+            a.append_str(&inbox, chunk)
+        }
+    }
+    return error.BadResponse
+}
+
+// One request, to an https:// or http:// URL.
+fn fetch_once(net: Net, a: Allocator, rng: Random, clock: Clock, roots: x509.CertList, method: []u8, url: []u8, headers: []u8, body: []u8, opts: http.Options) !http.Response {
+    var form: Buf(u8) = .empty
+    defer a.free(form)
+    const w = try locate(a, url, &form)
+    if (!w.secure) {
+        return http.fetch_once(net, a, method, url, headers, body, opts)
+    }
+    return fetch_tls(net, a, rng, clock, roots, method, form[0..], w, headers, body, opts)
+}
+
+// method url (https:// or http://) with headers (each ending in \r\n; not
+// Host, Content-Length or Connection, which fetch writes) and body, as
+// std/http's fetch, the server of an https:// URL checked against roots
+// (tls.client says how) at clock's time. With opts.redirects above 0 it
+// follows that many: a 303, or a 301 or 302 after a POST, as a GET
+// without the body; a 307 or 308 as it was; never from https:// to
+// http://. A redirect to another scheme, host or port goes without the
+// caller's headers. Fails as http.parse_url, net.tcp_connect,
+// tls.client_with and http.parse_response do.
+fn fetch(net: Net, a: Allocator, rng: Random, clock: Clock, roots: x509.CertList, method: []u8, url: []u8, headers: []u8, body: []u8, opts: http.Options) !http.Response {
+    var current = a.concat(url, "")
+    defer a.free(current)
+    var get = false
+    var hops = 0
+    while (true) {
+        const own = if (same_origin(a, url, current[0..])) headers else ""
+        const resp = try fetch_once(net, a, rng, clock, roots, if (get) "GET" else method, current[0..], own, if (get) "" else body, opts)
+        if (hops >= opts.redirects or !http.is_redirect(resp.status)) {
+            return resp
+        }
+        const location = resp.header("Location") orelse ""
+        if (@len(location) == 0) {
+            return resp
+        }
+        const next = resolve(a, current[0..], location) orelse { return resp }
+        if (!follows(current[0..], next[0..])) {
+            a.free(next)
+            return resp
+        }
+        get = get or resp.status == 303 or ((resp.status == 301 or resp.status == 302) and method == "POST")
+        resp.deinit(a)
+        a.free(@replace(&current, next))
+        hops = hops + 1
+    }
+    return error.BadResponse
+}

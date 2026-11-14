@@ -229,6 +229,41 @@ sites with the system's roots, offering ALPN http/1.1. `test/alpn.egg`
 checks the ALPN extension in both ClientHellos and the server's answer,
 against a server built by hand.
 
+## HTTPS
+
+`tls/https` is std/http's `fetch` for `https://` URLs too: the same
+request and `Response`, over a connection that checks the server as
+`tls.client` does.
+
+```egg
+uses io, alloc, net, rand, fs, time
+
+const https = @import("tls/https")
+const roots = @import("tls/roots")
+const http = @import("std/http")
+
+fn main(io: Io, a: Allocator, net: Net, rng: Random, files: Fs, clock: Clock) !void {
+    const trusted = try roots.system(a, files)     // once, for every request
+    defer a.free(trusted)
+    var opts = http.options()                      // 30 s, 16 MiB, no redirects
+    opts.redirects = 5
+    const r = try https.fetch(net, a, rng, clock, trusted, "GET", "https://example.com/", "", "", opts)
+    defer r.deinit(a)
+    io.print(r.status, " ", r.header("Content-Type") orelse "", " ", @len(r.body))
+}
+```
+
+An `http://` URL goes through std/http without TLS. Redirects are
+followed as std/http follows them, across schemes too, but never from
+`https://` down to `http://`: that 3xx comes back as it is. A redirect
+to another scheme, host or port goes without the caller's headers. It
+offers ALPN http/1.1. A body that runs to the end of the connection
+must end with the server's close_notify (`error.Truncated` if the
+connection just ends). `clutch test` checks its URLs, redirects and
+origins; `sh test/live.sh` fetches from `s_server -WWW` and from
+`test/https_server.py` (redirects, headers, a downgrade refused, an
+untrusted CA), and `test/real.egg` fetches each real site too.
+
 ## P-256 and P-384
 
 ECDH and ECDSA verification on the NIST curves, as TLS key shares and
