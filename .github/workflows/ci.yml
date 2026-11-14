@@ -12,7 +12,7 @@ env:
   # The oldest Egg this package supports (README): per-platform files
   # came in 0.2.1.
   EGG_REPO: femto/egg
-  EGG_REF: v0.2.1
+  EGG_REF: 5d032fb4b9ae32900f499cfc3d364b9558b5df59 # v0.2.1
 
 jobs:
   test:
@@ -58,4 +58,4 @@ jobs:
           exit 1
       - name: Against openssl s_server
         if: matrix.os == 'ubuntu-latest'
-        run: CLUTCH="ruby $PWD/.egg/bin/clutch" sh test/live.sh
+        run: CLUTCH="$PWD/.egg/bin/clutch" sh test/live.sh

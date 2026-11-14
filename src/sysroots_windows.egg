@@ -18,10 +18,10 @@ extern fn CertOpenSystemStoreW(prov: usize, name: *u16) *u8
 extern fn CertEnumCertificatesInStore(store: *u8, prev: *u8) *u8
 extern fn CertCloseStore(store: *u8, flags: u32) i32
 
-// CERT_CONTEXT on 64-bit Windows: DWORD dwCertEncodingType (and 4 bytes
-// of padding), BYTE *pbCertEncoded at 8, DWORD cbCertEncoded at 16.
-const ENCODED_AT: i64 = 8
-const LENGTH_AT: i64 = 16
+// CERT_CONTEXT: DWORD dwCertEncodingType, then BYTE *pbCertEncoded at
+// the next pointer's alignment and DWORD cbCertEncoded after it: at 8
+// and 16 on 64-bit Windows, 4 and 8 on 32-bit, one and two pointer
+// sizes (system takes them from @sizeOf, which is C's sizeof).
 // X509_ASN_ENCODING: DER.
 const X509_ASN: u32 = 1
 
@@ -32,14 +32,16 @@ fn system(a: Allocator, files: Fs) !x509.CertList {
     if (store == null) {
         return error.NoRoots
     }
+    const encoded_at = @sizeOf(*u8)
+    const length_at = 2 * @sizeOf(*u8)
     var list = x509.CertList.empty()
     // Each call frees the context it is given and returns the next; null
     // after the last.
     var ctx = CertEnumCertificatesInStore(store, null)
     while (ctx != null) {
         const kind = @ptrCast(*u32, ctx).*
-        const der = @ptrCast(**u8, @ptrAdd(ctx, ENCODED_AT)).*
-        const n = @as(i64, @ptrCast(*u32, @ptrAdd(ctx, LENGTH_AT)).*)
+        const der = @ptrCast(**u8, @ptrAdd(ctx, encoded_at)).*
+        const n = @as(i64, @ptrCast(*u32, @ptrAdd(ctx, length_at)).*)
         // One that does not parse is skipped, as in a PEM bundle.
         if (kind & X509_ASN != 0 and der != null) {
             list.add(a, @sliceFromPtr(der, n)) catch {}
