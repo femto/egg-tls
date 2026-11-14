@@ -27,13 +27,18 @@
 //     defer a.free(buf)
 //     while (try c.read(a, &buf, 65536) > 0) { ... }
 //
-// client_unverified connects without checking who answers, for tests.
+// client_with offers more (Options: ALPN protocols); client_unverified
+// connects without checking who answers, for tests.
 uses alloc, net, rand, time
 
 const tls_client = @import("client.egg")
 const record = @import("record.egg")
 const ec = @import("ec.egg")
 const x509 = @import("x509.egg")
+
+// What a client offers beyond the defaults: Options.empty(), then
+// add_alpn(a, "h2") and so on, in order of preference; freed with a.free.
+const Options = tls_client.Options
 
 const TlsConn = owned struct {
     conn: TcpConn
@@ -69,6 +74,12 @@ const TlsConn = owned struct {
     // The cipher suite the server chose.
     fn suite(self: TlsConn) record.Suite {
         return self.c.cipher_suite()
+    }
+
+    // The ALPN protocol the server chose from those offered, or empty if
+    // it chose none.
+    fn alpn(self: TlsConn) []u8 {
+        return self.c.alpn()
     }
 
     // Sends a close_notify (if it can) and closes the TCP connection.
@@ -110,7 +121,17 @@ const TlsConn = owned struct {
 // sign the handshake with its key (tls/client says how). roots is only
 // read: each connection keeps a copy. On any failure conn is closed.
 fn client(a: Allocator, rng: Random, clock: Clock, roots: x509.CertList, sink conn: TcpConn, host: []u8) !TlsConn {
-    return connect(a, rng, conn, host, true, roots, clock.now() / 1000000000)
+    const none = Options.empty()
+    defer a.free(none)
+    return connect(a, rng, conn, host, true, roots, clock.now() / 1000000000, none)
+}
+
+// client, offering what opts holds too: ALPN protocols, say, after which
+// alpn() is the one the server chose. A server that takes none of them
+// may go on without ALPN, or refuse with the alert no_application_protocol
+// (error.AlertReceived; tls/client's alert() is 120). opts is only read.
+fn client_with(a: Allocator, rng: Random, clock: Clock, roots: x509.CertList, sink conn: TcpConn, host: []u8, opts: Options) !TlsConn {
+    return connect(a, rng, conn, host, true, roots, clock.now() / 1000000000, opts)
 }
 
 // A TLS connection over conn **that does not check the server's
@@ -119,10 +140,12 @@ fn client(a: Allocator, rng: Random, clock: Clock, roots: x509.CertList, sink co
 fn client_unverified(a: Allocator, rng: Random, sink conn: TcpConn, host: []u8) !TlsConn {
     const none = x509.CertList.empty()
     defer a.free(none)
-    return connect(a, rng, conn, host, false, none, 0)
+    const defaults = Options.empty()
+    defer a.free(defaults)
+    return connect(a, rng, conn, host, false, none, 0, defaults)
 }
 
-fn connect(a: Allocator, rng: Random, sink conn: TcpConn, host: []u8, verify: bool, roots: x509.CertList, now: i64) !TlsConn {
+fn connect(a: Allocator, rng: Random, sink conn: TcpConn, host: []u8, verify: bool, roots: x509.CertList, now: i64, opts: Options) !TlsConn {
     var shares = tls_client.Shares{ .x25519 = @splat(0), .p256 = @splat(0), .p384 = @splat(0) }
     defer @secureZero(&shares)
     rng.fill(&shares.x25519[0..])
@@ -138,7 +161,7 @@ fn connect(a: Allocator, rng: Random, sink conn: TcpConn, host: []u8, verify: bo
     }
     var random: [32]u8 = @splat(0)
     rng.fill(&random[0..])
-    var c = tls_client.Client.start(a, shares, random, host) catch |e| {
+    var c = tls_client.Client.start_options(a, shares, random, host, opts) catch |e| {
         conn.close()
         return e
     }

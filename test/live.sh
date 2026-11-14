@@ -8,8 +8,10 @@
 # refuse (the wrong host, and a CA it does not trust), where the server
 # must log the client's alert (bad_certificate, unknown_ca). And through two
 # HelloRetryRequests, one for P-384 and one with a cookie (s_server
-# -stateless). Needs OpenSSL 1.1.1 or
-# later.
+# -stateless). ALPN: a server with -alpn h2,http/1.1 must choose the
+# first of its own the client offers, and refuse (no_application_protocol) when
+# there is none; a server without -alpn chooses none. Needs OpenSSL
+# 1.1.1 or later.
 #
 #     sh test/live.sh                 # clutch from PATH
 #     CLUTCH=../egg/bin/clutch sh test/live.sh
@@ -109,7 +111,20 @@ serve leaf256 -www -stateless
 printf 'HelloRetryRequest with a cookie (-stateless): '
 run env EGG_TLS_SUITE=TLS_CHACHA20_POLY1305_SHA256
 stop
+# ALPN. s_server -alpn takes the first of its own list the client offers,
+# so h2 here although the client lists http/1.1 before it.
+serve leaf256 -www -alpn h2,http/1.1
+printf 'ALPN, the server choosing: '
+run env EGG_TLS_SUITE=TLS_CHACHA20_POLY1305_SHA256 EGG_TLS_ALPN=spdy/1,http/1.1,h2 EGG_TLS_WANT_ALPN=h2
+printf 'ALPN, nothing offered: '
+run env EGG_TLS_SUITE=TLS_CHACHA20_POLY1305_SHA256
+printf 'ALPN, none in common: '
+run env EGG_TLS_SUITE=TLS_CHACHA20_POLY1305_SHA256 EGG_TLS_ALPN=spdy/1 EGG_TLS_EXPECT=AlertReceived
+grep -q 'no application protocol' "$dir/server.log" || { echo "FAIL the server did not refuse for ALPN:" >&2; cat "$dir/server.log" >&2; exit 1; }
+stop
 serve leaf256 -www
+printf 'ALPN offered to a server without it: '
+run env EGG_TLS_SUITE=TLS_CHACHA20_POLY1305_SHA256 EGG_TLS_ALPN=h2
 # server_alert N: the server logged receiving alert N from the client.
 # It may log a little after the client exits: up to 2 s.
 server_alert() {

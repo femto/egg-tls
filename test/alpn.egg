@@ -1,0 +1,267 @@
+// ALPN (RFC 7301): what the ClientHello offers, first and after a
+// HelloRetryRequest, and what the client takes from EncryptedExtensions.
+// The server here is built by hand: a ServerHello with an X25519 share,
+// then EncryptedExtensions under the handshake key it gives.
+uses io, alloc
+
+const client = @import("tls/client")
+const ks = @import("tls/key_schedule")
+const record = @import("tls/record")
+const x25519 = @import("tls/x25519")
+const support = @import("support/check.egg")
+
+fn main(io: Io, a: Allocator) !void {
+    var t = support.tally()
+    try options(io, a, &t)
+    try hello(io, a, &t)
+    try retry(io, a, &t)
+    try chosen(io, a, &t, "000d00000000001000050003026832", "h2", "h2, after server_name's empty answer")
+    try chosen(io, a, &t, "000f0010000b000908687474702f312e31", "http/1.1", "http/1.1")
+    try chosen(io, a, &t, "0000", "", "no ALPN: none chosen")
+    try refused(io, a, &t, true, "000b0010000700050473706479", error.IllegalParameter, 47, "a protocol not offered")
+    try refused(io, a, &t, true, "00120010000e000c02683208687474702f312e31", error.DecodeError, 50, "two protocols")
+    try refused(io, a, &t, true, "000700100003000100", error.DecodeError, 50, "an empty protocol")
+    try refused(io, a, &t, true, "0009001000050004026833", error.DecodeError, 50, "a list longer than the extension")
+    try refused(io, a, &t, true, "000a00100006000402683200", error.DecodeError, 50, "a name shorter than the list")
+    try refused(io, a, &t, false, "000b0010000700050473706479", error.UnsupportedExtension, 110, "ALPN not offered")
+    try no_protocol(io, a, &t)
+    try replayed(io, a, &t)
+    try t.done(io)
+}
+
+// add_alpn: names of 1 to 255 bytes, 1 KiB in all.
+fn options(io: Io, a: Allocator, inout t: support.Tally) !void {
+    var o = client.Options.empty()
+    defer a.free(o)
+    var got: anyerror = error.None
+    o.add_alpn(a, "") catch |e| {
+        got = e
+    }
+    t.check(io, got == error.BadProtocolName and @len(o.alpn) == 0, "an empty name refused")
+    var long: Buf(u8) = .empty
+    defer a.free(long)
+    a.resize(&long, 256, 'x')
+    got = error.None
+    o.add_alpn(a, long[0..]) catch |e| {
+        got = e
+    }
+    t.check(io, got == error.BadProtocolName, "a name of 256 bytes refused")
+    try o.add_alpn(a, long[0..255])
+    try o.add_alpn(a, long[0..255])
+    try o.add_alpn(a, long[0..255])
+    try o.add_alpn(a, long[0..255])
+    got = error.None
+    o.add_alpn(a, "h2") catch |e| {
+        got = e
+    }
+    t.check(io, got == error.TooManyProtocols and @len(o.alpn) == 1024, "past 1 KiB refused")
+}
+
+fn random() [32]u8 {
+    var r: [32]u8 = @splat(0)
+    var i = 0
+    while (i < 32) {
+        r[i] = @as(u8, i)
+        i = i + 1
+    }
+    return r
+}
+
+fn shares() client.Shares {
+    var s = client.Shares{ .x25519 = @splat(3), .p256 = @splat(0), .p384 = @splat(0) }
+    s.p256[31] = 5
+    s.p384[47] = 7
+    return s
+}
+
+// A client offering h2 and http/1.1 if alpn, nothing more if not.
+fn start(a: Allocator, alpn: bool) !client.Client {
+    var o = client.Options.empty()
+    defer a.free(o)
+    if (alpn) {
+        try o.add_alpn(a, "h2")
+        try o.add_alpn(a, "http/1.1")
+    }
+    return client.Client.start_options(a, shares(), random(), "example.com", o)
+}
+
+// The extension, as the ClientHello carries it.
+const EXT = "0010000e000c02683208687474702f312e31"
+
+// The ClientHello is the one without ALPN, with the extension added.
+fn hello(io: Io, a: Allocator, inout t: support.Tally) !void {
+    var plain = try client.Client.start(a, shares(), random(), "example.com")
+    defer plain.deinit(a)
+    const without = plain.take_outbox()
+    defer a.free(without)
+    var c = try start(a, true)
+    defer c.deinit(a)
+    const with = c.take_outbox()
+    defer a.free(with)
+    const ext = try support.unhex(a, EXT)
+    defer a.free(ext)
+    t.check(io, @len(with) == @len(without) + @len(ext) and contains(with[0..], ext[0..]), "the ClientHello offers h2, http/1.1")
+    t.check(io, !contains(without[0..], ext[0..]), "no ALPN without Options")
+}
+
+// After a HelloRetryRequest for P-384, the second ClientHello offers the
+// same protocols.
+fn retry(io: Io, a: Allocator, inout t: support.Tally) !void {
+    var c = try start(a, true)
+    defer c.deinit(a)
+    a.free(c.take_outbox())
+    var hrr: Buf(u8) = .empty
+    defer a.free(hrr)
+    const magic = try support.unhex(a, "cf21ad74e59a6111be1d8c021e65b891c2a211167abb8c5e079e09e2c8a8339c")
+    defer a.free(magic)
+    const head = try support.unhex(a, "1603030038020000340303")
+    defer a.free(head)
+    a.append_str(&hrr, head)
+    a.append_str(&hrr, magic)
+    const tail = try support.unhex(a, "00130100000c002b00020304003300020018")
+    defer a.free(tail)
+    a.append_str(&hrr, tail)
+    try c.feed(a, hrr[0..])
+    const second = c.take_outbox()
+    defer a.free(second)
+    const ext = try support.unhex(a, EXT)
+    defer a.free(ext)
+    t.check(io, @len(second) > 0 and contains(second[0..], ext[0..]), "the second ClientHello offers them too")
+}
+
+// The handshake up to EncryptedExtensions, whose extensions (hex: u16
+// length, then each) are exts: got is the client's error, or error.None.
+fn handshake(a: Allocator, inout c: client.Client, exts: str, inout got: anyerror) !void {
+    const ch = c.take_outbox()
+    defer a.free(ch)
+    // The client's X25519 share is in its ClientHello: the key after
+    // 001d0020.
+    const mark = [4]u8{ 0x00, 0x1D, 0x00, 0x20 }
+    const at = find(ch[0..], mark[0..]) + 4
+    var theirs: [32]u8 = @splat(0)
+    var i = 0
+    while (i < 32) {
+        theirs[i] = ch[at + i]
+        i = i + 1
+    }
+    const mine: [32]u8 = @splat(9)
+    const ours = x25519.public_key(mine)
+    const shared = try x25519.shared(mine, theirs)
+    var sh: Buf(u8) = .empty
+    defer a.free(sh)
+    const sh_head = try support.unhex(a, "020000560303")
+    defer a.free(sh_head)
+    a.append_str(&sh, sh_head)
+    const sh_random: [32]u8 = @splat(0x5A)
+    a.append_str(&sh, sh_random[0..])
+    const sh_mid = try support.unhex(a, "00130100002e002b0002030400330024001d0020")
+    defer a.free(sh_mid)
+    a.append_str(&sh, sh_mid)
+    a.append_str(&sh, ours[0..])
+    // The server's handshake key, as the client derives its own.
+    var tr = ks.Transcript.init()
+    tr.update(ch[5..])
+    tr.update(sh[0..])
+    const h = ks.HashKind.sha256
+    var th: [32]u8 = @splat(0)
+    tr.digest(h, &th[0..])
+    var early: [32]u8 = @splat(0)
+    ks.early_secret(h, &early[0..])
+    var hs: [32]u8 = @splat(0)
+    ks.handshake_secret(h, early[0..], shared[0..], &hs[0..])
+    var shs: [32]u8 = @splat(0)
+    ks.derive_secret(h, hs[0..], "s hs traffic", th[0..], &shs[0..])
+    var server = record.Protection.init(.aes_128_gcm_sha256, shs[0..])
+    var rec: Buf(u8) = .empty
+    defer a.free(rec)
+    const rec_head = [5]u8{ 22, 3, 3, 0, @as(u8, @len(sh)) }
+    a.append_str(&rec, rec_head[0..])
+    a.append_str(&rec, sh)
+    // EncryptedExtensions, sealed with its content type and a tag.
+    const ext_bytes = try support.unhex(a, exts)
+    defer a.free(ext_bytes)
+    const n = @len(ext_bytes) + 4 + 1 + 16
+    const hdr = [5]u8{ 23, 3, 3, @as(u8, n >> 8), @as(u8, n & 0xFF) }
+    const start_at = @len(rec)
+    a.append_str(&rec, hdr[0..])
+    const ee_head = [4]u8{ 8, 0, 0, @as(u8, @len(ext_bytes)) }
+    a.append_str(&rec, ee_head[0..])
+    a.append_str(&rec, ext_bytes)
+    a.push(&rec, 22)
+    const tag: [16]u8 = @splat(0)
+    a.append_str(&rec, tag[0..])
+    server.seal(hdr[0..], &rec[start_at + 5..])
+    c.feed(a, rec[0..]) catch |e| {
+        got = e
+    }
+}
+
+// The server chooses (exts, hex): no failure, and want is alpn().
+fn chosen(io: Io, a: Allocator, inout t: support.Tally, exts: str, want: str, name: str) !void {
+    var c = try start(a, true)
+    defer c.deinit(a)
+    var got: anyerror = error.None
+    try handshake(a, &c, exts, &got)
+    t.check(io, got == error.None and c.alpn() == want and !c.closed(), name)
+    if (got != error.None) {
+        io.print("  got ", @errorName(got))
+    }
+}
+
+// The server's EncryptedExtensions are exts: refused with want, the
+// alert desc sent.
+fn refused(io: Io, a: Allocator, inout t: support.Tally, alpn: bool, exts: str, want: anyerror, desc: i64, name: str) !void {
+    var c = try start(a, alpn)
+    defer c.deinit(a)
+    var got: anyerror = error.None
+    try handshake(a, &c, exts, &got)
+    t.check(io, got == want and c.alert_sent() == desc and @len(c.alpn()) == 0, name)
+    if (got != want) {
+        io.print("  got ", @errorName(got))
+    }
+}
+
+// A server that takes none of them may say so, in plaintext before its
+// ServerHello: no_application_protocol (120).
+fn no_protocol(io: Io, a: Allocator, inout t: support.Tally) !void {
+    var c = try start(a, true)
+    defer c.deinit(a)
+    a.free(c.take_outbox())
+    const alert = [7]u8{ 21, 3, 3, 0, 2, 2, 120 }
+    var got: anyerror = error.None
+    c.feed(a, alert[0..]) catch |e| {
+        got = e
+    }
+    t.check(io, got == error.AlertReceived and c.alert() == 120 and c.alert_sent() == -1, "no_application_protocol from the server")
+}
+
+// start_with takes the protocols offered from the ClientHello it sends.
+fn replayed(io: Io, a: Allocator, inout t: support.Tally) !void {
+    var first = try start(a, true)
+    defer first.deinit(a)
+    const rec = first.take_outbox()
+    defer a.free(rec)
+    var c = client.Client.start_with(a, shares(), rec[5..])
+    defer c.deinit(a)
+    var got: anyerror = error.None
+    try handshake(a, &c, "000d00000000001000050003026832", &got)
+    t.check(io, got == error.None and c.alpn() == "h2", "a replayed ClientHello's protocols")
+    if (got != error.None) {
+        io.print("  got ", @errorName(got))
+    }
+}
+
+fn find(s: []u8, p: []u8) i64 {
+    var i = 0
+    while (i + @len(p) <= @len(s)) {
+        if (s[i..i + @len(p)] == p) {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+fn contains(s: []u8, p: []u8) bool {
+    return find(s, p) >= 0
+}

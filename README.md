@@ -190,8 +190,25 @@ and encrypted after: `unknown_ca`, `certificate_expired` or
 `bad_certificate` for a chain it refuses, `decrypt_error` for a
 signature or Finished that does not verify, `bad_record_mac`,
 `decode_error`, `illegal_parameter` and so on; never in answer to the
-server's own alert. Not yet: PSK, early data, ALPN. A connection that ends without a
+server's own alert. Not yet: PSK, early data. A connection that ends without a
 close_notify is `error.Truncated`.
+
+`tls.client_with` takes `Options` too, which so far offer ALPN protocols
+(RFC 7301), in order of preference:
+
+```egg
+    var opts = tls.Options.empty()
+    defer a.free(opts)
+    try opts.add_alpn(a, "h2")                     // 1 to 255 bytes each
+    try opts.add_alpn(a, "http/1.1")
+    var c = try tls.client_with(a, rng, clock, trusted, conn, "example.com", opts)
+    defer c.close(a)
+    io.print(c.alpn())                             // "h2", "http/1.1" or ""
+```
+
+The server's choice must be one of them (`IllegalParameter` if not); one
+that takes none of them may go on without ALPN (`alpn()` is empty) or
+refuse with the alert no_application_protocol (`AlertReceived`).
 
 `tls/client` is the same client with no socket, fed bytes and leaving
 what it sends in an outbox. `clutch test` replays RFC 8448's handshakes
@@ -203,10 +220,13 @@ there: once per cipher suite, with P-256, P-384 and RSA certificates (so
 the handshake is signed with ECDSA P-256, ECDSA P-384 and RSA-PSS), the
 P-256 key share, HelloRetryRequests (a server that takes only P-384, and
 a stateless one that wants a cookie), an IP address as the host, a 1 MiB
-response, and the wrong host and an untrusted CA, which it must refuse, sending
+response, ALPN (chosen, not offered, none in common, a server without
+it), and the wrong host and an untrusted CA, which it must refuse, sending
 `bad_certificate` and `unknown_ca` (the server's log must show them).
 `EGG_TLS_REAL=example.com,github.com clutch test real` connects to real
-sites with the system's roots.
+sites with the system's roots, offering ALPN http/1.1. `test/alpn.egg`
+checks the ALPN extension in both ClientHellos and the server's answer,
+against a server built by hand.
 
 ## P-256 and P-384
 
