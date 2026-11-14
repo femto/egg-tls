@@ -15,7 +15,8 @@ RFC's test vectors:
 5. certificates: ECDSA on P-256 and P-384, RSA, DER, X.509, the system's
    CA bundle, host names, checked in the handshake (done). Ed25519 later
 
-It needs [Egg](https://github.com/femto/egg) 0.2.0 or later (for
+It needs [Egg](https://github.com/femto/egg) 0.2.0 or later (on
+Windows, an Egg with per-platform files, femto/egg#118) (for
 wrapping arithmetic `+%`, `rng.fill` into an array, `@secureZero` and
 `@mulWide`). In a project's `clutch.toml`:
 
@@ -333,7 +334,7 @@ as the whole leftmost label, with two labels after it) or an IPv4 or
 IPv6 address; the common name is never used. A critical extension it
 does not know fails the certificate, nameConstraints included (not
 supported yet). Revocation is not checked. Not yet: Ed25519 signatures
-in certificates, and Windows's certificate store (give PEM there).
+in certificates.
 
 DER is read strictly: definite, shortest lengths, explicit defaults
 refused. `roots.system` reads the first bundle of `/etc/ssl/cert.pem`,
@@ -341,6 +342,11 @@ refused. `roots.system` reads the first bundle of `/etc/ssl/cert.pem`,
 `/etc/ssl/ca-bundle.pem` and
 `/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem`; a certificate in it
 that does not parse is skipped, not fatal (all of macOS's 128 parse).
+On Windows it reads the ROOT system store through crypt32 instead
+(`src/sysroots_windows.egg`; Egg compiles it only there). Windows adds
+some roots to that store only when a chain first needs one, so a root
+nothing on the machine has used yet may be missing: give PEM for such a
+host.
 `clutch test` verifies 43 chains of a test PKI made by OpenSSL, whose
 verifier agreed with every answer except where tls/x509 differs by
 design (which each such case says).

@@ -57,7 +57,7 @@ run() {
     EGG_TLS_PORT=$PORT EGG_TLS_CA="$dir/ca.pem" "$@" ./build/test/live
 }
 
-"$CLUTCH" test live >/dev/null    # builds it; without the variables it only returns
+$CLUTCH test live >/dev/null    # builds it (CLUTCH may be "ruby PATH"); without the variables it only returns
 
 printf 'basicConstraints=critical,CA:TRUE,pathlen:0\nkeyUsage=critical,keyCertSign,cRLSign\n' >"$dir/ca.ext"
 printf 'subjectAltName=DNS:localhost,IP:127.0.0.1\nextendedKeyUsage=serverAuth\nkeyUsage=critical,digitalSignature\n' >"$dir/leaf.ext"

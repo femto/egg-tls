@@ -1,0 +1,55 @@
+// sysroots: the system's roots on Windows: the certificates of the ROOT
+// system store (the current user's view of it, which includes the
+// machine's), through crypt32. roots.system says which.
+//
+// Windows fetches some roots only when a chain needs them (automatic root
+// update), so a root the store has not been given yet is missing here
+// until something on the machine has used it; give PEM for such a host.
+uses alloc, fs
+allow unsafe
+link "crypt32"
+
+const x509 = @import("x509.egg")
+
+// HCERTSTORE CertOpenSystemStoreW(HCRYPTPROV_LEGACY, LPCWSTR);
+// PCCERT_CONTEXT CertEnumCertificatesInStore(HCERTSTORE, PCCERT_CONTEXT);
+// BOOL CertCloseStore(HCERTSTORE, DWORD). Handles cross as *u8.
+extern fn CertOpenSystemStoreW(prov: usize, name: *u16) *u8
+extern fn CertEnumCertificatesInStore(store: *u8, prev: *u8) *u8
+extern fn CertCloseStore(store: *u8, flags: u32) i32
+
+// CERT_CONTEXT on 64-bit Windows: DWORD dwCertEncodingType (and 4 bytes
+// of padding), BYTE *pbCertEncoded at 8, DWORD cbCertEncoded at 16.
+const ENCODED_AT: i64 = 8
+const LENGTH_AT: i64 = 16
+// X509_ASN_ENCODING: DER.
+const X509_ASN: u32 = 1
+
+fn system(a: Allocator, files: Fs) !x509.CertList {
+    _ = files
+    var name = [5]u16{ 'R', 'O', 'O', 'T', 0 }
+    const store = CertOpenSystemStoreW(0, &name[0])
+    if (store == null) {
+        return error.NoRoots
+    }
+    var list = x509.CertList.empty()
+    // Each call frees the context it is given and returns the next; null
+    // after the last.
+    var ctx = CertEnumCertificatesInStore(store, null)
+    while (ctx != null) {
+        const kind = @ptrCast(*u32, ctx).*
+        const der = @ptrCast(**u8, @ptrAdd(ctx, ENCODED_AT)).*
+        const n = @as(i64, @ptrCast(*u32, @ptrAdd(ctx, LENGTH_AT)).*)
+        // One that does not parse is skipped, as in a PEM bundle.
+        if (kind & X509_ASN != 0 and der != null) {
+            list.add(a, @sliceFromPtr(der, n)) catch {}
+        }
+        ctx = CertEnumCertificatesInStore(store, ctx)
+    }
+    _ = CertCloseStore(store, 0)
+    if (list.len() == 0) {
+        a.free(list)
+        return error.NoRoots
+    }
+    return list
+}
