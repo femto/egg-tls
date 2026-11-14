@@ -22,7 +22,7 @@ a project's `clutch.toml`:
 
 ```toml
 [dependencies]
-tls = "0.1"
+tls = "0.2"
 ```
 
 ## The hashes
