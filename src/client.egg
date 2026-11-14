@@ -212,13 +212,12 @@ const Client = owned struct {
         var c = Client.start_with(a, shares, hello[0..])
         c.random = random
         a.append_str(&c.host, host)
-        a.append_str(&c.alpn_offered, opts.alpn)
         return c
     }
 
     // A client that sends hello, a whole ClientHello message whose key
     // shares are the public keys of shares: for tests that replay a
-    // recorded handshake.
+    // recorded handshake. The ALPN protocols it offers are hello's.
     fn start_with(a: Allocator, shares: Shares, hello: []u8) Client {
         var c = Client{
             .state = .server_hello,
@@ -256,6 +255,7 @@ const Client = owned struct {
             .alpn_chosen = .empty,
         }
         c.transcript.update(hello)
+        a.append_str(&c.alpn_offered, alpn_in(hello))
         // A plaintext record; its version is 0x0301 for old middleboxes.
         a.push(&c.outbox, HANDSHAKE)
         put16(a, &c.outbox, 0x0301)
@@ -1229,38 +1229,67 @@ fn is_retry(body: []u8) bool {
 // The groups whose shares a ClientHello message carries, as bits; 0 if it
 // does not parse.
 fn shares_in(hello: []u8) i64 {
+    const data = ext_in(hello, 51)
+    var bits = 0
+    if (@len(data) >= 2) {
+        var p = 2
+        while (p + 4 <= @len(data)) {
+            bits = bits | group_bit(be16(data, p))
+            p = p + 4 + be16(data, p + 2)
+        }
+    }
+    return bits
+}
+
+// The ALPN protocols a ClientHello offers, a list as Options holds them:
+// empty if it offers none, or if the list is not well formed.
+fn alpn_in(hello: []u8) []u8 {
+    const data = ext_in(hello, 16)
+    if (@len(data) < 2 or be16(data, 0) != @len(data) - 2) {
+        return ""
+    }
+    var at = 2
+    while (at < @len(data)) {
+        const n = @as(i64, data[at])
+        if (n == 0 or at + 1 + n > @len(data)) {
+            return ""
+        }
+        at = at + 1 + n
+    }
+    return data[2..]
+}
+
+// The data of a ClientHello's extension ext, or empty if it has none.
+fn ext_in(hello: []u8, ext: i64) []u8 {
     // Header, version, random; session id; suites; compression.
     var at = 4 + 2 + 32
     if (@len(hello) < at + 1) {
-        return 0
+        return ""
     }
     at = at + 1 + @as(i64, hello[at])
     if (@len(hello) < at + 2) {
-        return 0
+        return ""
     }
     at = at + 2 + be16(hello, at)
     if (@len(hello) < at + 1) {
-        return 0
+        return ""
     }
     at = at + 1 + @as(i64, hello[at])
     if (@len(hello) < at + 2) {
-        return 0
+        return ""
     }
     at = at + 2
-    var bits = 0
     while (at + 4 <= @len(hello)) {
-        const ext = be16(hello, at)
         const n = be16(hello, at + 2)
-        if (ext == 51 and at + 6 <= @len(hello)) {
-            var p = at + 6
-            while (p + 4 <= at + 4 + n) {
-                bits = bits | group_bit(be16(hello, p))
-                p = p + 4 + be16(hello, p + 2)
-            }
+        if (at + 4 + n > @len(hello)) {
+            return ""
+        }
+        if (be16(hello, at) == ext) {
+            return hello[at + 4..at + 4 + n]
         }
         at = at + 4 + n
     }
-    return bits
+    return ""
 }
 
 // Is name one of list's, a list as Options holds them?

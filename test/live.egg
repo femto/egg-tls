@@ -9,7 +9,8 @@
 // (tls.client) for EGG_TLS_HOST (localhost by default); with
 // EGG_TLS_EXPECT too, connecting must fail with that error. With
 // EGG_TLS_ALPN, protocols separated by commas, it offers them, and the
-// server must choose EGG_TLS_WANT_ALPN (none if unset).
+// server must choose EGG_TLS_WANT_ALPN (none if unset); that needs
+// EGG_TLS_CA, as client_unverified offers nothing.
 uses io, alloc, args, net, rand, fs, time
 
 const tls = @import("tls")
@@ -38,6 +39,10 @@ fn main(io: Io, a: Allocator, args: Args, net: Net, rng: Random, files: Fs, cloc
         }
     }
     const alpn = args.env("EGG_TLS_ALPN") orelse ""
+    if (@len(alpn) > 0 and @len(ca_path) == 0) {
+        io.print("FAIL EGG_TLS_ALPN needs EGG_TLS_CA")
+        return error.Failed
+    }
     var opts = tls.Options.empty()
     defer a.free(opts)
     var from = 0

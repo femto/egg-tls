@@ -25,6 +25,7 @@ fn main(io: Io, a: Allocator) !void {
     try refused(io, a, &t, true, "000a00100006000402683200", error.DecodeError, 50, "a name shorter than the list")
     try refused(io, a, &t, false, "000b0010000700050473706479", error.UnsupportedExtension, 110, "ALPN not offered")
     try no_protocol(io, a, &t)
+    try replayed(io, a, &t)
     try t.done(io)
 }
 
@@ -232,6 +233,22 @@ fn no_protocol(io: Io, a: Allocator, inout t: support.Tally) !void {
         got = e
     }
     t.check(io, got == error.AlertReceived and c.alert() == 120 and c.alert_sent() == -1, "no_application_protocol from the server")
+}
+
+// start_with takes the protocols offered from the ClientHello it sends.
+fn replayed(io: Io, a: Allocator, inout t: support.Tally) !void {
+    var first = try start(a, true)
+    defer first.deinit(a)
+    const rec = first.take_outbox()
+    defer a.free(rec)
+    var c = client.Client.start_with(a, shares(), rec[5..])
+    defer c.deinit(a)
+    var got: anyerror = error.None
+    try handshake(a, &c, "000d00000000001000050003026832", &got)
+    t.check(io, got == error.None and c.alpn() == "h2", "a replayed ClientHello's protocols")
+    if (got != error.None) {
+        io.print("  got ", @errorName(got))
+    }
 }
 
 fn find(s: []u8, p: []u8) i64 {
