@@ -9,10 +9,10 @@ permissions:
   contents: read
 
 env:
-  # Egg with per-platform files (m_windows.egg / m_unix.egg), which
-  # src/sysroots needs: femto/egg#118, until a release has it.
+  # The oldest Egg this package supports (README): per-platform files
+  # came in 0.2.1.
   EGG_REPO: femto/egg
-  EGG_REF: 6a1fb9f5f1d753feff55bab45c8370393d9d04cd
+  EGG_REF: v0.2.1
 
 jobs:
   test:
